@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 import httpx
@@ -59,6 +60,30 @@ OPTIONAL_PERMISSIONS = {
 # Immich's Permission enum includes a real wildcard value.
 WILDCARD = "all"
 
+# Statuses worth retrying: a reverse proxy shedding load, or the server briefly
+# overwhelmed. Fetching hundreds of multi-megabyte originals is exactly the
+# workload that provokes these, and none of them mean "this asset is broken".
+TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def retry_delay(attempt: int, retry_after: float | None = None,
+                base: float = 1.0, cap: float = 30.0) -> float:
+    """Backoff for attempt N (0-indexed), honouring a Retry-After hint."""
+    if retry_after is not None and retry_after >= 0:
+        return min(float(retry_after), cap)
+    return min(cap, base * (2 ** attempt))
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    """Retry-After as delta-seconds. HTTP-date form is ignored, not guessed."""
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
 
 def normalize_path(path: str) -> str:
     """Collapse ids out of a request path so it matches an endpoint template."""
@@ -74,14 +99,18 @@ class ImmichHTTPError(RuntimeError):
     the path and whatever the API said.
     """
 
-    def __init__(self, method: str, path: str, status: int, body: str = ""):
+    def __init__(self, method: str, path: str, status: int, body: str = "",
+                 retry_after: float | None = None):
         self.method = method
         self.path = path
         self.status = status
         self.body = body
+        self.retry_after = retry_after
         super().__init__(self._render())
 
     def _render(self) -> str:
+        if self.status == 0:
+            return f"{self.method} {self.path} -> {self.body}"
         text = f"{self.method} {self.path} -> HTTP {self.status}"
         detail = self.body.strip()
         if detail:
@@ -101,6 +130,12 @@ class ImmichHTTPError(RuntimeError):
         elif self.status == 404:
             text += ("\n  Endpoint not found -- this usually means the Immich "
                      "server is older than the API this client targets.")
+        elif self.status == 429:
+            text += ("\n  Rate limited. Lower fetch.concurrency in config.toml "
+                     "if this persists after retries.")
+        elif self.status in (502, 503, 504):
+            text += ("\n  The server or a proxy in front of it is refusing load. "
+                     "Lower fetch.concurrency in config.toml.")
         return text
 
 
@@ -155,7 +190,8 @@ def missing_permissions(granted: set[str], required: dict[str, str]) -> list[str
 
 class ImmichClient:
     def __init__(self, creds: Credentials, timeout: float = 60.0, concurrency: int = 8,
-                 transport: httpx.AsyncBaseTransport | None = None):
+                 transport: httpx.AsyncBaseTransport | None = None,
+                 retries: int = 4, sleeper: Any = None):
         self._client = httpx.AsyncClient(
             base_url=creds.url,
             # Accept is set per request: the download endpoints produce
@@ -167,6 +203,8 @@ class ImmichClient:
             transport=transport,
         )
         self._sem = asyncio.Semaphore(concurrency)
+        self._retries = retries
+        self._sleep = sleeper or asyncio.sleep
 
     async def __aenter__(self) -> "ImmichClient":
         return self
@@ -177,18 +215,54 @@ class ImmichClient:
     def _check(self, response: httpx.Response, method: str, path: str) -> httpx.Response:
         if response.is_success:
             return response
-        raise ImmichHTTPError(method, path, response.status_code, _message_from(response))
+        raise ImmichHTTPError(
+            method, path, response.status_code, _message_from(response),
+            parse_retry_after(response.headers.get("retry-after")),
+        )
+
+    async def _retrying(self, attempt_fn, method: str, path: str):
+        """Run one request, retrying transient failures with backoff.
+
+        Bulk-fetching hundreds of large originals is precisely the workload that
+        trips rate limiters and provokes momentary 502/503s from a reverse
+        proxy, and a single failure there should not cost the whole asset.
+        Permanent failures (401, 403, 404) are raised immediately -- retrying
+        them just multiplies the wait before the real message appears.
+        """
+        last: Exception | None = None
+        for attempt in range(self._retries + 1):
+            try:
+                return await attempt_fn()
+            except ImmichHTTPError as exc:
+                if exc.status not in TRANSIENT_STATUSES or attempt == self._retries:
+                    raise
+                last = exc
+                await self._sleep(retry_delay(attempt, exc.retry_after))
+            except (httpx.TransportError, httpx.RemoteProtocolError) as exc:
+                if attempt == self._retries:
+                    raise ImmichHTTPError(method, path, 0,
+                                          f"{type(exc).__name__}: {exc}") from exc
+                last = exc
+                await self._sleep(retry_delay(attempt))
+        raise last  # unreachable; the loop either returns or raises
 
     async def _get(self, path: str, accept: str = JSON, **kwargs: Any) -> httpx.Response:
         headers = {"Accept": accept, **kwargs.pop("headers", {})}
-        async with self._sem:
-            response = await self._client.get(path, headers=headers, **kwargs)
-        return self._check(response, "GET", path)
+
+        async def attempt() -> httpx.Response:
+            async with self._sem:
+                response = await self._client.get(path, headers=headers, **kwargs)
+            return self._check(response, "GET", path)
+
+        return await self._retrying(attempt, "GET", path)
 
     async def _post(self, path: str, json: Any) -> httpx.Response:
-        async with self._sem:
-            response = await self._client.post(path, json=json, headers={"Accept": JSON})
-        return self._check(response, "POST", path)
+        async def attempt() -> httpx.Response:
+            async with self._sem:
+                response = await self._client.post(path, json=json, headers={"Accept": JSON})
+            return self._check(response, "POST", path)
+
+        return await self._retrying(attempt, "POST", path)
 
     async def ping(self) -> None:
         """Fail fast and clearly on a bad URL or key, before any long stage."""
@@ -305,12 +379,57 @@ class ImmichClient:
         and asking for JSON invites a 406 on the one request that has to return
         binary.
         """
+        path, params = self._asset_path(asset_id, source)
+        return (await self._get(path, accept=ANY, params=params)).content
+
+    @staticmethod
+    def _asset_path(asset_id: str, source: str) -> tuple[str, dict | None]:
         if source == "original":
-            resp = await self._get(f"/assets/{asset_id}/original", accept=ANY)
-        else:
-            resp = await self._get(f"/assets/{asset_id}/thumbnail",
-                                   accept=ANY, params={"size": source})
-        return resp.content
+            return f"/assets/{asset_id}/original", None
+        return f"/assets/{asset_id}/thumbnail", {"size": source}
+
+    async def download_to(self, asset_id: str, target: Path, source: str = "original",
+                          timeout: float | None = 300.0) -> int:
+        """Stream an asset to disk. Returns bytes written.
+
+        Streaming rather than buffering keeps memory flat when several
+        multi-megabyte originals are in flight, and the longer default timeout
+        suits large files over a slow link.
+
+        The bytes land in a temporary file that is renamed into place only once
+        complete. The fetch stage treats an existing file as already cached, so
+        a process killed mid-write would otherwise leave a truncated image that
+        is never re-fetched and fails much later in decoding.
+        """
+        path, params = self._asset_path(asset_id, source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".part")
+
+        async def attempt() -> int:
+            written = 0
+            async with self._sem:
+                request = self._client.build_request(
+                    "GET", path, headers={"Accept": ANY}, params=params,
+                    timeout=timeout,
+                )
+                response = await self._client.send(request, stream=True)
+                try:
+                    if not response.is_success:
+                        await response.aread()
+                        self._check(response, "GET", path)
+                    with tmp.open("wb") as fh:
+                        async for chunk in response.aiter_bytes(65536):
+                            fh.write(chunk)
+                            written += len(chunk)
+                finally:
+                    await response.aclose()
+            tmp.replace(target)
+            return written
+
+        try:
+            return await self._retrying(attempt, "GET", path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def pick_face(faces: list[dict], person_id: str) -> tuple[Face | None, int]:

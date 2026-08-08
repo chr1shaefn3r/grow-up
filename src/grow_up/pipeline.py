@@ -227,13 +227,12 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
         async with sem:
             if not target.exists():
                 try:
-                    data = await client.download(asset_id, source)
+                    await client.download_to(asset_id, target, source)
                 except Exception as exc:  # noqa: BLE001
                     async with lock:
                         errors.append(str(exc))
                     _log_error(log, errors, f"download {asset_id}", exc)
                     return
-                target.write_bytes(data)
         async with lock:
             conn.execute(
                 "INSERT OR REPLACE INTO downloads (asset_id, path, bytes, source, fetched_at)"

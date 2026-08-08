@@ -170,6 +170,17 @@ because that isolates a content-negotiation fault from a permission or path faul
 status code too — 403 names the permission that endpoint requires, 406 points at content
 negotiation, 404 at a server older than the API this client targets.
 
+**If `doctor` is clean but bulk `fetch` fails**, the problem is load rather than
+configuration: originals are frequently several MB each, and a reverse proxy in front of
+Immich will shed load long before Immich does. Requests retry transient failures (429,
+5xx, dropped connections) with exponential backoff honouring `Retry-After`; if failures
+persist, lower `fetch.concurrency` in `config.toml`. The reported status says which —
+429 is rate limiting, 502/503/504 is a proxy or server refusing load.
+
+Budget disk for the cache: a few thousand originals at ~4 MB each runs to several GB.
+Downloads stream to disk and are renamed into place only when complete, so an interrupted
+run never leaves a truncated file that would be mistaken for a cached one.
+
 ## Notes on the output
 
 Normalising scale by interocular distance holds head size constant, so growing up reads

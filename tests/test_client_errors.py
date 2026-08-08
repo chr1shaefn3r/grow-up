@@ -29,8 +29,18 @@ CREDS = Credentials(url="https://immich.example.com/api", api_key="secret")
 ASSET = "03529b3b-e721-40d1-a8a2-9443398e6f69"
 
 
-def client_with(handler) -> ImmichClient:
-    return ImmichClient(CREDS, transport=httpx.MockTransport(handler))
+def client_with(handler, retries: int = 0, sleeps: list | None = None) -> ImmichClient:
+    """A client wired to a mock transport.
+
+    Retries default to 0 and sleeping is captured rather than performed, so the
+    suite stays fast and the backoff schedule is assertable.
+    """
+    async def sleeper(seconds: float) -> None:
+        if sleeps is not None:
+            sleeps.append(seconds)
+
+    return ImmichClient(CREDS, transport=httpx.MockTransport(handler),
+                        retries=retries, sleeper=sleeper)
 
 
 def run(coro):
@@ -228,6 +238,125 @@ class TestErrorLogging:
 
         assert len(lines) == pipeline.MAX_LOGGED_ERRORS + 1
         assert "suppressed" in lines[-1]
+
+
+class TestRetry:
+    """Bulk-fetching hundreds of large originals is the workload that trips rate
+    limiters and provokes momentary 502s; one blip should not cost the asset."""
+
+    def counting_handler(self, statuses):
+        calls = {"n": 0}
+
+        def handler(request):
+            index = min(calls["n"], len(statuses) - 1)
+            calls["n"] += 1
+            status = statuses[index]
+            if status == 200:
+                return httpx.Response(200, content=b"jpeg")
+            return httpx.Response(status, json={"message": "busy"})
+
+        return calls, handler
+
+    def test_recovers_from_a_transient_failure(self):
+        calls, handler = self.counting_handler([503, 503, 200])
+        assert run(client_with(handler, retries=4).download(ASSET)) == b"jpeg"
+        assert calls["n"] == 3
+
+    def test_gives_up_after_the_retry_budget(self):
+        calls, handler = self.counting_handler([503])
+        with pytest.raises(ImmichHTTPError) as excinfo:
+            run(client_with(handler, retries=2).download(ASSET))
+        assert excinfo.value.status == 503
+        assert calls["n"] == 3, "initial attempt plus two retries"
+
+    @pytest.mark.parametrize("status", [401, 403, 404, 400])
+    def test_permanent_failures_are_not_retried(self, status):
+        """Retrying a permission error only delays the real message."""
+        calls, handler = self.counting_handler([status])
+        with pytest.raises(ImmichHTTPError):
+            run(client_with(handler, retries=4).download(ASSET))
+        assert calls["n"] == 1
+
+    def test_backoff_grows(self):
+        sleeps: list[float] = []
+        _, handler = self.counting_handler([503])
+        with pytest.raises(ImmichHTTPError):
+            run(client_with(handler, retries=3, sleeps=sleeps).download(ASSET))
+        assert sleeps == [1.0, 2.0, 4.0]
+
+    def test_retry_after_header_is_honoured(self):
+        def handler(request):
+            return httpx.Response(429, headers={"retry-after": "7"}, json={"message": "slow"})
+
+        sleeps: list[float] = []
+        with pytest.raises(ImmichHTTPError):
+            run(client_with(handler, retries=1, sleeps=sleeps).download(ASSET))
+        assert sleeps == [7.0]
+
+    def test_transport_errors_are_retried_then_reported(self):
+        def handler(request):
+            raise httpx.ConnectError("connection reset")
+
+        with pytest.raises(ImmichHTTPError, match="ConnectError"):
+            run(client_with(handler, retries=2).download(ASSET))
+
+    def test_delay_is_capped(self):
+        from grow_up.immich import retry_delay
+
+        assert retry_delay(20) == 30.0
+        assert retry_delay(0, retry_after=900) == 30.0
+
+    def test_retry_after_parsing(self):
+        from grow_up.immich import parse_retry_after
+
+        assert parse_retry_after("12") == 12.0
+        assert parse_retry_after(None) is None
+        assert parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT") is None
+
+
+class TestStreamingDownload:
+    def test_writes_the_file(self, tmp_path):
+        def handler(request):
+            return httpx.Response(200, content=b"a" * 5000)
+
+        target = tmp_path / "asset.jpg"
+        written = run(client_with(handler).download_to(ASSET, target))
+
+        assert written == 5000
+        assert target.read_bytes() == b"a" * 5000
+
+    def test_leaves_no_partial_file_on_failure(self, tmp_path):
+        """The fetch stage treats an existing file as cached, so a truncated one
+        would never be re-fetched and would fail much later, in decoding."""
+        def handler(request):
+            return httpx.Response(500, json={"message": "boom"})
+
+        target = tmp_path / "asset.jpg"
+        with pytest.raises(ImmichHTTPError):
+            run(client_with(handler).download_to(ASSET, target))
+
+        assert not target.exists()
+        assert list(tmp_path.iterdir()) == [], "no .part file left behind"
+
+    def test_creates_the_cache_directory(self, tmp_path):
+        def handler(request):
+            return httpx.Response(200, content=b"x")
+
+        target = tmp_path / "nested" / "dir" / "asset.jpg"
+        run(client_with(handler).download_to(ASSET, target))
+        assert target.exists()
+
+    def test_uses_the_thumbnail_endpoint_for_previews(self, tmp_path):
+        seen = {}
+
+        def handler(request):
+            seen["path"] = request.url.path
+            seen["size"] = request.url.params.get("size")
+            return httpx.Response(200, content=b"x")
+
+        run(client_with(handler).download_to(ASSET, tmp_path / "a.jpg", "preview"))
+        assert seen["path"] == f"/api/assets/{ASSET}/thumbnail"
+        assert seen["size"] == "preview"
 
 
 def test_search_assets_reports_errors_with_status():

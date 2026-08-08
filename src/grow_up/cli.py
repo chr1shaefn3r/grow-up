@@ -35,6 +35,19 @@ def _open(args: argparse.Namespace):
     return cfg, conn
 
 
+def _client(cfg: config.Config) -> ImmichClient:
+    """Build a client with the configured concurrency and retry budget.
+
+    Concurrency is shared with the stages' own limiting, so lowering
+    fetch.concurrency genuinely reduces simultaneous load on the server.
+    """
+    return ImmichClient(
+        config.credentials(),
+        concurrency=int(cfg.get("fetch", "concurrency", 8)),
+        retries=int(cfg.get("fetch", "retries", 4)),
+    )
+
+
 async def preflight(client: ImmichClient) -> set[str]:
     """Check connectivity and the key's scopes before doing any real work.
 
@@ -74,7 +87,7 @@ def _person_id(cfg: config.Config, conn) -> str:
         raise SystemExit("set immich.person_id or immich.person_name in config.toml")
 
     async def resolve() -> str:
-        async with ImmichClient(config.credentials()) as client:
+        async with _client(cfg) as client:
             person = await client.resolve_person(str(name))
             log(f"resolved {person.name!r} -> {person.id}")
             log("  (put this in config.toml as immich.person_id to skip the lookup)")
@@ -114,7 +127,7 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
     page_size = int(cfg.get("index", "page_size", 1000))
 
     try:
-        async with ImmichClient(config.credentials()) as client:
+        async with _client(cfg) as client:
             await preflight(client)
             _, new = await pipeline.stage_index(
                 client, conn, person_id, watermark, page_size, log
@@ -154,7 +167,7 @@ def cmd_faces(args: argparse.Namespace) -> None:
     person_id = _person_id(cfg, conn)
 
     async def go() -> None:
-        async with ImmichClient(config.credentials()) as client:
+        async with _client(cfg) as client:
             await pipeline.stage_faces(client, conn, person_id, log,
                                        int(cfg.get("fetch", "concurrency", 16)))
 
@@ -165,7 +178,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
 
     async def go() -> None:
-        async with ImmichClient(config.credentials()) as client:
+        async with _client(cfg) as client:
             await pipeline.stage_fetch(
                 client, conn, cfg.path("cache"),
                 str(cfg.get("fetch", "source", "original")), log,
@@ -240,7 +253,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     person_id = str(cfg.get("immich", "person_id") or "")
 
     async def go() -> None:
-        async with ImmichClient(config.credentials()) as client:
+        async with _client(cfg) as client:
             log(f"server:  {config.credentials().url}")
 
             probes: list[tuple[str, str, str, dict | None]] = [
@@ -325,7 +338,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     async def network_stages() -> None:
         # --since / --full apply here and stop here.
         await _index(cfg, conn, person_id, args.since, args.full)
-        async with ImmichClient(config.credentials()) as client:
+        async with _client(cfg) as client:
             await pipeline.stage_faces(client, conn, person_id, log,
                                        int(cfg.get("fetch", "concurrency", 16)))
             await pipeline.stage_fetch(

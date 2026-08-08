@@ -17,7 +17,13 @@ out = "out"
 page_size = 1000
 
 [fetch]
+# Simultaneous requests. Originals are often several MB each, so this is the
+# knob to turn down first if downloads start returning 429 or 502 -- a reverse
+# proxy in front of Immich will shed load long before Immich itself does.
 concurrency = 8
+# Retries per request on transient failures (429, 5xx, dropped connections),
+# with exponential backoff that honours Retry-After.
+retries = 4
 # "original" for maximum quality; "preview" is smaller and always a JPEG, which
 # sidesteps HEIC decoding at the cost of resolution.
 source = "original"
