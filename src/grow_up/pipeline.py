@@ -22,6 +22,51 @@ from .immich import ImmichClient, pick_face
 
 Log = Callable[[str], None]
 
+# Past this many identical-looking failures, further lines add nothing; the
+# summary at the end of the stage carries the detail.
+MAX_LOGGED_ERRORS = 5
+
+
+class StageFailed(RuntimeError):
+    """A stage failed so comprehensively that continuing would waste the run."""
+
+
+def _log_error(log: Log, errors: list[str], what: str, exc: BaseException) -> None:
+    """Log the real error, not just its class name.
+
+    A stage that prints `HTTPStatusError` 832 times says nothing about whether
+    the problem is a permission, content negotiation or a wrong path. The status
+    code is the entire diagnosis, so it has to survive to the terminal.
+    """
+    if len(errors) <= MAX_LOGGED_ERRORS:
+        log(f"  ! {what}: {exc}")
+        if len(errors) == MAX_LOGGED_ERRORS:
+            log(f"  ! (further errors suppressed; {MAX_LOGGED_ERRORS} shown)")
+
+
+def _abort_if_hopeless(stage: str, succeeded: int, errors: list[str], attempted: int) -> None:
+    """Stop the run when a stage achieved nothing.
+
+    Returning 0 and letting `run` continue means `analyze` finds no images,
+    `select` picks no frames, and the failure surfaces several minutes later as
+    an empty video rather than at its cause.
+    """
+    if not errors:
+        return
+    if succeeded == 0:
+        raise StageFailed(
+            f"every {stage} failed ({len(errors)}/{attempted}). First error:\n"
+            f"    {errors[0]}"
+        )
+    if len(errors) > attempted * 0.1:
+        # Not fatal, but a tenth of the corpus silently missing would skew the
+        # timelapse without ever looking wrong.
+        raise StageFailed(
+            f"{len(errors)} of {attempted} {stage} attempts failed. First error:\n"
+            f"    {errors[0]}\n"
+            "  Re-run to retry; nothing already fetched is lost."
+        )
+
 
 @dataclass(frozen=True)
 class Watermark:
@@ -111,6 +156,7 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
 
     sem = asyncio.Semaphore(concurrency)
     ok = missing = 0
+    errors: list[str] = []
     lock = asyncio.Lock()
 
     async def one(asset_id: str) -> None:
@@ -126,7 +172,8 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
                         (asset_id, db.iso_z(db.now_utc())),
                     )
                     missing += 1
-                log(f"  ! {asset_id}: {type(exc).__name__}")
+                    errors.append(str(exc))
+                _log_error(log, errors, f"faces {asset_id}", exc)
                 return
 
         face, n = pick_face(faces, person_id)
@@ -150,6 +197,7 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
 
     await asyncio.gather(*(one(a) for a in pending))
     log(f"  face boxes: {ok} found, {missing} without a usable detection")
+    _abort_if_hopeless("face lookup", ok, errors, len(pending))
     return ok, missing
 
 
@@ -170,6 +218,7 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
     done = 0
+    errors: list[str] = []
 
     async def one(asset_id: str, filename: str | None) -> None:
         nonlocal done
@@ -180,7 +229,9 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
                 try:
                     data = await client.download(asset_id, source)
                 except Exception as exc:  # noqa: BLE001
-                    log(f"  ! download {asset_id}: {type(exc).__name__}")
+                    async with lock:
+                        errors.append(str(exc))
+                    _log_error(log, errors, f"download {asset_id}", exc)
                     return
                 target.write_bytes(data)
         async with lock:
@@ -195,6 +246,7 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
 
     await asyncio.gather(*(one(r["id"], r["original_file_name"]) for r in pending))
     log(f"  downloaded {done} files")
+    _abort_if_hopeless("download", done, errors, len(pending))
     return done
 
 

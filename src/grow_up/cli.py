@@ -15,7 +15,14 @@ import urllib.request
 from pathlib import Path
 
 from . import analyze, config, db, pipeline, review, select
-from .immich import ImmichClient
+from .immich import (
+    ANY,
+    OPTIONAL_PERMISSIONS,
+    REQUIRED_PERMISSIONS,
+    ImmichClient,
+    ImmichHTTPError,
+    missing_permissions,
+)
 
 
 def log(message: str) -> None:
@@ -26,6 +33,34 @@ def _open(args: argparse.Namespace):
     cfg = config.load(args.config)
     conn = db.connect(cfg.path("db"))
     return cfg, conn
+
+
+async def preflight(client: ImmichClient) -> set[str]:
+    """Check connectivity and the key's scopes before doing any real work.
+
+    `/api-keys/me` needs no permission, so this answers "is it the key?"
+    definitively in one request rather than after hundreds of failures.
+    """
+    await client.ping()
+    try:
+        granted = await client.my_permissions()
+    except ImmichHTTPError as exc:
+        log(f"  ! could not read the key's permissions ({exc.status}); continuing")
+        return set()
+
+    missing = missing_permissions(granted, REQUIRED_PERMISSIONS)
+    if missing:
+        detail = "\n".join(f"    {name}  ({REQUIRED_PERMISSIONS[name]})" for name in missing)
+        raise RuntimeError(
+            "this Immich API key is missing required permission(s):\n"
+            f"{detail}\n"
+            "  Add them in Immich under Account Settings -> API Keys."
+        )
+
+    for name, why in OPTIONAL_PERMISSIONS.items():
+        if "all" not in granted and name not in granted:
+            log(f"  note: key lacks {name!r}, so grow-up cannot {why}")
+    return granted
 
 
 def _person_id(cfg: config.Config, conn) -> str:
@@ -80,12 +115,15 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
 
     try:
         async with ImmichClient(config.credentials()) as client:
-            await client.ping()
+            await preflight(client)
             _, new = await pipeline.stage_index(
                 client, conn, person_id, watermark, page_size, log
             )
 
             current_count = await client.person_asset_count(person_id)
+            if current_count is None:
+                log("  note: person statistics unavailable, so drift detection is off "
+                    "for this run")
             state = db.get_sync_state(conn, person_id)
             stored_count = state.person_assets if state else None
 
@@ -185,6 +223,73 @@ def cmd_encode(args: argparse.Namespace) -> None:
     log(f"  wrote {out}")
 
 
+def cmd_doctor(args: argparse.Namespace) -> None:
+    """Probe each endpoint once and report exactly what it returns.
+
+    Exists because a stage that fails on every item is the worst place to learn
+    what went wrong: one request, fully described, beats hundreds of identical
+    error lines.
+    """
+    cfg, conn = _open(args)
+
+    row = conn.execute(
+        "SELECT a.id FROM assets a JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
+        " LIMIT 1"
+    ).fetchone()
+    asset_id = args.asset or (row["id"] if row else None)
+    person_id = str(cfg.get("immich", "person_id") or "")
+
+    async def go() -> None:
+        async with ImmichClient(config.credentials()) as client:
+            log(f"server:  {config.credentials().url}")
+
+            probes: list[tuple[str, str, str, dict | None]] = [
+                ("connectivity", "/server/ping", "application/json", None),
+                ("key metadata", "/api-keys/me", "application/json", None),
+            ]
+            if person_id:
+                probes.append(("person stats", f"/people/{person_id}/statistics",
+                               "application/json", None))
+            if asset_id:
+                probes += [
+                    ("faces", "/faces", "application/json", {"id": asset_id}),
+                    # The failing call, and the two things it could be confused
+                    # with: same endpoint asking for JSON, and the view-scoped
+                    # rendition. Whichever succeeds localises the fault.
+                    ("download (Accept: */*)", f"/assets/{asset_id}/original", ANY, None),
+                    ("download (Accept: json)", f"/assets/{asset_id}/original",
+                     "application/json", None),
+                    ("preview", f"/assets/{asset_id}/thumbnail", ANY, {"size": "preview"}),
+                ]
+
+            log("")
+            for label, path, accept, params in probes:
+                result = await client.probe(path, accept, params)
+                mark = "ok  " if result["ok"] else "FAIL"
+                status = result["status"] if result["status"] is not None else "---"
+                line = f"  [{mark}] {label:<24} {status}"
+                if result["ok"]:
+                    line += f"  {result.get('content_type', '')} {result.get('length', 0)}B"
+                log(line)
+                if result["detail"]:
+                    log(f"         {result['detail'][:400]}")
+
+            try:
+                granted = await client.my_permissions()
+            except ImmichHTTPError:
+                granted = set()
+            if granted:
+                missing = missing_permissions(granted, REQUIRED_PERMISSIONS)
+                log("")
+                log(f"key permissions: {'all (wildcard)' if 'all' in granted else len(granted)}")
+                log(f"missing required: {missing or 'none'}")
+
+    if not asset_id:
+        log("note: no indexed asset to probe with; run `grow-up index` first "
+            "or pass --asset <uuid>")
+    asyncio.run(go())
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
     person_id = str(cfg.get("immich", "person_id") or "")
@@ -262,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add(name: str, func, help_text: str) -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=func, since=None, full=False, reanalyze=False,
-                       cadence=None, no_encode=False)
+                       cadence=None, no_encode=False, asset=None)
         return p
 
     model = add("fetch-model", cmd_fetch_model, "download the MediaPipe face landmarker model")
@@ -284,6 +389,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("faces", cmd_faces, "fetch her face bounding box per asset")
     add("fetch", cmd_fetch, "download originals")
+
+    p = add("doctor", cmd_doctor, "probe each endpoint once and report what it returns")
+    p.add_argument("--asset", default=None, help="asset UUID to probe with")
 
     p = add("analyze", cmd_analyze, "landmark faces and compute quality metrics")
     p.add_argument("--reanalyze", action="store_true", help="re-run on already-analyzed assets")

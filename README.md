@@ -69,6 +69,20 @@ export IMMICH_URL=https://immich.example.com
 export IMMICH_API_KEY=…            # Account Settings → API Keys
 ```
 
+Immich API keys carry 155 granular permissions. `grow-up` needs four, and checks them
+up front via `GET /api-keys/me` (which itself requires no permission), so a too-narrow
+key fails in one second with the missing names rather than after hundreds of requests:
+
+| Permission | Used for |
+|---|---|
+| `person.read` | resolving her by name |
+| `asset.read` | indexing her photos |
+| `face.read` | reading face bounding boxes |
+| `asset.download` | downloading originals |
+
+`person.statistics` is optional — without it, watermark drift detection is skipped and
+`grow-up` says so rather than disabling it silently.
+
 ## Usage
 
 ```bash
@@ -127,6 +141,34 @@ grouped by reason, so an over-tight threshold is visible immediately.
 Landmarks cannot catch sunglasses, a hand over the face, or another child mistagged as
 her. `out/contact-sheet.html` shows the aligned frames in order; click to reject, save
 `rejects.json` next to it, and re-run `grow-up encode`.
+
+## Troubleshooting
+
+```bash
+grow-up doctor        # probes each endpoint once and reports exactly what it returns
+```
+
+One request per endpoint, fully described — status, content type, body, and the key's
+permissions:
+
+```
+  [ok  ] connectivity             200  application/json 14B
+  [ok  ] key metadata             200  application/json 43B
+  [ok  ] faces                    200  application/json 2B
+  [ok  ] download (Accept: */*)   200  image/jpeg 2048B
+  [FAIL] download (Accept: json)  406
+         Not Acceptable
+  [ok  ] preview                  200  image/jpeg 512B
+
+key permissions: all (wildcard)
+missing required: none
+```
+
+It deliberately probes the download endpoint **twice**, with different `Accept` headers,
+because that isolates a content-negotiation fault from a permission or path fault: if
+`*/*` succeeds where `json` fails, the problem was the header. Errors elsewhere carry the
+status code too — 403 names the permission that endpoint requires, 406 points at content
+negotiation, 404 at a server older than the API this client targets.
 
 ## Notes on the output
 
