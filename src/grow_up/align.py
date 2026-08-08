@@ -1,4 +1,4 @@
-"""Eye alignment and temporal smoothing.
+"""Eye alignment.
 
 The transform maths is pure numpy and unit-tested; opencv is imported lazily and
 only for the actual pixel warp.
@@ -70,52 +70,27 @@ def target_eyes(width: int, height: int, left: tuple[float, float],
             np.array([right[0] * width, right[1] * height], dtype=np.float64))
 
 
-def smooth_params(params: list[TransformParams], window: int,
-                  polyorder: int = 2) -> list[TransformParams]:
-    """Smooth the transform series over date-ordered frames.
+def transforms_for(eye_pairs: list[tuple[np.ndarray, np.ndarray]],
+                   dst_left: np.ndarray, dst_right: np.ndarray) -> list[np.ndarray]:
+    """Per-frame transforms for a whole sequence.
 
-    Per-frame alignment lands the eyes perfectly but leaves the *rest* of the
-    head jittering, because expression and pose shift between shots. Smoothing
-    the transform series trades a little eye precision for a much calmer video.
+    Each frame is solved independently and exactly, which *is* the
+    stabilisation: both eyes land on the canonical positions every time.
 
-    Savitzky-Golay is preferred over a plain moving average because it preserves
-    the underlying trend rather than flattening it -- the slow drift as a child
-    grows is signal, not noise. Falls back to a centred moving average when
-    scipy is unavailable.
+    There is deliberately no smoothing across frames here. An earlier version
+    averaged the (tx, ty, angle, scale) series along the timeline, reasoning
+    that it would calm residual wobble. That was unsound: those parameters live
+    in each source photo's own pixel coordinate system, so across a library of
+    differing resolutions and face sizes tx alone ranged over thousands of
+    pixels. Averaging them produced a translation belonging to no photo, and
+    pushed the face clean out of frame.
 
-    Note the window counts *frames*, not days; with irregular photo spacing the
-    effective time constant varies. That is acceptable here because the input is
-    already regularised by temporal bucketing in `select`.
+    Nor would a corrected version buy much: what remains after exact eye
+    alignment is genuine head pose and expression change, which no similarity
+    transform can smooth away -- only unpin the eyes while trying.
     """
-    n = len(params)
-    if window <= 1 or n < 3:
-        return list(params)
-
-    window = min(window, n if n % 2 else n - 1)
-    if window % 2 == 0:
-        window -= 1
-    if window < 3:
-        return list(params)
-
-    tx = np.array([p.tx for p in params], dtype=np.float64)
-    ty = np.array([p.ty for p in params], dtype=np.float64)
-    scale = np.array([p.scale for p in params], dtype=np.float64)
-    # Unwrap before smoothing so a wrap across +/-pi cannot drag the mean around.
-    angle = np.unwrap(np.array([p.angle for p in params], dtype=np.float64))
-
-    smoothed = [_smooth_series(s, window, polyorder) for s in (tx, ty, angle, scale)]
-    return [TransformParams(tx=float(a), ty=float(b), angle=float(c), scale=float(d))
-            for a, b, c, d in zip(*smoothed)]
-
-
-def _smooth_series(values: np.ndarray, window: int, polyorder: int) -> np.ndarray:
-    try:
-        from scipy.signal import savgol_filter
-    except ImportError:
-        kernel = np.ones(window, dtype=np.float64) / window
-        padded = np.pad(values, window // 2, mode="edge")
-        return np.convolve(padded, kernel, mode="valid")
-    return savgol_filter(values, window_length=window, polyorder=min(polyorder, window - 1))
+    return [similarity_transform(left, right, dst_left, dst_right)
+            for left, right in eye_pairs]
 
 
 def warp(image: np.ndarray, matrix: np.ndarray, width: int, height: int) -> np.ndarray:

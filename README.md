@@ -273,9 +273,17 @@ Normalising scale by interocular distance holds head size constant, so growing u
 as changing facial *proportions* rather than a head that inflates. This is deliberate —
 absolute scale makes the face drift around the frame.
 
-After per-frame alignment the eyes are exact but the rest of the head still wobbles
-between shots, so the transform series is smoothed along the timeline with a
-Savitzky-Golay filter (which preserves the slow drift rather than flattening it).
+Each frame is solved independently and exactly: both eyes land on the canonical
+positions every time, and that *is* the stabilisation. There is deliberately no
+smoothing across frames. An earlier version averaged the `(tx, ty, angle, scale)`
+series along the timeline to calm residual wobble, which was unsound — those parameters
+live in each source photo's own pixel coordinate system, so across a library of mixed
+resolutions and face sizes `tx` alone ranged over thousands of pixels. The average
+belonged to no photo and pushed faces clean out of frame.
+
+Nor would a corrected version buy much. What remains after exact eye alignment is
+genuine head pose and expression change, which no similarity transform can smooth
+away — it can only unpin the eyes while trying.
 
 `[select] cadence` buckets the timeline and keeps the best frame per bucket. Without it,
 a photo-heavy holiday dominates the video while quiet months flash past.

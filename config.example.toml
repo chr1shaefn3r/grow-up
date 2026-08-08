@@ -83,8 +83,6 @@ height = 1350
 # Canonical eye positions as fractions of the output frame.
 left_eye = [0.36, 0.42]
 right_eye = [0.64, 0.42]
-smoothing_window = 9       # frames; 0 disables temporal smoothing of the transform
-smoothing_polyorder = 2
 flicker_match = true
 
 [encode]

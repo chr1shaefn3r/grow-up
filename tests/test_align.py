@@ -85,41 +85,57 @@ class TestDecomposition:
         assert align.build_affine(align.decompose_affine(m)) == pytest.approx(m)
 
 
-class TestSmoothing:
-    def make(self, values) -> list[TransformParams]:
-        return [TransformParams(tx=v, ty=0.0, angle=0.0, scale=1.0) for v in values]
+class TestSequenceTransforms:
+    """Regression cover for a shipped bug that put faces outside the frame.
 
-    def test_reduces_jitter(self):
-        rng = np.random.default_rng(3)
-        noisy = 500.0 + rng.normal(0, 12.0, size=60)
-        smoothed = align.smooth_params(self.make(noisy), window=9)
+    `stage_align` used to smooth the (tx, ty, angle, scale) series along the
+    timeline. Those parameters live in each source photo's own pixel coordinate
+    system, so across a real library tx ranged over thousands of pixels and the
+    average belonged to no photo at all. The single-transform tests above all
+    passed throughout -- only a test over a *heterogeneous batch* catches it.
+    """
 
-        before = np.diff(noisy).std()
-        after = np.diff([p.tx for p in smoothed]).std()
-        assert after < before / 2
+    def library(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        return [
+            # phone close-up, DSLR wide, phone mid: different resolutions,
+            # face sizes, positions and roll angles.
+            (np.array([1700.0, 1300.0]), np.array([2100.0, 1330.0])),
+            (np.array([3050.0, 1500.0]), np.array([3210.0, 1505.0])),
+            (np.array([1500.0, 900.0]), np.array([1760.0, 915.0])),
+            (np.array([240.0, 180.0]), np.array([300.0, 176.0])),
+            (np.array([2600.0, 2000.0]), np.array([3100.0, 2180.0])),
+        ]
 
-    def test_preserves_the_underlying_trend(self):
-        """Slow drift as a child grows is signal; a smoother must not flatten it."""
-        trend = np.linspace(0.0, 100.0, 60)
-        smoothed = align.smooth_params(self.make(trend), window=9)
-        got = np.array([p.tx for p in smoothed])
-        assert got[0] == pytest.approx(0.0, abs=3.0)
-        assert got[-1] == pytest.approx(100.0, abs=3.0)
+    def test_every_frame_lands_its_eyes_on_target(self):
+        dst_left, dst_right = align.target_eyes(WIDTH, HEIGHT, (0.36, 0.42), (0.64, 0.42))
 
-    def test_is_a_no_op_for_short_or_disabled_sequences(self):
-        params = self.make([1.0, 2.0, 3.0])
-        assert align.smooth_params(params, window=0) == params
-        assert align.smooth_params(self.make([1.0, 2.0]), window=9) == self.make([1.0, 2.0])
+        matrices = align.transforms_for(self.library(), dst_left, dst_right)
 
-    def test_window_larger_than_the_sequence_is_clamped(self):
-        params = self.make(np.linspace(0, 10, 5))
-        assert len(align.smooth_params(params, window=99)) == 5
+        assert len(matrices) == len(self.library())
+        for (left, right), matrix in zip(self.library(), matrices):
+            assert apply(matrix, left) == pytest.approx(dst_left, abs=0.5)
+            assert apply(matrix, right) == pytest.approx(dst_right, abs=0.5)
 
-    def test_angles_wrapping_past_pi_do_not_swing_the_mean(self):
-        """Without unwrapping, a +pi/-pi crossing drags smoothed angles to zero."""
-        angles = [math.pi - 0.02, math.pi - 0.01, -math.pi + 0.01, -math.pi + 0.02,
-                  -math.pi + 0.03]
-        params = [TransformParams(tx=0.0, ty=0.0, angle=a, scale=1.0) for a in angles]
-        smoothed = align.smooth_params(params, window=5)
-        for p in smoothed:
-            assert abs(p.angle) > math.pi - 0.2
+    def test_every_eye_stays_inside_the_output_frame(self):
+        """The symptom that surfaced: the subject was not in the picture."""
+        dst_left, dst_right = align.target_eyes(WIDTH, HEIGHT, (0.36, 0.42), (0.64, 0.42))
+
+        for (left, right), matrix in zip(
+                self.library(), align.transforms_for(self.library(), dst_left, dst_right)):
+            for eye in (apply(matrix, left), apply(matrix, right)):
+                assert 0 <= eye[0] <= WIDTH, eye
+                assert 0 <= eye[1] <= HEIGHT, eye
+
+    def test_frames_are_solved_independently(self):
+        """Adding a photo must not move any other photo's face."""
+        dst_left, dst_right = align.target_eyes(WIDTH, HEIGHT, (0.36, 0.42), (0.64, 0.42))
+        pairs = self.library()
+
+        alone = align.transforms_for(pairs[:1], dst_left, dst_right)[0]
+        in_company = align.transforms_for(pairs, dst_left, dst_right)[0]
+
+        assert alone == pytest.approx(in_company)
+
+    def test_empty_sequence(self):
+        dst_left, dst_right = align.target_eyes(WIDTH, HEIGHT, (0.36, 0.42), (0.64, 0.42))
+        assert align.transforms_for([], dst_left, dst_right) == []

@@ -382,19 +382,16 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
         width, height, tuple(output["left_eye"]), tuple(output["right_eye"])
     )
 
-    params = []
-    for row in rows:
-        matrix = align.similarity_transform(
-            np.array([row["left_eye_x"], row["left_eye_y"]]),
-            np.array([row["right_eye_x"], row["right_eye_y"]]),
-            dst_left, dst_right,
-        )
-        params.append(align.decompose_affine(matrix))
+    if int(output.get("smoothing_window", 0) or 0) > 1:
+        log("  note: output.smoothing_window is obsolete and ignored — it averaged "
+            "transforms across photos with different coordinate systems, which "
+            "pushed faces out of frame. Remove it from config.toml.")
 
-    window = int(output.get("smoothing_window", 0))
-    smoothed = align.smooth_params(params, window, int(output.get("smoothing_polyorder", 2)))
-    if window > 1:
-        log(f"  smoothing transforms over a {min(window, len(params))}-frame window")
+    eye_pairs = [(np.array([row["left_eye_x"], row["left_eye_y"]]),
+                  np.array([row["right_eye_x"], row["right_eye_y"]]))
+                 for row in rows]
+    matrices = align.transforms_for(eye_pairs, dst_left, dst_right)
+    smoothed = [align.decompose_affine(m) for m in matrices]
 
     workers = workers or max(4, analyze.physical_cores())
 
