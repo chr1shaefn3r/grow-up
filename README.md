@@ -209,7 +209,8 @@ her. `out/contact-sheet.html` shows the aligned frames in order; click to reject
 ## Troubleshooting
 
 ```bash
-grow-up doctor        # probes each endpoint once and reports exactly what it returns
+grow-up doctor            # probes each endpoint once and reports exactly what it returns
+grow-up -v analyze        # show the MediaPipe/TFLite native logging that is hidden by default
 ```
 
 One request per endpoint, fully described — status, content type, body, and the key's
@@ -240,6 +241,12 @@ Immich will shed load long before Immich does. Requests retry transient failures
 5xx, dropped connections) with exponential backoff honouring `Retry-After`; if failures
 persist, lower `fetch.concurrency` in `config.toml`. The reported status says which —
 429 is rate limiting, 502/503/504 is a proxy or server refusing load.
+
+MediaPipe, TFLite and the GL context log heavily from C++ on startup — fiber init,
+XNNPACK delegates, feedback managers — once per worker, so eight workers means eight
+copies interleaved. None of it is actionable, and it drowns the progress output, so it is
+suppressed by default. `-v/--verbose` (or `analyze.verbose` in `config.toml`) brings it
+back when the model itself is what needs diagnosing.
 
 Budget disk for the cache: a few thousand originals at ~4 MB each runs to several GB.
 Downloads stream to disk and are renamed into place only when complete, so an interrupted

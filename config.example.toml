@@ -37,6 +37,10 @@ workers = 0
 bbox_margin = 0.8      # grow Immich's face box before landmarking; the mesh wants context
 min_face_detection_confidence = 0.5
 oob_inset = 0.0        # pixels of margin when testing landmarks against the frame edge
+# MediaPipe, TFLite and the GL context log heavily from C++ on startup -- fiber
+# init, XNNPACK delegates, feedback managers -- once per worker. Hidden by
+# default; set true (or pass --verbose) when diagnosing the model itself.
+verbose = false
 
 # Hard filters. Anything failing one of these never becomes a frame.
 # Loosen these first if the rejects gallery is full of frames you would have kept.

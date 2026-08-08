@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,12 +34,58 @@ _LANDMARKER = None
 _OPTS: "AnalyzeOptions | None" = None
 
 
+# MediaPipe's graphs, TFLite and the GL context all log through C++ (glog/absl),
+# writing to file descriptor 2 directly. Python's logging module cannot filter
+# any of it, and these have to be set before the native libraries initialize --
+# which is why workers set them ahead of importing mediapipe.
+QUIET_ENV = {
+    "GLOG_minloglevel": "2",        # ERROR and above only
+    "GLOG_stderrthreshold": "3",
+    "GLOG_logtostderr": "0",
+    "ABSL_MIN_LOG_LEVEL": "2",
+    "TF_CPP_MIN_LOG_LEVEL": "3",
+}
+
+
+@contextmanager
+def suppress_native_output(enabled: bool = True):
+    """Silence writes to stdout/stderr at the file-descriptor level.
+
+    The env vars above quieten most of it, but a few messages -- notably
+    TFLite's XNNPACK delegate banner -- are written to the descriptor
+    regardless. Only descriptor redirection reliably catches those.
+
+    Safe inside worker processes specifically: they never print anything of
+    their own, returning results to the parent instead, so nothing worth seeing
+    is lost. Failures still surface, because `analyze_one` reports them through
+    its return value rather than by writing to stderr.
+    """
+    if not enabled:
+        yield
+        return
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved = [os.dup(1), os.dup(2)]
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        for fd in (*saved, devnull):
+            os.close(fd)
+
+
 @dataclass(frozen=True)
 class AnalyzeOptions:
     model_path: str = str(DEFAULT_MODEL_PATH)
     bbox_margin: float = 0.8
     min_face_detection_confidence: float = 0.5
     oob_inset: float = 0.0
+    verbose: bool = False
 
 
 def available_cpus() -> int:
@@ -115,6 +162,12 @@ def init_worker(opts: AnalyzeOptions) -> None:
     # pool on top of the process pool is a net loss.
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(var, "1")
+
+    # Must happen before mediapipe is imported, hence here rather than at module
+    # scope: the native log level is read once, when the library initializes.
+    if not opts.verbose:
+        os.environ.update(QUIET_ENV)
+
     try:
         import cv2
 
@@ -122,7 +175,8 @@ def init_worker(opts: AnalyzeOptions) -> None:
     except ImportError:
         pass
 
-    _LANDMARKER = build_landmarker(opts)
+    with suppress_native_output(not opts.verbose):
+        _LANDMARKER = build_landmarker(opts)
 
 
 def build_landmarker(opts: AnalyzeOptions):

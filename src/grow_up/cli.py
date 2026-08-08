@@ -190,19 +190,23 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     asyncio.run(go())
 
 
-def _analyze_options(cfg: config.Config) -> analyze.AnalyzeOptions:
+def _analyze_options(cfg: config.Config,
+                     verbose: bool = False) -> analyze.AnalyzeOptions:
     return analyze.AnalyzeOptions(
         model_path=str(cfg.get("analyze", "model_path", analyze.DEFAULT_MODEL_PATH)),
         bbox_margin=float(cfg.get("analyze", "bbox_margin", 0.8)),
         min_face_detection_confidence=float(
             cfg.get("analyze", "min_face_detection_confidence", 0.5)),
         oob_inset=float(cfg.get("analyze", "oob_inset", 0.0)),
+        # --verbose only ever turns logging on; it never silences a config that
+        # asked for it.
+        verbose=bool(verbose or cfg.get("analyze", "verbose", False)),
     )
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
-    pipeline.stage_analyze(conn, _analyze_options(cfg),
+    pipeline.stage_analyze(conn, _analyze_options(cfg, args.verbose),
                            int(cfg.get("analyze", "workers", 0)), log,
                            reanalyze=args.reanalyze, limit=args.limit)
     cmd_select(args)
@@ -294,7 +298,7 @@ def cmd_trial(args: argparse.Namespace) -> None:
 
     asyncio.run(network_stages())
 
-    opts = _analyze_options(cfg)
+    opts = _analyze_options(cfg, args.verbose)
     with timing.stopwatch() as analyze_elapsed:
         analyzed = pipeline.stage_analyze(
             conn, opts, int(cfg.get("analyze", "workers", 0)), log, limit=limit)
@@ -498,6 +502,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Build an eye-aligned face timelapse from an Immich library.",
     )
     parser.add_argument("--config", default="config.toml", help="path to config.toml")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="show MediaPipe/TFLite native logging, hidden by default")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help_text: str) -> argparse.ArgumentParser:
