@@ -117,18 +117,32 @@ stage       items   elapsed   per item   projected
 faces           -         -          -           -   (nothing pending)
 fetch         100     48.3s      483ms      6m 41s   394.0 MB at 8.2 MB/s -> 3.2 GB total
 analyze       100     12.4s      124ms      1m 43s
-align          18      4.2s      233ms       30.8s   ~150 frames projected
+align          18      4.2s      233ms       30.8s   ~150 frames projected for the full set
+review         18      0.1s        6ms        0.8s
+encode         18      1.9s      106ms       14.0s   out/trial-timelapse.mp4
 --------------------------------------------------
-total         100    1m 04s      649ms      8m 55s
+total         100    1m 07s      667ms      9m 10s
 
 Time per picture:  649ms across all stages (100 sampled)
 Full set:          8m 55s for all 832 assets
 Still to go:       7m 50s (this trial already banked its own work — nothing is repeated)
 ```
 
-**A trial is a partial real run, not a simulation.** Everything it downloads and
-analyzes goes into the cache and manifest, so no work is thrown away — running one
-simply gets you that much further along.
+**A trial is a partial real run, not a simulation.** It goes all the way through to a
+video, so you can judge alignment and framing rather than only timings:
+
+```
+out/contact-sheet.html      the sampled frames, in order
+out/rejects.html            what was filtered out, and why
+out/trial-timelapse.mp4     a short video from the sampled frames
+```
+
+Everything it downloads and analyzes goes into the cache and manifest, so no work is
+thrown away — running one simply gets you that much further along.
+
+The video is written as `trial-` + the configured filename, so a two-second sample can
+never silently replace a finished full render. `--no-encode` stops after the review
+pages if ffmpeg is unavailable or unwanted.
 
 The sample is deterministic and representative: ordering by asset id is stable across
 runs, and since Immich ids are random UUIDs it is also uncorrelated with date,

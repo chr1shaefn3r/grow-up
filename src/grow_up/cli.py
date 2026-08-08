@@ -15,6 +15,7 @@ import urllib.request
 from pathlib import Path
 
 from . import analyze, config, db, pipeline, review, select, timing
+from .encode import FFmpegMissing
 from .immich import (
     ANY,
     OPTIONAL_PERMISSIONS,
@@ -317,9 +318,45 @@ def cmd_trial(args: argparse.Namespace) -> None:
         "align", aligned, align_elapsed(), max(0, projected_frames - aligned),
         unit="frame", note=f"~{projected_frames} frames projected for the full set"))
 
+    if aligned:
+        out_dir = cfg.path("out")
+        with timing.stopwatch() as review_elapsed:
+            cmd_review(args)
+        trial.stages.append(timing.StageTiming(
+            "review", aligned, review_elapsed(), max(0, projected_frames - aligned),
+            unit="frame"))
+
+        # Write the trial video under its own name. A trial renders a handful of
+        # frames, and silently overwriting a finished full render with a
+        # two-second sample would be a poor trade for the convenience.
+        encode_cfg = dict(cfg.section("encode"))
+        encode_cfg["filename"] = f"trial-{encode_cfg.get('filename', 'timelapse.mp4')}"
+        if args.no_encode:
+            log("  skipping encode (--no-encode)")
+        else:
+            try:
+                with timing.stopwatch() as encode_elapsed:
+                    video = pipeline.stage_encode(conn, out_dir, encode_cfg, log)
+                trial.stages.append(timing.StageTiming(
+                    "encode", aligned, encode_elapsed(),
+                    max(0, projected_frames - aligned),
+                    unit="frame", note=str(video)))
+            except FFmpegMissing as exc:
+                log(f"  ! skipping encode: {exc}")
+            except RuntimeError as exc:
+                log(f"  ! encode failed: {exc}")
+    else:
+        log("  no frames survived the filters, so there is nothing to review or encode")
+
     for line in trial.render():
         log(line)
     pipeline.report_rejects(conn, log)
+
+    if aligned:
+        out_dir = cfg.path("out")
+        log("")
+        log(f"Look at {out_dir / 'contact-sheet.html'} to judge alignment and framing,")
+        log(f"and {out_dir / 'rejects.html'} to check the thresholds are not too tight.")
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
@@ -502,6 +539,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--limit", type=int, default=None,
                    help="how many assets to sample (default: trial.limit in config)")
     p.add_argument("--cadence", default=None, choices=list(select.CADENCES))
+    p.add_argument("--no-encode", action="store_true",
+                   help="stop after the review pages, skipping the sample video")
 
     p = add("analyze", cmd_analyze, "landmark faces and compute quality metrics")
     p.add_argument("--reanalyze", action="store_true", help="re-run on already-analyzed assets")

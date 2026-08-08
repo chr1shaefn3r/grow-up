@@ -84,6 +84,87 @@ class TestBuildCommand:
         assert chain.index("minterpolate") < chain.index("scale=trunc")
 
 
+class TestStageEncode:
+    """The trial reuses this stage with an overridden filename, so that a
+    two-second sample cannot silently replace a finished full render."""
+
+    @pytest.fixture()
+    def conn(self, tmp_path):
+        from grow_up import db
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        for i in range(1, 4):
+            frame = tmp_path / f"frame_{i:06d}.jpg"
+            frame.write_bytes(b"\xff\xd8\xff")
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01", stamp))
+            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                         " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+        return conn
+
+    def captured(self, monkeypatch):
+        from grow_up import pipeline
+
+        seen = {}
+
+        def fake_encode(frames, out_path, **kwargs):
+            seen["frames"] = list(frames)
+            seen["out"] = out_path
+            seen.update(kwargs)
+            return out_path
+
+        monkeypatch.setattr(pipeline, "encode", fake_encode)
+        return seen
+
+    def test_uses_the_configured_filename(self, conn, tmp_path, monkeypatch):
+        from grow_up import pipeline
+
+        seen = self.captured(monkeypatch)
+        out = pipeline.stage_encode(conn, tmp_path / "out",
+                                    {"filename": "trial-timelapse.mp4", "fps": 10},
+                                    lambda _: None)
+
+        assert out.name == "trial-timelapse.mp4"
+        assert seen["out"].name == "trial-timelapse.mp4"
+        assert len(seen["frames"]) == 3
+
+    def test_defaults_the_filename(self, conn, tmp_path, monkeypatch):
+        from grow_up import pipeline
+
+        self.captured(monkeypatch)
+        out = pipeline.stage_encode(conn, tmp_path / "out", {}, lambda _: None)
+        assert out.name == "timelapse.mp4"
+
+    def test_honours_manual_rejects(self, conn, tmp_path, monkeypatch):
+        from grow_up import pipeline
+
+        seen = self.captured(monkeypatch)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "rejects.json").write_text('{"rejected": ["a2"]}')
+
+        pipeline.stage_encode(conn, out_dir, {}, lambda _: None)
+        assert len(seen["frames"]) == 2
+        assert all("000002" not in str(f) for f in seen["frames"])
+
+    def test_raises_when_everything_is_rejected(self, conn, tmp_path, monkeypatch):
+        from grow_up import pipeline
+
+        self.captured(monkeypatch)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "rejects.json").write_text('{"rejected": ["a1", "a2", "a3"]}')
+
+        with pytest.raises(RuntimeError, match="no frames"):
+            pipeline.stage_encode(conn, out_dir, {}, lambda _: None)
+
+    def test_ffmpeg_missing_is_a_runtime_error_subclass(self):
+        """cmd_trial catches FFmpegMissing before RuntimeError, so the order of
+        those except clauses depends on this relationship."""
+        assert issubclass(encode.FFmpegMissing, RuntimeError)
+
+
 def test_missing_ffmpeg_says_how_to_install_it(monkeypatch):
     monkeypatch.setattr(encode.shutil, "which", lambda _: None)
     with pytest.raises(encode.FFmpegMissing, match="(?i)install it"):
