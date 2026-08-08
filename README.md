@@ -7,6 +7,22 @@ The download is the easy part. The work is in **filtering** — dropping frames 
 the face is partly out of shot or the eyes aren't on the camera — and in **aligning**
 every remaining frame to the same eye positions so the video doesn't judder.
 
+> ### Authorship
+>
+> **This project was written entirely by Claude**, Anthropic's AI assistant, running as
+> [Claude Code](https://claude.com/claude-code). Every line of the source, the tests, the
+> configuration and this README was authored by the model.
+>
+> The repository owner's role was supervision, not implementation: setting the goal and
+> the constraints, choosing between the approaches put to them, requesting changes, and
+> running the verification against a real Immich library — which the model never had
+> access to, and still does not. No credentials were shared with it.
+>
+> Read the code with that in mind. It is unit-tested and the design decisions are
+> deliberate and documented, but it has been reviewed rather than hand-written, and the
+> caveats under [Verifying against a real library](#verifying-against-a-real-library)
+> apply.
+
 ## How it works
 
 Two things make this tractable:
