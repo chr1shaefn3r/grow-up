@@ -170,6 +170,64 @@ def exposure_percentiles(gray: np.ndarray) -> tuple[float, float]:
     return float(lo), float(hi)
 
 
+@dataclass(frozen=True)
+class Rule:
+    """One hard filter, expressed as data rather than code.
+
+    The rejects page re-evaluates these in the browser so thresholds can be
+    tuned interactively. Serialising the rules -- instead of reimplementing them
+    in JavaScript -- is what keeps the preview honest: there is one definition,
+    and the page interprets it.
+    """
+
+    reason: str
+    fields: tuple[str, ...]
+    op: str            # flag | gt | lt | abs_gt | max_gt
+    limit: str
+    label: str         # human-readable, for the slider
+
+
+RULES: tuple[Rule, ...] = (
+    Rule("bbox_clipped", ("bbox_clipped",), "flag", "allow_bbox_clipped",
+         "allow faces touching the frame edge"),
+    Rule("partially_out_of_frame", ("oob_frac",), "gt", "max_oob_frac",
+         "landmarks allowed outside the frame"),
+    Rule("head_turned", ("yaw",), "abs_gt", "max_yaw", "head turned (yaw°)"),
+    Rule("head_tilted", ("pitch",), "abs_gt", "max_pitch", "head nodding (pitch°)"),
+    Rule("head_rolled", ("roll",), "abs_gt", "max_roll", "head tilted (roll°)"),
+    Rule("looking_away", ("gaze_x",), "abs_gt", "max_gaze", "gaze sideways"),
+    Rule("looking_away", ("gaze_y",), "abs_gt", "max_gaze", "gaze up/down"),
+    Rule("eyes_closed", ("blink_l", "blink_r"), "max_gt", "max_blink", "eyes closed"),
+    Rule("face_too_small", ("interocular_px",), "lt", "min_interocular_px",
+         "minimum eye-to-eye distance (px)"),
+    Rule("blurry", ("sharpness",), "lt", "min_sharpness", "minimum sharpness"),
+    Rule("overexposed", ("exposure_hi",), "gt", "max_exposure_hi", "maximum brightness"),
+    Rule("underexposed", ("exposure_lo",), "lt", "min_exposure_lo", "minimum brightness"),
+)
+
+
+def violates(rule: Rule, m: FaceMetrics, limits: dict) -> bool:
+    values = [getattr(m, field, None) for field in rule.fields]
+
+    if rule.op == "flag":
+        return bool(values[0]) and not limits.get(rule.limit, False)
+
+    present = [v for v in values if v is not None]
+    if not present or rule.limit not in limits:
+        return False
+    limit = limits[rule.limit]
+
+    if rule.op == "gt":
+        return present[0] > limit
+    if rule.op == "lt":
+        return present[0] < limit
+    if rule.op == "abs_gt":
+        return abs(present[0]) > limit
+    if rule.op == "max_gt":
+        return max(present) > limit
+    raise ValueError(f"unknown rule op {rule.op!r}")
+
+
 def hard_reject(m: FaceMetrics, limits: dict) -> str | None:
     """First failing hard filter, or None if the frame is a keeper.
 
@@ -178,25 +236,9 @@ def hard_reject(m: FaceMetrics, limits: dict) -> str | None:
     """
     if not m.detected:
         return "no_face_detected"
-
-    checks: list[tuple[bool, str]] = [
-        (m.bbox_clipped and not limits.get("allow_bbox_clipped", False), "bbox_clipped"),
-        (m.oob_frac is not None and m.oob_frac > limits["max_oob_frac"], "partially_out_of_frame"),
-        (m.yaw is not None and abs(m.yaw) > limits["max_yaw"], "head_turned"),
-        (m.pitch is not None and abs(m.pitch) > limits["max_pitch"], "head_tilted"),
-        (m.roll is not None and abs(m.roll) > limits["max_roll"], "head_rolled"),
-        (m.gaze_x is not None and abs(m.gaze_x) > limits["max_gaze"], "looking_away"),
-        (m.gaze_y is not None and abs(m.gaze_y) > limits["max_gaze"], "looking_away"),
-        (max(m.blink_l or 0.0, m.blink_r or 0.0) > limits["max_blink"], "eyes_closed"),
-        (m.interocular_px is not None
-         and m.interocular_px < limits["min_interocular_px"], "face_too_small"),
-        (m.sharpness is not None and m.sharpness < limits["min_sharpness"], "blurry"),
-        (m.exposure_hi is not None and m.exposure_hi > limits["max_exposure_hi"], "overexposed"),
-        (m.exposure_lo is not None and m.exposure_lo < limits["min_exposure_lo"], "underexposed"),
-    ]
-    for failed, reason in checks:
-        if failed:
-            return reason
+    for rule in RULES:
+        if violates(rule, m, limits):
+            return rule.reason
     return None
 
 

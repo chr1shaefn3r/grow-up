@@ -189,16 +189,31 @@ Four details in there are load-bearing:
 
 ### Tuning the filter
 
-Metrics are stored per asset, not just pass/fail, so retuning never re-runs the ML:
+`out/rejects.html` is an interactive threshold tuner, not just a list of what was
+dropped. It carries a slider per `[filter]` threshold and, as you move one, shows
+**exactly which photos that change would add or drop** — because guessing what
+`max_yaw = 25` buys you is not something a static gallery can answer.
+
+Each slider's range comes from the spread of your own library, so the track always
+covers the photos that actually exist. When it looks right, copy the generated
+`[filter]` block into `config.toml` and:
 
 ```bash
-$EDITOR config.toml        # loosen a threshold under [filter]
 grow-up select             # sub-second; re-applies thresholds from stored metrics
 grow-up align && grow-up encode
 ```
 
-Read `out/rejects.html` **before** trusting the acceptances — it samples dropped frames
-grouped by reason, so an over-tight threshold is visible immediately.
+Metrics are stored per asset, not just pass/fail, so retuning never re-runs the ML.
+
+The page re-evaluates the filter in JavaScript, which raises the obvious question of
+whether the preview matches reality. Both implementations walk the *same* serialized
+rule table (`metrics.RULES`) rather than each spelling the rules out, and the test
+suite runs the page's own filter under node against the Python one over every rule,
+both sides of each boundary, and missing-metric cases. A preview that disagreed with
+the pipeline would be worse than no preview.
+
+Read this page **before** trusting the acceptances: if good photos appear under a
+rejection reason, that threshold is too tight.
 
 ### Manual review
 

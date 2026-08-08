@@ -65,6 +65,56 @@ class TestContactSheet:
         review.write_contact_sheet(conn, out)
         assert 'data-id="asset-2"' in out.read_text()
 
+    def test_tiles_are_big_enough_to_judge_a_face(self, conn, tmp_path):
+        """A 1080x1350 frame rendered ~150px wide shows nothing useful about
+        eye alignment or sharpness, which is the whole point of the page."""
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+
+        default_tile = re.search(r"--tile:\s*(\d+)px", out.read_text())
+        assert default_tile and int(default_tile.group(1)) >= 300
+
+    def test_images_are_shown_whole_never_cropped(self, conn, tmp_path):
+        """object-fit: cover would crop away the framing being assessed."""
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        css = out.read_text()
+
+        assert re.search(r"figure img\s*\{[^}]*width:100%[^}]*height:auto", css)
+        assert "object-fit:cover" not in css.replace(" ", "")
+
+    def test_offers_size_controls(self, conn, tmp_path):
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        html = out.read_text()
+
+        assert html.count("data-tile=") == 3
+        assert 'data-tile="520px"' in html
+
+    def test_has_a_full_size_viewer(self, conn, tmp_path):
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        html = out.read_text()
+
+        assert 'id="viewer"' in html and 'id="viewer-img"' in html
+        assert "ArrowRight" in html and "ArrowLeft" in html, "flipbook navigation"
+        assert "Escape" in html
+
+    def test_rejection_has_its_own_control(self, conn, tmp_path):
+        """Clicking the image opens the viewer, so rejecting needs a separate
+        affordance rather than sharing the click."""
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        html = out.read_text()
+
+        assert html.count(">reject<") == 3
+        assert "stopPropagation" in html
+
+    def test_each_frame_carries_a_label_for_the_viewer(self, conn, tmp_path):
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        assert 'data-label="2026-01-10  #1"' in out.read_text()
+
 
 class TestRejectsGallery:
     def test_groups_by_reason(self, conn, tmp_path):
@@ -105,6 +155,26 @@ class TestRejectsGallery:
         out = tmp_path / "out" / "rejects.html"
         assert review.write_rejects_gallery(conn, out) == 0
         assert out.exists()
+
+    def test_also_gets_the_viewer_and_size_controls(self, conn, tmp_path):
+        """Rejects are full-resolution originals, so judging them at tile size
+        is even less workable than judging the aligned crops."""
+        add_rejected(conn, "bad-1", "blurry", tmp_path)
+        out = tmp_path / "out" / "rejects.html"
+        review.write_rejects_gallery(conn, out)
+        html = out.read_text()
+
+        assert 'id="viewer"' in html
+        assert "data-tile=" in html
+        assert 'data-id="bad-1"' in html
+
+    def test_stays_self_contained(self, conn, tmp_path):
+        add_rejected(conn, "bad-1", "blurry", tmp_path)
+        out = tmp_path / "out" / "rejects.html"
+        review.write_rejects_gallery(conn, out)
+        html = out.read_text()
+
+        assert not re.search(r"""(src|href)\s*=\s*["']https?://""", html)
 
 
 class TestManualRejects:

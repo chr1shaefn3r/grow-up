@@ -235,7 +235,8 @@ def cmd_review(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
     out_dir = cfg.path("out")
     accepted = review.write_contact_sheet(conn, out_dir / "contact-sheet.html")
-    rejected = review.write_rejects_gallery(conn, out_dir / "rejects.html")
+    rejected = review.write_rejects_gallery(conn, out_dir / "rejects.html",
+                                            limits=cfg.section("filter"))
     log(f"  contact sheet: {accepted} frames -> {out_dir / 'contact-sheet.html'}")
     log(f"  rejects gallery: {rejected} samples -> {out_dir / 'rejects.html'}")
 
