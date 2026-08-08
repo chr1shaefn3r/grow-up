@@ -31,9 +31,16 @@ class Progress:
     def __init__(self, label: str, total: int, *, stream: TextIO | None = None,
                  emit: Callable[[str], None] | None = None, show_bytes: bool = False,
                  min_interval: float = 0.1, quiet_interval: float = 15.0,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 overall: int | None = None, already_done: int = 0):
         self.label = label
         self.total = max(0, int(total))
+        # The bar tracks this batch, so it fills to 100% and its ETA is right.
+        # The closing summary instead reports position in the *whole* job:
+        # after `trial -n 100` against 832 outstanding assets, "100/100" hides
+        # that 732 remain, which is the number worth knowing.
+        self.overall = self.total if overall is None else max(0, int(overall))
+        self.already_done = max(0, int(already_done))
         self.show_bytes = show_bytes
         self.min_interval = min_interval
         self.quiet_interval = quiet_interval
@@ -83,17 +90,25 @@ class Progress:
             self._emit(message)
             self._paint(force=True)
 
+    @property
+    def overall_done(self) -> int:
+        return self.already_done + self.completed
+
     def close(self) -> None:
-        """Finish the bar, leaving one durable summary line behind."""
+        """Finish the bar, leaving exactly one durable summary line behind."""
         with self._lock:
             self._clear()
-            summary = f"  {self.label}: {self.completed}/{self.total}"
+            denominator = max(self.overall, self.overall_done)
+            summary = (f"  {self.label}: {self.overall_done}/{denominator}"
+                       f" in {format_duration(self.elapsed)}")
             if self.failed:
                 summary += f", {self.failed} failed"
             if self.show_bytes and self.bytes:
-                summary += f", {format_bytes(self.bytes)}"
-                summary += f" at {format_bytes(self.bytes / self.elapsed)}/s"
-            summary += f" in {format_duration(self.elapsed)}"
+                summary += (f", {format_bytes(self.bytes)} at "
+                            f"{format_bytes(self.bytes / self.elapsed)}/s")
+            remaining = denominator - self.overall_done
+            if remaining:
+                summary += f" ({remaining} still pending)"
             self._emit(summary)
             self._painted = False
 

@@ -192,7 +192,12 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
     ok = missing = 0
     errors: list[str] = []
     lock = asyncio.Lock()
-    bar = Progress("faces", len(pending), emit=log)
+    # `pending` is capped by --limit; the summary should still report position
+    # in the whole job, so ask how much is outstanding overall.
+    total_assets = conn.execute("SELECT count(*) FROM assets").fetchone()[0]
+    outstanding = pending_counts(conn)["faces"]
+    bar = Progress("faces", len(pending), emit=log,
+                   overall=total_assets, already_done=total_assets - outstanding)
 
     async def one(asset_id: str) -> None:
         nonlocal ok, missing
@@ -260,7 +265,11 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
     errors: list[str] = []
     # Originals run to several MB each, so throughput is the number that tells
     # you whether the run is minutes or hours.
-    bar = Progress("fetch", len(pending), emit=log, show_bytes=True)
+    downloadable = conn.execute(
+        "SELECT count(*) FROM faces WHERE status = 'ok'").fetchone()[0]
+    outstanding = pending_counts(conn)["fetch"]
+    bar = Progress("fetch", len(pending), emit=log, show_bytes=True,
+                   overall=downloadable, already_done=downloadable - outstanding)
 
     async def one(asset_id: str, filename: str | None) -> None:
         nonlocal done
@@ -319,7 +328,12 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
 
     done = 0
     stamp = db.iso_z(db.now_utc())
-    bar = Progress("analyze", len(jobs), emit=log)
+    analyzable = conn.execute(
+        "SELECT count(*) FROM downloads d"
+        "  JOIN faces f ON f.asset_id = d.asset_id AND f.status = 'ok'").fetchone()[0]
+    outstanding = pending_counts(conn)["analyze"]
+    bar = Progress("analyze", len(jobs), emit=log,
+                   overall=analyzable, already_done=analyzable - outstanding)
     with ProcessPoolExecutor(max_workers=workers, initializer=analyze.init_worker,
                              initargs=(opts,)) as pool:
         for asset_id, m in pool.map(analyze.analyze_one, jobs, chunksize=8):

@@ -139,6 +139,53 @@ class TestTerminalOutput:
         assert lines[-1].strip().startswith("fetch: 10/10")
         assert "42.0s" in lines[-1]
 
+    def test_summary_counts_against_the_whole_job(self):
+        """After `trial -n 100` against 832 outstanding assets, "100/100" would
+        hide that 732 remain -- which is the number worth knowing."""
+        bar, _, lines, clock = make(total=100, overall=832)
+        clock.tick(48.3)
+        bar.advance(count=100)
+        bar.close()
+
+        assert "fetch: 100/832" in lines[-1]
+        assert "732 still pending" in lines[-1]
+
+    def test_summary_includes_work_from_earlier_runs(self):
+        bar, _, lines, _ = make(total=100, overall=832, already_done=100)
+        bar.advance(count=100)
+        bar.close()
+
+        assert "fetch: 200/832" in lines[-1]
+        assert "632 still pending" in lines[-1]
+
+    def test_no_pending_note_when_the_job_is_finished(self):
+        bar, _, lines, _ = make(total=832, overall=832)
+        bar.advance(count=832)
+        bar.close()
+
+        assert "fetch: 832/832" in lines[-1]
+        assert "pending" not in lines[-1]
+
+    def test_summary_is_a_single_line(self):
+        bar, _, lines, clock = make(total=100, overall=832, show_bytes=True)
+        clock.tick(10.0)
+        bar.advance(count=100, nbytes=1024 * 1024)
+        bar.close()
+
+        assert len(lines) == 1
+        assert "\n" not in lines[0]
+
+    def test_bar_itself_still_tracks_the_batch(self):
+        """The bar must reach 100% and give a batch-accurate ETA, even though
+        the summary reports the wider job."""
+        bar, _, _, clock = make(total=100, overall=832)
+        clock.tick(10.0)
+        bar.advance(count=100)
+
+        assert "100/100" in bar.render()
+        assert "100%" in bar.render()
+        assert bar.eta is None
+
     def test_close_reports_failures_and_bytes(self):
         bar, _, lines, clock = make(total=10, show_bytes=True)
         clock.tick(2.0)

@@ -267,7 +267,6 @@ def cmd_trial(args: argparse.Namespace) -> None:
         async with _client(cfg) as client:
             await preflight(client)
 
-            log("\n-- faces --")
             with timing.stopwatch() as faces_elapsed:
                 found, _ = await pipeline.stage_faces(
                     client, conn, person_id, log,
@@ -275,7 +274,6 @@ def cmd_trial(args: argparse.Namespace) -> None:
             trial.stages.append(timing.StageTiming(
                 "faces", found, faces_elapsed(), before["faces"]))
 
-            log("\n-- fetch --")
             with timing.stopwatch() as fetch_elapsed:
                 fetched = await pipeline.stage_fetch(
                     client, conn, cfg.path("cache"),
@@ -295,7 +293,6 @@ def cmd_trial(args: argparse.Namespace) -> None:
 
     asyncio.run(network_stages())
 
-    log("\n-- analyze --")
     opts = _analyze_options(cfg)
     with timing.stopwatch() as analyze_elapsed:
         analyzed = pipeline.stage_analyze(
@@ -303,7 +300,6 @@ def cmd_trial(args: argparse.Namespace) -> None:
     trial.stages.append(timing.StageTiming(
         "analyze", analyzed, analyze_elapsed(), before["analyze"]))
 
-    log("\n-- select --")
     limits, weights = cfg.section("filter"), cfg.section("score")
     kept, scored = select.apply_filters(conn, limits, weights)
     cadence = args.cadence or str(cfg.get("select", "cadence", "week"))
@@ -311,7 +307,6 @@ def cmd_trial(args: argparse.Namespace) -> None:
     log(f"  {kept}/{scored} pass the filters; {frames} frames selected "
         f"(cadence={cadence})")
 
-    log("\n-- align --")
     with timing.stopwatch() as align_elapsed:
         aligned = pipeline.stage_align(conn, cfg.path("frames"), cfg.section("output"),
                                        log, int(cfg.get("analyze", "workers", 0)))
