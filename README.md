@@ -93,6 +93,16 @@ grow-up status       # manifest counts, stored watermark, recent runs
 Every stage is also runnable on its own and skips work the manifest already records,
 so interrupting any of them costs only the item in flight.
 
+The bulk stages show live progress, with throughput and an ETA where they mean
+something:
+
+```
+  fetch    [=========               ]   312/832  38%   1.2 GB at 8.5 MB/s   eta 4m 09s
+```
+
+When output is not a terminal — redirected to a file, or running under CI — the bar
+degrades to occasional plain lines instead of repainting, so logs stay readable.
+
 ### Trial runs
 
 Before committing to a few thousand photos, measure a sample:

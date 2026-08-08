@@ -19,6 +19,7 @@ import numpy as np
 from . import align, analyze, db, images, review, select
 from .encode import encode
 from .immich import ImmichClient, pick_face
+from .progress import Progress
 
 Log = Callable[[str], None]
 
@@ -191,6 +192,7 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
     ok = missing = 0
     errors: list[str] = []
     lock = asyncio.Lock()
+    bar = Progress("faces", len(pending), emit=log)
 
     async def one(asset_id: str) -> None:
         nonlocal ok, missing
@@ -206,7 +208,8 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
                     )
                     missing += 1
                     errors.append(str(exc))
-                _log_error(log, errors, f"faces {asset_id}", exc)
+                _log_error(bar.log, errors, f"faces {asset_id}", exc)
+                bar.advance(failed=1)
                 return
 
         face, n = pick_face(faces, person_id)
@@ -227,8 +230,10 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
                      face.image_height, face.source_type, n, db.iso_z(db.now_utc())),
                 )
                 ok += 1
+        bar.advance()
 
     await asyncio.gather(*(one(a) for a in pending))
+    bar.close()
     log(f"  face boxes: {ok} found, {missing} without a usable detection")
     _abort_if_hopeless("face lookup", ok, errors, len(pending))
     return ok, missing
@@ -253,6 +258,9 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
     lock = asyncio.Lock()
     done = 0
     errors: list[str] = []
+    # Originals run to several MB each, so throughput is the number that tells
+    # you whether the run is minutes or hours.
+    bar = Progress("fetch", len(pending), emit=log, show_bytes=True)
 
     async def one(asset_id: str, filename: str | None) -> None:
         nonlocal done
@@ -265,20 +273,21 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
                 except Exception as exc:  # noqa: BLE001
                     async with lock:
                         errors.append(str(exc))
-                    _log_error(log, errors, f"download {asset_id}", exc)
+                    _log_error(bar.log, errors, f"download {asset_id}", exc)
+                    bar.advance(failed=1)
                     return
+        size = target.stat().st_size
         async with lock:
             conn.execute(
                 "INSERT OR REPLACE INTO downloads (asset_id, path, bytes, source, fetched_at)"
                 " VALUES (?, ?, ?, ?, ?)",
-                (asset_id, str(target), target.stat().st_size, source, db.iso_z(db.now_utc())),
+                (asset_id, str(target), size, source, db.iso_z(db.now_utc())),
             )
             done += 1
-            if done % 100 == 0:
-                log(f"  downloaded {done}/{len(pending)}…")
+        bar.advance(nbytes=size)
 
     await asyncio.gather(*(one(r["id"], r["original_file_name"]) for r in pending))
-    log(f"  downloaded {done} files")
+    bar.close()
     _abort_if_hopeless("download", done, errors, len(pending))
     return done
 
@@ -310,15 +319,15 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
 
     done = 0
     stamp = db.iso_z(db.now_utc())
+    bar = Progress("analyze", len(jobs), emit=log)
     with ProcessPoolExecutor(max_workers=workers, initializer=analyze.init_worker,
                              initargs=(opts,)) as pool:
         for asset_id, m in pool.map(analyze.analyze_one, jobs, chunksize=8):
             _store_metrics(conn, asset_id, m, stamp)
             done += 1
-            if done % 200 == 0:
-                log(f"  analyzed {done}/{len(jobs)}…")
+            bar.advance()
 
-    log(f"  analyzed {done} images")
+    bar.close()
     return done
 
 
@@ -375,13 +384,14 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
         return row["asset_id"], str(out_path), seq, p, luma
 
     results = []
+    bar = Progress("align", len(rows), emit=log)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for n, result in enumerate(pool.map(one, [
+        for result in pool.map(one, [
             (i, row, p) for i, (row, p) in enumerate(zip(rows, smoothed), start=1)
-        ]), start=1):
+        ]):
             results.append(result)
-            if n % 100 == 0:
-                log(f"  aligned {n}/{len(rows)}…")
+            bar.advance()
+    bar.close()
 
     results.sort(key=lambda r: r[2])
     stamp = db.iso_z(db.now_utc())
