@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grow-up"
+version = "0.1.0"
+description = "Build an eye-aligned face timelapse from photos of one person in an Immich library"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "mediapipe>=0.10.14",
+    "pillow>=10.2",
+    "pillow-heif>=0.16",
+    "scipy>=1.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+grow-up = "grow_up.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

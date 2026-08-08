@@ -1,0 +1,312 @@
+"""Command line interface.
+
+`--since` is threaded into the index stage and nowhere else. Selection,
+alignment and encoding must always see the whole corpus: constraining them to
+the incremental window would silently produce a timelapse containing only the
+last few days of frames.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+import urllib.request
+from pathlib import Path
+
+from . import analyze, config, db, pipeline, review, select
+from .immich import ImmichClient
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _open(args: argparse.Namespace):
+    cfg = config.load(args.config)
+    conn = db.connect(cfg.path("db"))
+    return cfg, conn
+
+
+def _person_id(cfg: config.Config, conn) -> str:
+    """Resolve the target person, caching the id in config for later runs."""
+    person_id = cfg.get("immich", "person_id")
+    if person_id:
+        return str(person_id)
+
+    name = cfg.get("immich", "person_name")
+    if not name:
+        raise SystemExit("set immich.person_id or immich.person_name in config.toml")
+
+    async def resolve() -> str:
+        async with ImmichClient(config.credentials()) as client:
+            person = await client.resolve_person(str(name))
+            log(f"resolved {person.name!r} -> {person.id}")
+            log("  (put this in config.toml as immich.person_id to skip the lookup)")
+            return person.id
+
+    return asyncio.run(resolve())
+
+
+# --------------------------------------------------------------------------- #
+# Individual stages
+# --------------------------------------------------------------------------- #
+
+def cmd_fetch_model(args: argparse.Namespace) -> None:
+    target = Path(args.output or analyze.DEFAULT_MODEL_PATH)
+    if target.exists() and not args.force:
+        log(f"{target} already present")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    log(f"downloading {analyze.MODEL_URL}")
+    urllib.request.urlretrieve(analyze.MODEL_URL, target)  # noqa: S310
+    log(f"saved {target} ({target.stat().st_size / 1e6:.1f} MB)")
+
+
+def cmd_index(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    person_id = _person_id(cfg, conn)
+    asyncio.run(_index(cfg, conn, person_id, args.since, args.full))
+
+
+async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> int:
+    """Index stage plus watermark bookkeeping. Returns assets newly added."""
+    started_at = db.now_utc()
+    watermark = pipeline.resolve_watermark(conn, person_id, since, full)
+    log(f"watermark: {watermark.value or '(none — full index)'}  [{watermark.source}]")
+
+    run_id = db.start_run(conn, person_id, started_at, watermark.value, watermark.source)
+    page_size = int(cfg.get("index", "page_size", 1000))
+
+    try:
+        async with ImmichClient(config.credentials()) as client:
+            await client.ping()
+            _, new = await pipeline.stage_index(
+                client, conn, person_id, watermark, page_size, log
+            )
+
+            current_count = await client.person_asset_count(person_id)
+            state = db.get_sync_state(conn, person_id)
+            stored_count = state.person_assets if state else None
+
+            if not watermark.is_full and pipeline.detect_drift(stored_count, current_count, new):
+                log(
+                    f"drift detected: Immich reports {current_count} assets for this person "
+                    f"(was {stored_count}) but the incremental window only found {new} new. "
+                    "She was likely tagged in older photos — re-indexing in full."
+                )
+                _, new = await pipeline.stage_index(
+                    client, conn, person_id, pipeline.Watermark(None, "full: drift detected"),
+                    page_size, log,
+                )
+                current_count = await client.person_asset_count(person_id)
+    except Exception:
+        # Leave the previous watermark alone so the un-indexed window is covered
+        # again next run.
+        db.fail_run(conn, run_id)
+        raise
+
+    stored = db.commit_watermark(conn, run_id, person_id, started_at, current_count, new)
+    log(f"watermark advanced to {stored}")
+    return new
+
+
+def cmd_faces(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    person_id = _person_id(cfg, conn)
+
+    async def go() -> None:
+        async with ImmichClient(config.credentials()) as client:
+            await pipeline.stage_faces(client, conn, person_id, log,
+                                       int(cfg.get("fetch", "concurrency", 16)))
+
+    asyncio.run(go())
+
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+
+    async def go() -> None:
+        async with ImmichClient(config.credentials()) as client:
+            await pipeline.stage_fetch(
+                client, conn, cfg.path("cache"),
+                str(cfg.get("fetch", "source", "original")), log,
+                int(cfg.get("fetch", "concurrency", 8)),
+            )
+
+    asyncio.run(go())
+
+
+def cmd_analyze(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    opts = analyze.AnalyzeOptions(
+        model_path=str(cfg.get("analyze", "model_path", analyze.DEFAULT_MODEL_PATH)),
+        bbox_margin=float(cfg.get("analyze", "bbox_margin", 0.8)),
+        min_face_detection_confidence=float(
+            cfg.get("analyze", "min_face_detection_confidence", 0.5)),
+        oob_inset=float(cfg.get("analyze", "oob_inset", 0.0)),
+    )
+    pipeline.stage_analyze(conn, opts, int(cfg.get("analyze", "workers", 0)), log,
+                           reanalyze=args.reanalyze)
+    cmd_select(args)
+
+
+def cmd_select(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    limits, weights = cfg.section("filter"), cfg.section("score")
+    kept, total = select.apply_filters(conn, limits, weights)
+    log(f"  {kept}/{total} images pass the hard filters")
+
+    cadence = getattr(args, "cadence", None) or str(cfg.get("select", "cadence", "week"))
+    per_bucket = int(cfg.get("select", "per_bucket", 1))
+    n = select.select_frames(conn, cadence, per_bucket)
+    log(f"  selected {n} frames (cadence={cadence}, {per_bucket} per bucket)")
+    pipeline.report_rejects(conn, log)
+
+
+def cmd_align(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    pipeline.stage_align(conn, cfg.path("frames"), cfg.section("output"), log,
+                         int(cfg.get("analyze", "workers", 0)))
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    out_dir = cfg.path("out")
+    accepted = review.write_contact_sheet(conn, out_dir / "contact-sheet.html")
+    rejected = review.write_rejects_gallery(conn, out_dir / "rejects.html")
+    log(f"  contact sheet: {accepted} frames -> {out_dir / 'contact-sheet.html'}")
+    log(f"  rejects gallery: {rejected} samples -> {out_dir / 'rejects.html'}")
+
+
+def cmd_encode(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    out = pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log)
+    log(f"  wrote {out}")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    person_id = str(cfg.get("immich", "person_id") or "")
+    log(f"database: {cfg.path('db')}")
+    for table in ("assets", "faces", "downloads", "metrics", "selection", "frames"):
+        n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        log(f"  {table:<12} {n:>7}")
+
+    state = db.get_sync_state(conn, person_id) if person_id else None
+    if state:
+        log(f"\nwatermark   {state.watermark}")
+        log(f"last run    {state.last_run_at}")
+        log(f"person has  {state.person_assets} assets per Immich at that point")
+    else:
+        log("\nno watermark stored yet — the next run will be a full index")
+
+    rows = conn.execute(
+        "SELECT started_at, watermark_source, assets_indexed, status"
+        "  FROM runs ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+    if rows:
+        log("\nrecent runs:")
+        for r in rows:
+            log(f"  {r['started_at']}  {r['status']:<7} {r['watermark_source']:<22}"
+                f" +{r['assets_indexed'] or 0}")
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """The whole pipeline. A bare `run` is implicitly incremental."""
+    cfg, conn = _open(args)
+    person_id = _person_id(cfg, conn)
+
+    async def network_stages() -> None:
+        # --since / --full apply here and stop here.
+        await _index(cfg, conn, person_id, args.since, args.full)
+        async with ImmichClient(config.credentials()) as client:
+            await pipeline.stage_faces(client, conn, person_id, log,
+                                       int(cfg.get("fetch", "concurrency", 16)))
+            await pipeline.stage_fetch(
+                client, conn, cfg.path("cache"),
+                str(cfg.get("fetch", "source", "original")), log,
+                int(cfg.get("fetch", "concurrency", 8)),
+            )
+
+    log("== index ==")
+    asyncio.run(network_stages())
+
+    log("== analyze ==")
+    cmd_analyze(args)
+
+    log("== align ==")
+    cmd_align(args)
+
+    log("== review ==")
+    cmd_review(args)
+
+    if args.no_encode:
+        log("\nskipping encode (--no-encode)")
+        return
+
+    log("== encode ==")
+    cmd_encode(args)
+    log("\nReview out/contact-sheet.html, drop rejects.json beside it, "
+        "then re-run `grow-up encode` to apply them.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="grow-up",
+        description="Build an eye-aligned face timelapse from an Immich library.",
+    )
+    parser.add_argument("--config", default="config.toml", help="path to config.toml")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add(name: str, func, help_text: str) -> argparse.ArgumentParser:
+        p = sub.add_parser(name, help=help_text)
+        p.set_defaults(func=func, since=None, full=False, reanalyze=False,
+                       cadence=None, no_encode=False)
+        return p
+
+    model = add("fetch-model", cmd_fetch_model, "download the MediaPipe face landmarker model")
+    model.add_argument("-o", "--output", default=None)
+    model.add_argument("--force", action="store_true")
+
+    for name, func, help_text in (
+        ("index", cmd_index, "enumerate her photos (honours the sync watermark)"),
+        ("run", cmd_run, "run every stage; incremental by default"),
+    ):
+        p = add(name, func, help_text)
+        p.add_argument("--since", default=None,
+                       help="override the stored watermark (ISO-8601, e.g. 2026-01-01T00:00:00Z)")
+        p.add_argument("--full", action="store_true",
+                       help="ignore the stored watermark and re-index everything")
+        if name == "run":
+            p.add_argument("--cadence", default=None, choices=list(select.CADENCES))
+            p.add_argument("--no-encode", action="store_true")
+
+    add("faces", cmd_faces, "fetch her face bounding box per asset")
+    add("fetch", cmd_fetch, "download originals")
+
+    p = add("analyze", cmd_analyze, "landmark faces and compute quality metrics")
+    p.add_argument("--reanalyze", action="store_true", help="re-run on already-analyzed assets")
+
+    p = add("select", cmd_select, "re-apply thresholds and pick frames (no ML re-run)")
+    p.add_argument("--cadence", default=None, choices=list(select.CADENCES))
+
+    add("align", cmd_align, "warp selected frames onto canonical eye positions")
+    add("review", cmd_review, "write the contact sheet and rejects gallery")
+    add("encode", cmd_encode, "encode the video")
+    add("status", cmd_status, "show manifest counts and the stored watermark")
+    return parser
+
+
+def app(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except (RuntimeError, FileNotFoundError, SystemExit) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(app())

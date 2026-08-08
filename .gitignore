@@ -1,0 +1,15 @@
+# Local config carries the person id for a real library
+config.toml
+
+# Downloaded originals, frames, database, rendered video
+data/
+out/
+models/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.DS_Store

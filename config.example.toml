@@ -1,0 +1,76 @@
+# Copy to config.toml and edit. Credentials are NOT stored here -- they come
+# from the IMMICH_URL and IMMICH_API_KEY environment variables, so this file
+# stays safe to commit.
+
+[immich]
+person_name = "Her Name"
+# Filled in after the first lookup; setting it skips the name resolution.
+person_id = ""
+
+[paths]
+db = "data/grow-up.sqlite"
+cache = "data/originals"
+frames = "data/frames"
+out = "out"
+
+[index]
+page_size = 1000
+
+[fetch]
+concurrency = 8
+# "original" for maximum quality; "preview" is smaller and always a JPEG, which
+# sidesteps HEIC decoding at the cost of resolution.
+source = "original"
+
+[analyze]
+model_path = "models/face_landmarker.task"
+workers = 0            # 0 = physical cores
+bbox_margin = 0.8      # grow Immich's face box before landmarking; the mesh wants context
+min_face_detection_confidence = 0.5
+oob_inset = 0.0        # pixels of margin when testing landmarks against the frame edge
+
+# Hard filters. Anything failing one of these never becomes a frame.
+# Loosen these first if the rejects gallery is full of frames you would have kept.
+[filter]
+max_yaw = 20.0             # degrees; head turned left/right
+max_pitch = 18.0           # degrees; head nodding up/down
+max_roll = 25.0            # degrees; head tilted (alignment corrects this, so it can be generous)
+max_gaze = 0.35            # 0..1; eyes looking away from the lens, independent of head pose
+max_blink = 0.45           # 0..1; higher means more half-closed eyes get through
+max_oob_frac = 0.005       # fraction of the 478 landmarks allowed outside the frame
+allow_bbox_clipped = false # accept faces touching the image edge
+min_interocular_px = 60.0  # eye-to-eye distance; below this the frame upscales badly
+min_sharpness = 12.0       # Laplacian variance on the eye region at a canonical scale
+min_exposure_lo = 8.0
+max_exposure_hi = 250.0
+
+# Relative weights for ranking the survivors. Only their ratios matter.
+[score]
+w_pose = 1.0
+w_gaze = 1.0
+w_eyes_open = 1.0
+w_sharpness = 1.0
+w_size = 0.5
+
+[select]
+# day | week | month | all -- bucket the timeline and keep the best per bucket,
+# so a photo-heavy holiday cannot dominate the video.
+cadence = "week"
+per_bucket = 1
+
+[output]
+width = 1080
+height = 1350
+# Canonical eye positions as fractions of the output frame.
+left_eye = [0.36, 0.42]
+right_eye = [0.64, 0.42]
+smoothing_window = 9       # frames; 0 disables temporal smoothing of the transform
+smoothing_polyorder = 2
+flicker_match = true
+
+[encode]
+filename = "timelapse.mp4"
+fps = 10
+codec = "libx264"          # "hevc_videotoolbox" is much faster on Apple Silicon
+crf = 18
+interpolate = false        # ffmpeg minterpolate; smoother but very slow
