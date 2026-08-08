@@ -14,7 +14,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from . import analyze, config, db, pipeline, review, select
+from . import analyze, config, db, pipeline, review, select, timing
 from .immich import (
     ANY,
     OPTIONAL_PERMISSIONS,
@@ -169,7 +169,8 @@ def cmd_faces(args: argparse.Namespace) -> None:
     async def go() -> None:
         async with _client(cfg) as client:
             await pipeline.stage_faces(client, conn, person_id, log,
-                                       int(cfg.get("fetch", "concurrency", 16)))
+                                       int(cfg.get("fetch", "concurrency", 16)),
+                                       limit=args.limit)
 
     asyncio.run(go())
 
@@ -182,23 +183,27 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             await pipeline.stage_fetch(
                 client, conn, cfg.path("cache"),
                 str(cfg.get("fetch", "source", "original")), log,
-                int(cfg.get("fetch", "concurrency", 8)),
+                int(cfg.get("fetch", "concurrency", 8)), limit=args.limit,
             )
 
     asyncio.run(go())
 
 
-def cmd_analyze(args: argparse.Namespace) -> None:
-    cfg, conn = _open(args)
-    opts = analyze.AnalyzeOptions(
+def _analyze_options(cfg: config.Config) -> analyze.AnalyzeOptions:
+    return analyze.AnalyzeOptions(
         model_path=str(cfg.get("analyze", "model_path", analyze.DEFAULT_MODEL_PATH)),
         bbox_margin=float(cfg.get("analyze", "bbox_margin", 0.8)),
         min_face_detection_confidence=float(
             cfg.get("analyze", "min_face_detection_confidence", 0.5)),
         oob_inset=float(cfg.get("analyze", "oob_inset", 0.0)),
     )
-    pipeline.stage_analyze(conn, opts, int(cfg.get("analyze", "workers", 0)), log,
-                           reanalyze=args.reanalyze)
+
+
+def cmd_analyze(args: argparse.Namespace) -> None:
+    cfg, conn = _open(args)
+    pipeline.stage_analyze(conn, _analyze_options(cfg),
+                           int(cfg.get("analyze", "workers", 0)), log,
+                           reanalyze=args.reanalyze, limit=args.limit)
     cmd_select(args)
 
 
@@ -234,6 +239,92 @@ def cmd_encode(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
     out = pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log)
     log(f"  wrote {out}")
+
+
+def cmd_trial(args: argparse.Namespace) -> None:
+    """Run the pipeline over a sample and project the full run from it.
+
+    A trial is a *partial real run*, not a simulation: everything it downloads
+    and analyzes is written to the manifest and cache, so none of the work is
+    repeated later. Running a trial simply gets you that much further along.
+    """
+    cfg, conn = _open(args)
+
+    total_assets = db.count_assets(conn)
+    if not total_assets:
+        raise SystemExit("no assets indexed yet — run `grow-up index` first")
+
+    person_id = _person_id(cfg, conn)
+    limit = int(args.limit or cfg.get("trial", "limit", 100))
+    before = pipeline.pending_counts(conn)
+    trial = timing.Trial(sample_size=limit, total_assets=total_assets)
+    log(f"== trial: sampling up to {limit} of {total_assets} indexed assets ==")
+
+    bytes_before = conn.execute(
+        "SELECT coalesce(sum(bytes), 0) FROM downloads").fetchone()[0]
+
+    async def network_stages() -> None:
+        async with _client(cfg) as client:
+            await preflight(client)
+
+            log("\n-- faces --")
+            with timing.stopwatch() as faces_elapsed:
+                found, _ = await pipeline.stage_faces(
+                    client, conn, person_id, log,
+                    int(cfg.get("fetch", "concurrency", 16)), limit=limit)
+            trial.stages.append(timing.StageTiming(
+                "faces", found, faces_elapsed(), before["faces"]))
+
+            log("\n-- fetch --")
+            with timing.stopwatch() as fetch_elapsed:
+                fetched = await pipeline.stage_fetch(
+                    client, conn, cfg.path("cache"),
+                    str(cfg.get("fetch", "source", "original")), log,
+                    int(cfg.get("fetch", "concurrency", 8)), limit=limit)
+            downloaded = conn.execute(
+                "SELECT coalesce(sum(bytes), 0) FROM downloads").fetchone()[0] - bytes_before
+            note = ""
+            if fetched and downloaded:
+                rate = downloaded / max(fetch_elapsed(), 1e-6)
+                projected_bytes = downloaded / fetched * before["fetch"]
+                note = (f"{timing.format_bytes(downloaded)} at "
+                        f"{timing.format_bytes(rate)}/s -> "
+                        f"{timing.format_bytes(projected_bytes)} total")
+            trial.stages.append(timing.StageTiming(
+                "fetch", fetched, fetch_elapsed(), before["fetch"], note=note))
+
+    asyncio.run(network_stages())
+
+    log("\n-- analyze --")
+    opts = _analyze_options(cfg)
+    with timing.stopwatch() as analyze_elapsed:
+        analyzed = pipeline.stage_analyze(
+            conn, opts, int(cfg.get("analyze", "workers", 0)), log, limit=limit)
+    trial.stages.append(timing.StageTiming(
+        "analyze", analyzed, analyze_elapsed(), before["analyze"]))
+
+    log("\n-- select --")
+    limits, weights = cfg.section("filter"), cfg.section("score")
+    kept, scored = select.apply_filters(conn, limits, weights)
+    cadence = args.cadence or str(cfg.get("select", "cadence", "week"))
+    frames = select.select_frames(conn, cadence, int(cfg.get("select", "per_bucket", 1)))
+    log(f"  {kept}/{scored} pass the filters; {frames} frames selected "
+        f"(cadence={cadence})")
+
+    log("\n-- align --")
+    with timing.stopwatch() as align_elapsed:
+        aligned = pipeline.stage_align(conn, cfg.path("frames"), cfg.section("output"),
+                                       log, int(cfg.get("analyze", "workers", 0)))
+    # Alignment scales with *selected frames*, not assets: bucketing means a
+    # bigger library yields proportionally more frames, not one per photo.
+    projected_frames = round(frames / scored * total_assets) if scored else 0
+    trial.stages.append(timing.StageTiming(
+        "align", aligned, align_elapsed(), max(0, projected_frames - aligned),
+        unit="frame", note=f"~{projected_frames} frames projected for the full set"))
+
+    for line in trial.render():
+        log(line)
+    pipeline.report_rejects(conn, log)
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
@@ -380,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add(name: str, func, help_text: str) -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=func, since=None, full=False, reanalyze=False,
-                       cadence=None, no_encode=False, asset=None)
+                       cadence=None, no_encode=False, asset=None, limit=None)
         return p
 
     model = add("fetch-model", cmd_fetch_model, "download the MediaPipe face landmarker model")
@@ -400,14 +491,27 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--cadence", default=None, choices=list(select.CADENCES))
             p.add_argument("--no-encode", action="store_true")
 
-    add("faces", cmd_faces, "fetch her face bounding box per asset")
-    add("fetch", cmd_fetch, "download originals")
+    for name, func, help_text in (
+        ("faces", cmd_faces, "fetch her face bounding box per asset"),
+        ("fetch", cmd_fetch, "download originals"),
+    ):
+        p = add(name, func, help_text)
+        p.add_argument("-n", "--limit", type=int, default=None,
+                       help="process at most this many assets")
 
     p = add("doctor", cmd_doctor, "probe each endpoint once and report what it returns")
     p.add_argument("--asset", default=None, help="asset UUID to probe with")
 
+    p = add("trial", cmd_trial,
+            "process a sample, measure it, and project the full run")
+    p.add_argument("-n", "--limit", type=int, default=None,
+                   help="how many assets to sample (default: trial.limit in config)")
+    p.add_argument("--cadence", default=None, choices=list(select.CADENCES))
+
     p = add("analyze", cmd_analyze, "landmark faces and compute quality metrics")
     p.add_argument("--reanalyze", action="store_true", help="re-run on already-analyzed assets")
+    p.add_argument("-n", "--limit", type=int, default=None,
+                   help="process at most this many assets")
 
     p = add("select", cmd_select, "re-apply thresholds and pick frames (no ML re-run)")
     p.add_argument("--cadence", default=None, choices=list(select.CADENCES))

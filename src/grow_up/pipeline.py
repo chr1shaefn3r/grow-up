@@ -143,12 +143,45 @@ async def stage_index(client: ImmichClient, conn: sqlite3.Connection, person_id:
     return seen, new
 
 
+def _limit_clause(limit: int | None) -> str:
+    """Deterministic sample of the pending work.
+
+    Ordering by id is both stable and effectively random with respect to date,
+    resolution and file size, because Immich asset ids are random UUIDs. That
+    makes a trial reproducible while still being representative of the average
+    photo -- which ordering by date would not be, since cameras and file sizes
+    change over the years being sampled.
+    """
+    return f" ORDER BY a.id LIMIT {int(limit)}" if limit else " ORDER BY a.id"
+
+
+def pending_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Outstanding work per stage, used to project a full run from a sample."""
+    return {
+        "faces": conn.execute(
+            "SELECT count(*) FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"
+            " WHERE f.asset_id IS NULL").fetchone()[0],
+        "fetch": conn.execute(
+            "SELECT count(*) FROM assets a"
+            "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
+            "  LEFT JOIN downloads d ON d.asset_id = a.id"
+            " WHERE d.asset_id IS NULL").fetchone()[0],
+        "analyze": conn.execute(
+            "SELECT count(*) FROM assets a"
+            "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
+            "  JOIN downloads d ON d.asset_id = a.id"
+            "  LEFT JOIN metrics m ON m.asset_id = a.id"
+            " WHERE m.asset_id IS NULL").fetchone()[0],
+    }
+
+
 async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id: str,
-                      log: Log, concurrency: int = 16) -> tuple[int, int]:
+                      log: Log, concurrency: int = 16,
+                      limit: int | None = None) -> tuple[int, int]:
     """Fetch her face box per asset. Immich's association means no recognition here."""
     pending = [row[0] for row in conn.execute(
         "SELECT a.id FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"
-        " WHERE f.asset_id IS NULL"
+        " WHERE f.asset_id IS NULL" + _limit_clause(limit)
     )]
     if not pending:
         log("  no new assets need face boxes")
@@ -202,14 +235,15 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
 
 
 async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir: Path,
-                      source: str, log: Log, concurrency: int = 8) -> int:
+                      source: str, log: Log, concurrency: int = 8,
+                      limit: int | None = None) -> int:
     """Download originals, skipping anything already cached."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     pending = conn.execute(
         "SELECT a.id, a.original_file_name FROM assets a"
         "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
         "  LEFT JOIN downloads d ON d.asset_id = a.id"
-        " WHERE d.asset_id IS NULL"
+        " WHERE d.asset_id IS NULL" + _limit_clause(limit)
     ).fetchall()
     if not pending:
         log("  nothing new to download")
@@ -250,7 +284,7 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
 
 
 def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, workers: int,
-                  log: Log, reanalyze: bool = False) -> int:
+                  log: Log, reanalyze: bool = False, limit: int | None = None) -> int:
     """Landmark every downloaded face and store its metrics."""
     where = "" if reanalyze else " LEFT JOIN metrics m ON m.asset_id = a.id WHERE m.asset_id IS NULL"
     rows = conn.execute(
@@ -259,7 +293,7 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
         "  FROM assets a"
         "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
         "  JOIN downloads d ON d.asset_id = a.id"
-        f"{where}"
+        f"{where}" + _limit_clause(limit)
     ).fetchall()
     if not rows:
         log("  nothing new to analyze")

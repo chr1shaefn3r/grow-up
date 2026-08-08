@@ -93,6 +93,46 @@ grow-up status       # manifest counts, stored watermark, recent runs
 Every stage is also runnable on its own and skips work the manifest already records,
 so interrupting any of them costs only the item in flight.
 
+### Trial runs
+
+Before committing to a few thousand photos, measure a sample:
+
+```bash
+grow-up trial -n 100      # or set trial.limit in config.toml
+```
+
+```
+stage       items   elapsed   per item   projected
+--------------------------------------------------
+faces           -         -          -           -   (nothing pending)
+fetch         100     48.3s      483ms      6m 41s   394.0 MB at 8.2 MB/s -> 3.2 GB total
+analyze       100     12.4s      124ms      1m 43s
+align          18      4.2s      233ms       30.8s   ~150 frames projected
+--------------------------------------------------
+total         100    1m 04s      649ms      8m 55s
+
+Time per picture:  649ms across all stages (100 sampled)
+Full set:          8m 55s for all 832 assets
+Still to go:       7m 50s (this trial already banked its own work — nothing is repeated)
+```
+
+**A trial is a partial real run, not a simulation.** Everything it downloads and
+analyzes goes into the cache and manifest, so no work is thrown away — running one
+simply gets you that much further along.
+
+The sample is deterministic and representative: ordering by asset id is stable across
+runs, and since Immich ids are random UUIDs it is also uncorrelated with date,
+resolution and file size — which ordering by date would not be, over years of changing
+cameras.
+
+Two projections are honest rather than convenient. `align` scales with *selected
+frames*, not assets, because bucketing means a larger library yields proportionally more
+frames rather than one per photo — projecting it on the asset count would overstate it
+several-fold. And `fetch` reports throughput and total bytes, usually the figure that
+decides whether the run is minutes or hours.
+
+`-n/--limit` also works on `faces`, `fetch` and `analyze` individually.
+
 ### Runs are incremental by default
 
 `run` stores a sync watermark in SQLite, so a later bare `run` picks up where the last

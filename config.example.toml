@@ -58,6 +58,12 @@ w_eyes_open = 1.0
 w_sharpness = 1.0
 w_size = 0.5
 
+[trial]
+# `grow-up trial` processes this many assets, measures each stage, and projects
+# the full run from it. A trial is a partial real run -- everything it downloads
+# and analyzes is cached, so none of the work is repeated afterwards.
+limit = 100
+
 [select]
 # day | week | month | all -- bucket the timeline and keep the best per bucket,
 # so a photo-heavy holiday cannot dominate the video.
