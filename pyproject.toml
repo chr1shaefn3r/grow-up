@@ -28,3 +28,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Lets `pytest` work straight from a checkout, without an editable install and
+# without the heavy runtime stack (mediapipe, opencv, scipy) being present.
+pythonpath = ["src"]

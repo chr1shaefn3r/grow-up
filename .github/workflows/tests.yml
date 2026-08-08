@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The suite deliberately runs without mediapipe, opencv, scipy, ffmpeg or
+      # network access, so CI installs only what the tests actually import.
+      # Pulling the full runtime stack here would cost minutes per run and tie
+      # the build to mediapipe's wheel availability for each Python version.
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest numpy httpx
+
+      - name: Run tests
+        run: pytest -q

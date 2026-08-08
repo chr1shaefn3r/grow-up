@@ -144,8 +144,13 @@ a photo-heavy holiday dominates the video while quiet months flash past.
 ## Tests
 
 ```bash
-pytest
+pytest        # works straight from a checkout; no install needed
 ```
+
+Every push to `main` (and every PR targeting it) runs the suite on Python 3.11, 3.12 and
+3.13 via [`.github/workflows/tests.yml`](.github/workflows/tests.yml). CI installs only
+`pytest`, `numpy` and `httpx` — pulling the full runtime stack would cost minutes per run
+and tie the build to mediapipe's wheel availability for each Python version.
 
 The suite needs no network, no Immich instance, no model download, and no ffmpeg — it
 covers the transform maths, the metric definitions, bbox coordinate mapping, and the
