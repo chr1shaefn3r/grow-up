@@ -323,8 +323,18 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
         "source_type": r["source_type"],
     }) for r in rows]
 
-    workers = workers or analyze.physical_cores()
-    log(f"  analyzing {len(jobs)} images across {workers} workers")
+    if workers:
+        log(f"  analyzing {len(jobs)} images across {workers} workers (from config)")
+    else:
+        workers = analyze.physical_cores()
+        log(f"  analyzing {len(jobs)} images across {workers} workers "
+            f"({analyze.available_cpus()} CPUs visible)")
+
+    # Chunk finely enough that the tail stays short. Fixed coarse chunks leave
+    # stragglers on heterogeneous cores -- an M1's efficiency cores run maybe a
+    # third the speed of its performance cores, so a chunk landing on one at the
+    # end holds up the whole stage.
+    chunksize = max(1, min(16, len(jobs) // (workers * 4) or 1))
 
     done = 0
     stamp = db.iso_z(db.now_utc())
@@ -336,7 +346,7 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
                    overall=analyzable, already_done=analyzable - outstanding)
     with ProcessPoolExecutor(max_workers=workers, initializer=analyze.init_worker,
                              initargs=(opts,)) as pool:
-        for asset_id, m in pool.map(analyze.analyze_one, jobs, chunksize=8):
+        for asset_id, m in pool.map(analyze.analyze_one, jobs, chunksize=chunksize):
             _store_metrics(conn, asset_id, m, stamp)
             done += 1
             bar.advance()

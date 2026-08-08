@@ -8,6 +8,8 @@ pool over physical cores saturates the machine; the Python here is glue.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,19 +41,69 @@ class AnalyzeOptions:
     oob_inset: float = 0.0
 
 
-def physical_cores() -> int:
-    """Physical cores, not hyperthreads.
+def available_cpus() -> int:
+    """CPUs this process is actually allowed to run on.
 
-    Inference is compute-bound, so scheduling two workers per physical core just
-    adds contention.
+    Respects affinity masks and container limits, which `os.cpu_count()` ignores.
     """
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def _macos_physical_cores() -> int | None:
     try:
-        count = os.cpu_count() or 1
-        if hasattr(os, "sched_getaffinity"):
-            count = len(os.sched_getaffinity(0))
+        result = subprocess.run(["sysctl", "-n", "hw.physicalcpu"],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return int(result.stdout.strip()) or None
+    except ValueError:
+        return None
+
+
+def _linux_physical_cores(sysfs: Path = Path("/sys/devices/system/cpu")) -> int | None:
+    """Count distinct (package, core) pairs, so hyperthread siblings collapse."""
+    pairs: set[tuple[str, str]] = set()
+    try:
+        cpu_dirs = sorted(sysfs.glob("cpu[0-9]*"))
     except OSError:
-        count = 1
-    return max(1, count // 2) if count > 2 else max(1, count)
+        return None
+    for cpu_dir in cpu_dirs:
+        topology = cpu_dir / "topology"
+        try:
+            package = (topology / "physical_package_id").read_text().strip()
+            core = (topology / "core_id").read_text().strip()
+        except OSError:
+            continue
+        pairs.add((package, core))
+    return len(pairs) or None
+
+
+def physical_cores() -> int:
+    """Physical cores available to this process.
+
+    Inference is compute-bound, so two workers per physical core mostly adds
+    contention and memory pressure -- each worker holds its own landmarker.
+
+    This has to be *detected*, not inferred by halving the logical count. That
+    shortcut assumes simultaneous multithreading, which Apple Silicon does not
+    have: an M1 Pro reports 8 logical and 8 physical cores (6 performance, 2
+    efficiency), so halving would waste half the machine. The same is true of
+    any x86 part with hyperthreading disabled.
+    """
+    detected = (_macos_physical_cores() if sys.platform == "darwin"
+                else _linux_physical_cores())
+    allowed = available_cpus()
+    if detected:
+        # Affinity still wins: a container pinned to fewer CPUs than the host
+        # has physical cores must not oversubscribe them.
+        return max(1, min(detected, allowed))
+    return allowed
 
 
 def init_worker(opts: AnalyzeOptions) -> None:

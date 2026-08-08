@@ -30,7 +30,10 @@ source = "original"
 
 [analyze]
 model_path = "models/face_landmarker.task"
-workers = 0            # 0 = physical cores
+# 0 detects physical cores: sysctl on macOS, sysfs topology on Linux, capped by
+# any affinity or container limit. Apple Silicon has no hyperthreading, so an
+# M1 Pro correctly yields 8 (6 performance + 2 efficiency), not 4.
+workers = 0
 bbox_margin = 0.8      # grow Immich's face box before landmarking; the mesh wants context
 min_face_detection_confidence = 0.5
 oob_inset = 0.0        # pixels of margin when testing landmarks against the frame edge
