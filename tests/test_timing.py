@@ -130,6 +130,88 @@ class TestPendingCounts:
         assert counts == {"faces": 6, "fetch": 2, "analyze": 1}
 
 
+class TestEventualWorkload:
+    """Projections need the eventual population, not what is actionable now."""
+
+    def build(self, tmp_path, *, assets=10, faces_ok=0, faces_bad=0,
+              downloads=0, metrics=0):
+        conn = db.connect(tmp_path / f"w{assets}{faces_ok}{downloads}{metrics}.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        # One transaction for the lot; the connection autocommits otherwise and
+        # a few hundred fsyncs per fixture dominates the suite's runtime.
+        conn.execute("BEGIN")
+        for i in range(assets):
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, '2026-01-01', ?)", (f"a{i}", stamp))
+        for i in range(faces_ok + faces_bad):
+            status = "ok" if i < faces_ok else "no_face"
+            conn.execute("INSERT INTO faces (asset_id, status, n_candidates, fetched_at)"
+                         " VALUES (?, ?, 0, ?)", (f"a{i}", status, stamp))
+        for i in range(downloads):
+            conn.execute("INSERT INTO downloads (asset_id, path, source, fetched_at)"
+                         " VALUES (?, '/x.jpg', 'original', ?)", (f"a{i}", stamp))
+        for i in range(metrics):
+            conn.execute("INSERT INTO metrics (asset_id, detected, analyzed_at)"
+                         " VALUES (?, 1, ?)", (f"a{i}", stamp))
+        conn.execute("COMMIT")
+        return conn
+
+    def test_analyze_is_sized_before_anything_is_downloaded(self, tmp_path):
+        """The reported bug: 10 images at 203ms projected a full run as 0ms,
+        because the actionable analyze count joins on downloads."""
+        conn = self.build(tmp_path, assets=832, faces_ok=832)
+
+        assert pipeline.pending_counts(conn)["analyze"] == 0
+        assert pipeline.eventual_workload(conn)["analyze"] == 832
+
+    def test_fetch_is_sized_before_anything_is_downloaded(self, tmp_path):
+        conn = self.build(tmp_path, assets=832, faces_ok=832)
+        assert pipeline.eventual_workload(conn)["fetch"] == 832
+
+    def test_discounts_work_already_done(self, tmp_path):
+        conn = self.build(tmp_path, assets=832, faces_ok=832, downloads=10, metrics=10)
+        counts = pipeline.eventual_workload(conn)
+        assert counts == {"faces": 0, "fetch": 822, "analyze": 822}
+
+    def test_excludes_assets_with_no_usable_face(self, tmp_path):
+        """Those are never downloaded or analyzed, so they must not inflate it."""
+        conn = self.build(tmp_path, assets=100, faces_ok=90, faces_bad=10)
+        counts = pipeline.eventual_workload(conn)
+        assert counts["fetch"] == 90 and counts["analyze"] == 90
+
+    def test_estimates_unchecked_assets_from_the_observed_rate(self, tmp_path):
+        """Half the library checked at a 90% hit rate implies ~90% of the rest."""
+        conn = self.build(tmp_path, assets=100, faces_ok=45, faces_bad=5)
+        counts = pipeline.eventual_workload(conn)
+        assert counts["faces"] == 50
+        assert counts["fetch"] == 90  # 45 known + 90% of the 50 unchecked
+
+    def test_assumes_the_best_when_nothing_is_checked_yet(self, tmp_path):
+        conn = self.build(tmp_path, assets=832)
+        counts = pipeline.eventual_workload(conn)
+        assert counts == {"faces": 832, "fetch": 832, "analyze": 832}
+
+    def test_empty_library(self, tmp_path):
+        conn = self.build(tmp_path, assets=0)
+        assert pipeline.eventual_workload(conn) == {"faces": 0, "fetch": 0, "analyze": 0}
+
+    def test_never_goes_negative(self, tmp_path):
+        """Downloads can outlive the faces they came from if a person is retagged."""
+        conn = self.build(tmp_path, assets=10, faces_ok=2, downloads=8, metrics=8)
+        counts = pipeline.eventual_workload(conn)
+        assert all(value >= 0 for value in counts.values())
+
+    def test_projection_is_non_zero_for_a_measured_stage(self, tmp_path):
+        """End to end: the exact shape from the bug report."""
+        conn = self.build(tmp_path, assets=832, faces_ok=832)
+        remaining = pipeline.eventual_workload(conn)["analyze"]
+
+        stage = StageTiming("analyze", processed=10, elapsed=2.03, remaining=remaining)
+        assert stage.per_item == pytest.approx(0.203)
+        assert stage.projected == pytest.approx(0.203 * 832)
+        assert format_duration(stage.projected) == "2m 48s"
+
+
 class TestLimitClause:
     def test_no_limit_still_orders_deterministically(self):
         assert pipeline._limit_clause(None) == " ORDER BY a.id"

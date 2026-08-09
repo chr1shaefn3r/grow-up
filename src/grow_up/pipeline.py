@@ -156,8 +156,44 @@ def _limit_clause(limit: int | None) -> str:
     return f" ORDER BY a.id LIMIT {int(limit)}" if limit else " ORDER BY a.id"
 
 
+def eventual_workload(conn: sqlite3.Connection) -> dict[str, int]:
+    """How many items each stage will process before the library is finished.
+
+    Distinct from `pending_counts`, which answers "what is actionable right
+    now". A projection needs the eventual total: at the start of a trial nothing
+    has been downloaded yet, so the actionable count for `analyze` is zero, and
+    multiplying a measured per-image cost by zero reported a full run as 0ms.
+
+    Downstream stages are therefore sized off the *population* they will see
+    rather than the rows that happen to exist. Assets whose face box has not
+    been looked up yet are assumed to resolve at the same rate as those already
+    checked -- the only available estimate, and exact once `faces` has run.
+    """
+    def scalar(sql: str) -> int:
+        return int(conn.execute(sql).fetchone()[0])
+
+    total = scalar("SELECT count(*) FROM assets")
+    checked = scalar("SELECT count(*) FROM faces")
+    usable = scalar("SELECT count(*) FROM faces WHERE status = 'ok'")
+    downloaded = scalar("SELECT count(*) FROM downloads")
+    analyzed = scalar("SELECT count(*) FROM metrics")
+
+    usable_rate = usable / checked if checked else 1.0
+    expected = round(usable + (total - checked) * usable_rate)
+
+    return {
+        "faces": max(0, total - checked),
+        "fetch": max(0, expected - downloaded),
+        "analyze": max(0, expected - analyzed),
+    }
+
+
 def pending_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Outstanding work per stage, used to project a full run from a sample."""
+    """Work each stage can act on *right now*, for progress-bar denominators.
+
+    Downstream stages are gated on upstream rows existing, so these are zero
+    until the stage before has run. Use `eventual_workload` for projections.
+    """
     return {
         "faces": conn.execute(
             "SELECT count(*) FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"

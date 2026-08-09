@@ -262,7 +262,10 @@ def cmd_trial(args: argparse.Namespace) -> None:
 
     person_id = _person_id(cfg, conn)
     limit = int(args.limit or cfg.get("trial", "limit", 100))
-    before = pipeline.pending_counts(conn)
+    # Sized off the eventual population, not what is actionable right now:
+    # nothing is downloaded when a trial starts, so an actionable count would
+    # make the analyze projection zero.
+    before = pipeline.eventual_workload(conn)
     trial = timing.Trial(sample_size=limit, total_assets=total_assets)
     log(f"== trial: sampling up to {limit} of {total_assets} indexed assets ==")
 
