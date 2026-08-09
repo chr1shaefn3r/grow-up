@@ -90,8 +90,8 @@ def _person_id(cfg: config.Config, conn) -> str:
     async def resolve() -> str:
         async with _client(cfg) as client:
             person = await client.resolve_person(str(name))
-            log(f"resolved {person.name!r} -> {person.id}")
-            log("  (put this in config.toml as immich.person_id to skip the lookup)")
+            log(f"  person: {person.name!r} -> {person.id}")
+            log("  note: set immich.person_id in config.toml to skip this lookup")
             return person.id
 
     return asyncio.run(resolve())
@@ -104,12 +104,12 @@ def _person_id(cfg: config.Config, conn) -> str:
 def cmd_fetch_model(args: argparse.Namespace) -> None:
     target = Path(args.output or analyze.DEFAULT_MODEL_PATH)
     if target.exists() and not args.force:
-        log(f"{target} already present")
+        log(f"model: already present at {target}")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    log(f"downloading {analyze.MODEL_URL}")
+    log(f"model: downloading {analyze.MODEL_URL}")
     urllib.request.urlretrieve(analyze.MODEL_URL, target)  # noqa: S310
-    log(f"saved {target} ({target.stat().st_size / 1e6:.1f} MB)")
+    log(f"model: saved {target} ({target.stat().st_size / 1e6:.1f} MB)")
 
 
 def cmd_index(args: argparse.Namespace) -> None:
@@ -122,7 +122,7 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
     """Index stage plus watermark bookkeeping. Returns assets newly added."""
     started_at = db.now_utc()
     watermark = pipeline.resolve_watermark(conn, person_id, since, full)
-    log(f"watermark: {watermark.value or '(none — full index)'}  [{watermark.source}]")
+    log(f"  watermark: {watermark.value or '(none — full index)'}  [{watermark.source}]")
 
     run_id = db.start_run(conn, person_id, started_at, watermark.value, watermark.source)
     page_size = int(cfg.get("index", "page_size", 1000))
@@ -143,7 +143,7 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
 
             if not watermark.is_full and pipeline.detect_drift(stored_count, current_count, new):
                 log(
-                    f"drift detected: Immich reports {current_count} assets for this person "
+                    f"  drift detected: Immich reports {current_count} assets for this person "
                     f"(was {stored_count}) but the incremental window only found {new} new. "
                     "She was likely tagged in older photos — re-indexing in full."
                 )
@@ -159,7 +159,7 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
         raise
 
     stored = db.commit_watermark(conn, run_id, person_id, started_at, current_count, new)
-    log(f"watermark advanced to {stored}")
+    log(f"  watermark advanced: {stored}")
     return new
 
 
@@ -222,12 +222,12 @@ def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tupl
     Returns (kept, scored, frames).
     """
     kept, scored = select.apply_filters(conn, cfg.section("filter"), cfg.section("score"))
-    log(f"  {kept}/{scored} images pass the hard filters")
+    log(f"  select: {kept}/{scored} pass the hard filters")
 
     cadence = cadence or str(cfg.get("select", "cadence", "week"))
     per_bucket = int(cfg.get("select", "per_bucket", 1))
     frames = select.select_frames(conn, cadence, per_bucket)
-    log(f"  selected {frames} frames (cadence={cadence}, {per_bucket} per bucket)")
+    log(f"  select: {frames} frames (cadence={cadence}, {per_bucket} per bucket)")
     pipeline.report_rejects(conn, log)
     return kept, scored, frames
 
@@ -256,7 +256,7 @@ def cmd_review(args: argparse.Namespace) -> None:
 def cmd_encode(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
     out = pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log)
-    log(f"  wrote {out}")
+    log(f"  encode: wrote {out}")
 
 
 def cmd_trial(args: argparse.Namespace) -> None:
@@ -347,7 +347,7 @@ def cmd_trial(args: argparse.Namespace) -> None:
         encode_cfg = dict(cfg.section("encode"))
         encode_cfg["filename"] = f"trial-{encode_cfg.get('filename', 'timelapse.mp4')}"
         if args.no_encode:
-            log("  skipping encode (--no-encode)")
+            log("  encode: skipped (--no-encode)")
         else:
             try:
                 with timing.stopwatch() as encode_elapsed:
@@ -361,7 +361,7 @@ def cmd_trial(args: argparse.Namespace) -> None:
             except RuntimeError as exc:
                 log(f"  ! encode failed: {exc}")
     else:
-        log("  no frames survived the filters, so there is nothing to review or encode")
+        log("  align: no frames survived the filters, nothing to review or encode")
 
     for line in trial.render():
         log(line)

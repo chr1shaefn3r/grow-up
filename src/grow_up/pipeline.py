@@ -138,9 +138,9 @@ async def stage_index(client: ImmichClient, conn: sqlite3.Connection, person_id:
             "original_file_name": item.get("originalFileName"),
         })
         if seen % 500 == 0:
-            log(f"  indexed {seen}…")
+            log(f"  index: {seen} assets so far…")
 
-    log(f"  indexed {seen} assets ({new} new)")
+    log(f"  index: {seen} assets ({new} new)")
     return seen, new
 
 
@@ -221,7 +221,7 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
         " WHERE f.asset_id IS NULL" + _limit_clause(limit)
     )]
     if not pending:
-        log("  no new assets need face boxes")
+        log("  faces: nothing new to look up")
         return 0, 0
 
     sem = asyncio.Semaphore(concurrency)
@@ -275,7 +275,7 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
 
     await asyncio.gather(*(one(a) for a in pending))
     bar.close()
-    log(f"  face boxes: {ok} found, {missing} without a usable detection")
+    log(f"  faces: {ok} found, {missing} without a usable detection")
     _abort_if_hopeless("face lookup", ok, errors, len(pending))
     return ok, missing
 
@@ -292,7 +292,7 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
         " WHERE d.asset_id IS NULL" + _limit_clause(limit)
     ).fetchall()
     if not pending:
-        log("  nothing new to download")
+        log("  fetch: nothing new to download")
         return 0
 
     sem = asyncio.Semaphore(concurrency)
@@ -350,7 +350,7 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
         f"{where}" + _limit_clause(limit)
     ).fetchall()
     if not rows:
-        log("  nothing new to analyze")
+        log("  analyze: nothing new to analyze")
         return 0
 
     jobs = [(r["id"], r["path"], {
@@ -360,10 +360,10 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
     }) for r in rows]
 
     if workers:
-        log(f"  analyzing {len(jobs)} images across {workers} workers (from config)")
+        log(f"  analyze: {len(jobs)} images across {workers} workers (from config)")
     else:
         workers = analyze.physical_cores()
-        log(f"  analyzing {len(jobs)} images across {workers} workers "
+        log(f"  analyze: {len(jobs)} images across {workers} workers "
             f"({analyze.available_cpus()} CPUs visible)")
 
     # Chunk finely enough that the tail stays short. Fixed coarse chunks leave
@@ -409,7 +409,7 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
 
     rows = select.selected_in_order(conn)
     if not rows:
-        log("  nothing selected to align")
+        log("  align: nothing selected")
         return 0
 
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -465,7 +465,7 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
     if output.get("flicker_match", False):
         _damp_flicker(results, log)
 
-    log(f"  wrote {len(results)} frames to {frames_dir}")
+    log(f"  align: wrote {len(results)} frames to {frames_dir}")
     return len(results)
 
 
@@ -493,7 +493,7 @@ def _damp_flicker(results: list[tuple], log: Log, window: int = 9) -> None:
         cv2.imwrite(path, align.match_luma(frame, reference),
                     [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         adjusted += 1
-    log(f"  flicker pass adjusted {adjusted} frames")
+    log(f"  flicker: adjusted {adjusted} frames")
 
 
 def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
@@ -504,12 +504,12 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     frames = [Path(r["path"]) for r in rows if r["asset_id"] not in rejects]
 
     if rejects:
-        log(f"  honouring {len(rejects)} manual rejects from rejects.json")
+        log(f"  encode: honouring {len(rejects)} manual rejects from rejects.json")
     if not frames:
         raise RuntimeError("no frames left to encode")
 
     out_path = out_dir / str(encode_cfg.get("filename", "timelapse.mp4"))
-    log(f"  encoding {len(frames)} frames at {encode_cfg.get('fps', 10)} fps")
+    log(f"  encode: {len(frames)} frames at {encode_cfg.get('fps', 10)} fps")
     return encode(
         frames, out_path,
         fps=float(encode_cfg.get("fps", 10)),

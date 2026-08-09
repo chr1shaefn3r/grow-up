@@ -15,6 +15,7 @@ Two behaviours matter more than looks:
 
 from __future__ import annotations
 
+import shutil
 import sys
 import threading
 import time
@@ -23,6 +24,9 @@ from typing import Callable, TextIO
 from .timing import format_bytes, format_duration
 
 BAR_WIDTH = 24
+
+# ANSI "erase from cursor to end of line".
+ERASE_LINE = "\x1b[K"
 
 
 class Progress:
@@ -138,6 +142,13 @@ class Progress:
             return
         self._paint()
 
+    def _width(self) -> int:
+        """Usable columns, so a long bar cannot wrap and defeat the repaint."""
+        try:
+            return max(20, shutil.get_terminal_size((100, 24)).columns - 1)
+        except (OSError, ValueError):
+            return 100
+
     def _paint(self, force: bool = False) -> None:
         if not self.interactive:
             # Without a terminal there is nothing to repaint over, so emit a
@@ -147,13 +158,16 @@ class Progress:
                 self._last_paint = self._clock()
                 self._emit(self.render())
             return
-        self._stream.write("\r" + self.render().ljust(100)[:100])
+        # Erase to end of line rather than padding with spaces. Padding leaves
+        # them sitting in the terminal's line buffer past the text, so the
+        # summary that replaces the bar copies out with a trail of blanks.
+        self._stream.write("\r" + self.render()[: self._width()] + ERASE_LINE)
         self._stream.flush()
         self._painted = True
         self._last_paint = self._clock()
 
     def _clear(self) -> None:
         if self.interactive and self._painted:
-            self._stream.write("\r" + " " * 100 + "\r")
+            self._stream.write("\r" + ERASE_LINE)
             self._stream.flush()
             self._painted = False

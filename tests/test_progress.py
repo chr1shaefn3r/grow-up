@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import os
 
 import pytest
 
+from grow_up import progress
 from grow_up.progress import BAR_WIDTH, Progress
 
 
@@ -235,11 +237,54 @@ class TestLogInterleaving:
 
         written = stream.getvalue()[before:]
         assert lines == ["  ! download failed"]
-        assert written.startswith("\r" + " " * 100 + "\r"), "bar cleared before the log"
-        assert written.rstrip().endswith("%") or "=" in written, "bar redrawn afterwards"
+        assert written.startswith("\r" + progress.ERASE_LINE), "bar cleared before the log"
+        assert "=" in written, "bar redrawn afterwards"
 
     def test_log_on_a_non_tty_does_not_duplicate_the_bar(self):
         bar, _, lines, clock = make(total=10, tty=False, quiet_interval=999.0)
         bar.advance()
         bar.log("  ! download failed")
         assert lines == ["  ! download failed"]
+
+
+class TestNoTrailingWhitespace:
+    """Padding the bar to a fixed width left blanks in the terminal's line
+    buffer, so the summary that replaced it copied out with a trailing run of
+    spaces."""
+
+    def test_bar_is_not_padded_with_spaces(self):
+        bar, stream, _, _ = make(total=100, min_interval=0.0)
+        bar.advance()
+
+        painted = stream.getvalue()
+        assert painted.endswith(progress.ERASE_LINE), "cleared by erasing, not padding"
+        # The unfilled track is spaces, but nothing may follow the erase.
+        assert not painted.split(progress.ERASE_LINE)[0].endswith("  ")
+
+    def test_summary_line_has_no_trailing_whitespace(self):
+        bar, _, lines, clock = make(total=10, show_bytes=True)
+        clock.tick(5.0)
+        bar.advance(count=10, nbytes=1024 * 1024)
+        bar.close()
+
+        assert lines[-1] == lines[-1].rstrip()
+
+    def test_summary_line_has_no_trailing_whitespace_when_pending(self):
+        bar, _, lines, clock = make(total=10, overall=100, show_bytes=True)
+        clock.tick(5.0)
+        bar.advance(count=10, nbytes=1024 * 1024)
+        bar.close()
+
+        assert lines[-1] == lines[-1].rstrip()
+        assert "90 still pending" in lines[-1]
+
+    def test_long_bars_are_trimmed_to_the_terminal(self, monkeypatch):
+        """A bar wider than the terminal wraps, and the carriage return then
+        only rewinds the last visual line, leaving debris behind."""
+        monkeypatch.setattr(progress.shutil, "get_terminal_size",
+                            lambda fallback=None: os.terminal_size((40, 24)))
+        bar, stream, _, _ = make(total=100, min_interval=0.0, show_bytes=True)
+        bar.advance(nbytes=5 * 1024 * 1024)
+
+        painted = stream.getvalue().split("\r")[-1].replace(progress.ERASE_LINE, "")
+        assert len(painted) <= 39
