@@ -54,6 +54,7 @@ def apply_filters(conn: sqlite3.Connection, limits: dict, weights: dict) -> tupl
     from .metrics import FaceMetrics, composite_score, hard_reject
 
     rows = conn.execute("SELECT * FROM metrics").fetchall()
+    stamp = iso_z(now_utc())
     kept = 0
     updates = []
     for row in rows:
@@ -63,10 +64,11 @@ def apply_filters(conn: sqlite3.Connection, limits: dict, weights: dict) -> tupl
         m.reject_reason = hard_reject(m, limits)
         m.score = None if m.reject_reason else composite_score(m, limits, weights)
         kept += int(m.reject_reason is None)
-        updates.append((m.reject_reason, m.score, row["asset_id"]))
+        updates.append((m.reject_reason, m.score, stamp, row["asset_id"]))
 
     conn.executemany(
-        "UPDATE metrics SET reject_reason = ?, score = ? WHERE asset_id = ?", updates
+        "UPDATE metrics SET reject_reason = ?, score = ?, filtered_at = ?"
+        " WHERE asset_id = ?", updates
     )
     return kept, len(rows)
 
@@ -127,3 +129,43 @@ def reject_summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "  FROM metrics GROUP BY reason ORDER BY n DESC"
     ).fetchall()
     return [(r["reason"], r["n"]) for r in rows]
+
+
+def filters_applied(conn: sqlite3.Connection) -> bool:
+    """Whether `apply_filters` has run against the stored metrics.
+
+    Between `analyze` and `select` every surviving face still has
+    `reject_reason IS NULL`, which the summary would render as `accepted` --
+    reporting photos that were never evaluated as having passed.
+
+    Recorded explicitly rather than inferred from a non-NULL score: rejected
+    rows carry no score, so a library where every photo fails the filters --
+    entirely reachable while tuning thresholds tight -- would have looked
+    unevaluated.
+    """
+    return bool(conn.execute(
+        "SELECT 1 FROM metrics WHERE filtered_at IS NOT NULL LIMIT 1").fetchone())
+
+
+def format_reject_summary(conn: sqlite3.Connection, indent: str = "  ",
+                          label: str = "filter outcome") -> list[str]:
+    """Render the filter outcome.
+
+    Shared by the stages and by `status` so the two cannot drift; they differ
+    only in indent and in the label, which `status` uses to say that these
+    verdicts are from the last `select` rather than from whatever the config
+    currently says.
+    """
+    heading = f"{indent}{label}"
+    if not conn.execute("SELECT 1 FROM metrics LIMIT 1").fetchone():
+        return [f"{heading}: nothing analyzed yet"]
+    if not filters_applied(conn):
+        return [f"{heading}: not yet evaluated — run `grow-up select`"]
+
+    rows = reject_summary(conn)
+    total = sum(count for _, count in rows)
+    lines = [f"{heading}:"]
+    for reason, count in rows:
+        share = f"{count / total:>6.1%}" if total else ""
+        lines.append(f"{indent}  {reason:<26} {count:>6} {share}")
+    return lines

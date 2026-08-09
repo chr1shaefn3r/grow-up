@@ -566,6 +566,5 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
 
 
 def report_rejects(conn: sqlite3.Connection, log: Log) -> None:
-    log("  filter outcome:")
-    for reason, count in select.reject_summary(conn):
-        log(f"    {reason:<26} {count:>6}")
+    for line in select.format_reject_summary(conn):
+        log(line)

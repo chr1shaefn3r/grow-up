@@ -76,7 +76,9 @@ CREATE TABLE IF NOT EXISTS metrics (
     span_down      REAL,
     reject_reason  TEXT,                 -- NULL when the frame passes hard filters
     score          REAL,
-    analyzed_at    TEXT NOT NULL
+    analyzed_at    TEXT NOT NULL,
+    filtered_at    TEXT                  -- set by select; distinguishes "passed"
+                                         -- from "not yet evaluated"
 );
 
 CREATE TABLE IF NOT EXISTS selection (
@@ -161,7 +163,8 @@ class SyncState:
 # existing table alone, so new ones have to be added explicitly or a database
 # built by an earlier version keeps the old shape.
 ADDED_COLUMNS = {
-    "metrics": (("span_w", "REAL"), ("span_up", "REAL"), ("span_down", "REAL")),
+    "metrics": (("span_w", "REAL"), ("span_up", "REAL"), ("span_down", "REAL"),
+                ("filtered_at", "TEXT")),
 }
 
 

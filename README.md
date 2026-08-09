@@ -87,11 +87,28 @@ key fails in one second with the missing names rather than after hundreds of req
 
 ```bash
 grow-up run          # everything: index → faces → fetch → analyze → select → align → review → encode
-grow-up status       # manifest counts, stored watermark, recent runs
+grow-up status       # manifest counts, filter outcome, stored watermark, recent runs
 ```
 
 Every stage is also runnable on its own and skips work the manifest already records,
 so interrupting any of them costs only the item in flight.
+
+`status` includes the filter outcome, so checking how much of the library survives does
+not mean re-running a stage:
+
+```
+filter outcome (last select):
+  accepted                       50  50.0%
+  head_turned                    26  26.0%
+  head_tilted                    16  16.0%
+  looking_away                    7   7.0%
+  blurry                          1   1.0%
+```
+
+The heading names its vintage deliberately: these verdicts are whatever the last
+`grow-up select` decided, not what an edited `config.toml` would now produce. Between
+`analyze` and `select` the outcome is reported as *not yet evaluated* rather than
+counting unfiltered photos as accepted.
 
 The bulk stages show live progress, with throughput and an ETA where they mean
 something:

@@ -529,6 +529,13 @@ def cmd_status(args: argparse.Namespace) -> None:
         n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         log(f"  {table:<12} {n:>7}")
 
+    # Describes the same stored rows as the counts above, so it belongs with
+    # them rather than after the sync bookkeeping.
+    log("")
+    for line in select.format_reject_summary(conn, indent="",
+                                             label="filter outcome (last select)"):
+        log(line)
+
     state = db.get_sync_state(conn, person_id) if person_id else None
     if state:
         log(f"\nwatermark   {state.watermark}")
