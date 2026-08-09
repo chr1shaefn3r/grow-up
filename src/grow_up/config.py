@@ -29,6 +29,27 @@ class Config:
         return self.root / value
 
 
+# Settings that were replaced rather than kept, and what replaced them. Failing
+# on these beats ignoring them: a key that used to control framing, silently
+# dropped, reads as "the new setting doesn't work".
+REMOVED_KEYS = {
+    ("output", "left_eye"): "align.eye_distance / align.eye_level",
+    ("output", "right_eye"): "align.eye_distance / align.eye_level",
+    ("output", "smoothing_window"): "nothing — transform smoothing was removed",
+    ("output", "smoothing_polyorder"): "nothing — transform smoothing was removed",
+}
+
+
+def check_removed(raw: dict) -> None:
+    stale = [(f"{section}.{key}", replacement)
+             for (section, key), replacement in REMOVED_KEYS.items()
+             if key in raw.get(section, {})]
+    if not stale:
+        return
+    detail = "\n".join(f"    {name}  ->  {replacement}" for name, replacement in stale)
+    raise RuntimeError(f"config.toml uses settings that no longer exist:\n{detail}")
+
+
 def load(path: str | Path | None = None) -> Config:
     p = Path(path or DEFAULT_CONFIG)
     if not p.exists():
@@ -37,6 +58,7 @@ def load(path: str | Path | None = None) -> Config:
         )
     with p.open("rb") as fh:
         raw = tomllib.load(fh)
+    check_removed(raw)
     return Config(raw=raw, root=p.parent if p.parent != Path("") else Path("."))
 
 

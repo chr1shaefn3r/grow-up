@@ -111,7 +111,8 @@ def selected_in_order(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Selected frames in chronological order -- the order they appear in the video."""
     return conn.execute(
         "SELECT s.asset_id, s.bucket, a.local_datetime, d.path,"
-        "       m.left_eye_x, m.left_eye_y, m.right_eye_x, m.right_eye_y, m.score"
+        "       m.left_eye_x, m.left_eye_y, m.right_eye_x, m.right_eye_y, m.score,"
+        "       m.span_w, m.span_up, m.span_down"
         "  FROM selection s"
         "  JOIN assets a ON a.id = s.asset_id"
         "  JOIN metrics m ON m.asset_id = s.asset_id"

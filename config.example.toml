@@ -101,10 +101,25 @@ per_bucket = 1
 [output]
 width = 1080
 height = 1350
-# Canonical eye positions as fractions of the output frame.
-left_eye = [0.36, 0.42]
-right_eye = [0.64, 0.42]
 flicker_match = true
+
+[align]
+# How far apart the eyes sit, as a fraction of the frame width. This is the
+# knob that decides how much room there is around the face: a head is roughly
+# 2.4-3.0x the interocular distance across, so 0.20 puts it at about half the
+# frame width, with space for hair and shoulders. Larger fills more of the
+# frame and eventually crops the head.
+eye_distance = 0.20
+# Height of the eye line, as a fraction of the frame height.
+eye_level = 0.42
+# What fills the frame where it reaches past the edge of the source photo.
+# "edge" stretches the outermost pixels into bars; "blur" keeps the same
+# content softened, which reads as a deliberate surround.
+fill = "blur"          # blur | edge | black
+# Allowance for what the landmark mesh does not cover -- hair, ears and the
+# cranium above the forehead -- when checking whether a face fits the frame.
+# Only affects the advisory report, never the framing itself.
+fit_margin = 1.5
 
 [encode]
 filename = "timelapse.mp4"

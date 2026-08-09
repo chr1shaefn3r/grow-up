@@ -322,6 +322,39 @@ Normalising scale by interocular distance holds head size constant, so growing u
 as changing facial *proportions* rather than a head that inflates. This is deliberate —
 absolute scale makes the face drift around the frame.
 
+### Framing
+
+`[align] eye_distance` decides how much of the frame the face occupies, and so how much
+room is left around it. A head is roughly 2.4–3.0× the interocular distance across, so:
+
+| `eye_distance` | head fills | |
+|---|---|---|
+| 0.28 | 67–84% of the width | crops hair and chins, worst on the youngest photos |
+| **0.20** | 48–60% | default: headroom, ears, some shoulders |
+| 0.15 | 36–45% | half-body |
+
+`align` checks each frame against the face extents recorded during analysis and says so
+when the geometry does not fit:
+
+```
+  align: 4 frames clip the face at eye_distance=0.28; 0.25 would fit them all
+```
+
+An infant's cranium is large relative to eye spacing, so if anything still clips it will
+be the earliest photos. `fit_margin` (default 1.5) allows for hair, ears and the cranium,
+none of which the landmark mesh reaches — it affects only that advisory, never the
+framing.
+
+Framing changes need no re-analysis: `grow-up align && grow-up encode`. The clipping
+report does need the face spans, which are recorded from `grow-up analyze` onwards; older
+rows are reported as unchecked rather than assumed to fit.
+
+`align.fill` decides what goes where the frame reaches past the edge of the source photo
+— more common once the framing is loose. `edge` stretches the outermost pixels into
+visible bars; `blur` (default) keeps the same content softened.
+
+### Stabilisation
+
 Each frame is solved independently and exactly: both eyes land on the canonical
 positions every time, and that *is* the stabilisation. There is deliberately no
 smoothing across frames. An earlier version averaged the `(tx, ty, angle, scale)`

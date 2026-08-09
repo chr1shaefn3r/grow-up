@@ -71,6 +71,9 @@ CREATE TABLE IF NOT EXISTS metrics (
     sharpness      REAL,
     exposure_lo    REAL,
     exposure_hi    REAL,
+    span_w         REAL,               -- face extents in interocular units,
+    span_up        REAL,               -- so `align` can predict clipping
+    span_down      REAL,
     reject_reason  TEXT,                 -- NULL when the frame passes hard filters
     score          REAL,
     analyzed_at    TEXT NOT NULL
@@ -154,6 +157,26 @@ class SyncState:
     last_run_at: str
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an
+# existing table alone, so new ones have to be added explicitly or a database
+# built by an earlier version keeps the old shape.
+ADDED_COLUMNS = {
+    "metrics": (("span_w", "REAL"), ("span_up", "REAL"), ("span_down", "REAL")),
+}
+
+
+def migrate(conn: sqlite3.Connection) -> list[str]:
+    """Add any columns missing from an older database. Returns what was added."""
+    added = []
+    for table, columns in ADDED_COLUMNS.items():
+        present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns:
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+                added.append(f"{table}.{name}")
+    return added
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,6 +185,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
 
 

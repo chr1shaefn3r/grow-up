@@ -7,6 +7,7 @@ records, so interrupting any of them costs only the item in flight.
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -410,10 +411,48 @@ def _store_metrics(conn: sqlite3.Connection, asset_id: str, m, stamp: str) -> No
     )
 
 
+def _report_fit(rows: Iterable, eye_distance: float, eye_level: float,
+                aspect: float, margin: float, log: Log) -> None:
+    """Say which frames clip, and what setting would fit them.
+
+    A default framing is a guess about someone else's photos, so rather than
+    leave the user to spot a cropped forehead in the contact sheet, work it out
+    from the spans recorded during analysis.
+    """
+    clipped = 0
+    unjudged = 0
+    tightest = None
+
+    for row in rows:
+        spans = (row["span_w"], row["span_up"], row["span_down"])
+        if any(span is None for span in spans):
+            unjudged += 1
+            continue
+        span_w, span_up, span_down = (float(s) for s in spans)
+        if not align.head_fits(eye_distance, eye_level, span_w, span_up, span_down,
+                               aspect, margin):
+            clipped += 1
+        limit = align.fitting_eye_distance(span_w, span_up, span_down, eye_level,
+                                           aspect, margin)
+        tightest = limit if tightest is None else min(tightest, limit)
+
+    if clipped and tightest is not None:
+        # Round down, so the suggestion lands inside the limit rather than on it.
+        suggestion = math.floor(tightest * 100) / 100
+        log(f"  align: {clipped} frames clip the face at eye_distance="
+            f"{eye_distance:g}; {suggestion:g} would fit them all")
+    if unjudged:
+        log(f"  align: {unjudged} frames analyzed before face spans were recorded, "
+            "so their framing was not checked — `grow-up analyze --reanalyze` fills "
+            "them in")
+
+
 def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
-                log: Log, workers: int = 0) -> int:
-    """Warp selected frames onto canonical eye positions, then smooth the sequence."""
+                log: Log, workers: int = 0, framing: dict | None = None) -> int:
+    """Warp selected frames onto canonical eye positions."""
     import cv2
+
+    framing = dict(framing or {})
 
     rows = select.selected_in_order(conn)
     if not rows:
@@ -422,14 +461,13 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
 
     frames_dir.mkdir(parents=True, exist_ok=True)
     width, height = int(output["width"]), int(output["height"])
-    dst_left, dst_right = align.target_eyes(
-        width, height, tuple(output["left_eye"]), tuple(output["right_eye"])
-    )
+    eye_distance = float(framing.get("eye_distance", 0.20))
+    eye_level = float(framing.get("eye_level", 0.42))
+    fill = str(framing.get("fill", "blur"))
+    dst_left, dst_right = align.target_eyes_from(width, height, eye_distance, eye_level)
 
-    if int(output.get("smoothing_window", 0) or 0) > 1:
-        log("  note: output.smoothing_window is obsolete and ignored — it averaged "
-            "transforms across photos with different coordinate systems, which "
-            "pushed faces out of frame. Remove it from config.toml.")
+    _report_fit(rows, eye_distance, eye_level, width / height,
+                float(framing.get("fit_margin", 1.5)), log)
 
     eye_pairs = [(np.array([row["left_eye_x"], row["left_eye_y"]]),
                   np.array([row["right_eye_x"], row["right_eye_y"]]))
@@ -442,7 +480,7 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
     def one(index_row_param: tuple[int, sqlite3.Row, align.TransformParams]) -> tuple:
         seq, row, p = index_row_param
         bgr = images.load_bgr(row["path"])
-        warped = align.warp(bgr, align.build_affine(p), width, height)
+        warped = align.warp(bgr, align.build_affine(p), width, height, fill=fill)
         out_path = frames_dir / f"frame_{seq:06d}.jpg"
         cv2.imwrite(str(out_path), warped, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         luma = float(np.median(cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)[:, :, 0]))

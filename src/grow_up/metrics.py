@@ -41,6 +41,13 @@ class FaceMetrics:
     sharpness: float | None = None
     exposure_lo: float | None = None
     exposure_hi: float | None = None
+    # Face extents in units of interocular distance -- the same quantity the
+    # alignment transform normalises, so these hold whatever the source
+    # resolution or camera distance was. They let `align` predict whether a face
+    # will fit the output frame without re-opening the photo.
+    span_w: float | None = None
+    span_up: float | None = None
+    span_down: float | None = None
     reject_reason: str | None = None
     score: float | None = None
 
@@ -171,6 +178,25 @@ def iris_centers(landmarks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     a = np.asarray(landmarks[IRIS_CENTER_A], dtype=np.float64)[:2]
     b = np.asarray(landmarks[IRIS_CENTER_B], dtype=np.float64)[:2]
     return (a, b) if a[0] <= b[0] else (b, a)
+
+
+def face_spans(landmarks: np.ndarray, left_eye: np.ndarray, right_eye: np.ndarray,
+               interocular: float) -> tuple[float, float, float]:
+    """Face extents relative to the interocular distance.
+
+    Returns (width, above the eye line, below it). Dividing by the interocular
+    distance is what makes these comparable across photos: it is exactly the
+    quantity alignment holds constant, so a face that measures 2.6 wide here
+    occupies 2.6 eye-widths of the output frame regardless of the original.
+    """
+    if interocular <= 0:
+        return 0.0, 0.0, 0.0
+    pts = np.asarray(landmarks, dtype=np.float64)[:, :2]
+    eye_y = (float(left_eye[1]) + float(right_eye[1])) / 2.0
+    span_w = float(pts[:, 0].max() - pts[:, 0].min()) / interocular
+    span_up = max(0.0, eye_y - float(pts[:, 1].min())) / interocular
+    span_down = max(0.0, float(pts[:, 1].max()) - eye_y) / interocular
+    return span_w, span_up, span_down
 
 
 def out_of_bounds_fraction(landmarks: np.ndarray, width: int, height: int,

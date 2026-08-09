@@ -262,7 +262,8 @@ def cmd_select(args: argparse.Namespace) -> None:
 def cmd_align(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
     pipeline.stage_align(conn, cfg.path("frames"), cfg.section("output"), log,
-                         int(cfg.get("analyze", "workers", 0)))
+                         int(cfg.get("analyze", "workers", 0)),
+                         framing=cfg.section("align"))
 
 
 def cmd_review(args: argparse.Namespace) -> None:
@@ -351,7 +352,8 @@ def cmd_trial(args: argparse.Namespace) -> None:
 
     with timing.stopwatch() as align_elapsed:
         aligned = pipeline.stage_align(conn, cfg.path("frames"), cfg.section("output"),
-                                       log, int(cfg.get("analyze", "workers", 0)))
+                                       log, int(cfg.get("analyze", "workers", 0)),
+                                       framing=cfg.section("align"))
     # Alignment scales with *selected frames*, not assets: bucketing means a
     # bigger library yields proportionally more frames, not one per photo.
     projected_frames = round(frames / scored * total_assets) if scored else 0

@@ -454,6 +454,9 @@ def analyze_image(landmarker, opts: AnalyzeOptions, path: Path,
         right_eye_x=float(right_eye[0]), right_eye_y=float(right_eye[1]),
     )
 
+    m.span_w, m.span_up, m.span_down = metrics.face_spans(
+        pts, left_eye, right_eye, interocular)
+
     if pose is not None:
         m.yaw, m.pitch, m.roll = pose
 
