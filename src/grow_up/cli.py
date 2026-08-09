@@ -212,17 +212,29 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     cmd_select(args)
 
 
+def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tuple[int, int, int]:
+    """Apply thresholds, pick frames, and report the filter outcome.
+
+    Shared by `select`, `run` and `trial` so the outcome block always lands
+    directly after selection. Duplicating it once let `trial` print the same
+    table adrift at the very end of the run, after the timing report.
+
+    Returns (kept, scored, frames).
+    """
+    kept, scored = select.apply_filters(conn, cfg.section("filter"), cfg.section("score"))
+    log(f"  {kept}/{scored} images pass the hard filters")
+
+    cadence = cadence or str(cfg.get("select", "cadence", "week"))
+    per_bucket = int(cfg.get("select", "per_bucket", 1))
+    frames = select.select_frames(conn, cadence, per_bucket)
+    log(f"  selected {frames} frames (cadence={cadence}, {per_bucket} per bucket)")
+    pipeline.report_rejects(conn, log)
+    return kept, scored, frames
+
+
 def cmd_select(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
-    limits, weights = cfg.section("filter"), cfg.section("score")
-    kept, total = select.apply_filters(conn, limits, weights)
-    log(f"  {kept}/{total} images pass the hard filters")
-
-    cadence = getattr(args, "cadence", None) or str(cfg.get("select", "cadence", "week"))
-    per_bucket = int(cfg.get("select", "per_bucket", 1))
-    n = select.select_frames(conn, cadence, per_bucket)
-    log(f"  selected {n} frames (cadence={cadence}, {per_bucket} per bucket)")
-    pipeline.report_rejects(conn, log)
+    _select_frames(cfg, conn, getattr(args, "cadence", None))
 
 
 def cmd_align(args: argparse.Namespace) -> None:
@@ -309,12 +321,7 @@ def cmd_trial(args: argparse.Namespace) -> None:
     trial.stages.append(timing.StageTiming(
         "analyze", analyzed, analyze_elapsed(), before["analyze"]))
 
-    limits, weights = cfg.section("filter"), cfg.section("score")
-    kept, scored = select.apply_filters(conn, limits, weights)
-    cadence = args.cadence or str(cfg.get("select", "cadence", "week"))
-    frames = select.select_frames(conn, cadence, int(cfg.get("select", "per_bucket", 1)))
-    log(f"  {kept}/{scored} pass the filters; {frames} frames selected "
-        f"(cadence={cadence})")
+    _, scored, frames = _select_frames(cfg, conn, args.cadence)
 
     with timing.stopwatch() as align_elapsed:
         aligned = pipeline.stage_align(conn, cfg.path("frames"), cfg.section("output"),
@@ -358,7 +365,6 @@ def cmd_trial(args: argparse.Namespace) -> None:
 
     for line in trial.render():
         log(line)
-    pipeline.report_rejects(conn, log)
 
     if aligned:
         out_dir = cfg.path("out")
