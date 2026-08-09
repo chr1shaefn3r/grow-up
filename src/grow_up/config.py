@@ -37,6 +37,7 @@ REMOVED_KEYS = {
     ("output", "right_eye"): "align.eye_distance / align.eye_level",
     ("output", "smoothing_window"): "nothing — transform smoothing was removed",
     ("output", "smoothing_polyorder"): "nothing — transform smoothing was removed",
+    ("analyze", "gaze_method"): "nothing — gaze is always measured geometrically",
 }
 
 

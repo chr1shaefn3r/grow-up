@@ -105,7 +105,6 @@ class AnalyzeOptions:
     ensemble: int = 1
     # Downscale crops longer than this before inference. 0 disables.
     max_crop_px: int = 0
-    gaze_method: str = "blendshapes"
 
 
 # The dial itself. `fast` is deliberately identical to the original behaviour:
@@ -462,7 +461,7 @@ def analyze_image(landmarker, opts: AnalyzeOptions, path: Path,
 
     if blendshapes:
         m.blink_l, m.blink_r = metrics.blink_from_blendshapes(blendshapes)
-    m.gaze_x, m.gaze_y = metrics.gaze(pts, blendshapes, opts.gaze_method)
+    m.gaze_x, m.gaze_y = metrics.gaze_from_geometry(pts)
 
     cx1, cy1, cx2, cy2 = images.expand_box(box, opts.bbox_margin, width, height)
     m.exposure_lo, m.exposure_hi = metrics.exposure_percentiles(

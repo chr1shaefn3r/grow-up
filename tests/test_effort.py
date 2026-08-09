@@ -407,12 +407,6 @@ class TestOptionResolution:
         with pytest.raises(ValueError, match="unknown analyze.effort"):
             self.build({"effort": "maximum"})
 
-    def test_gaze_method_defaults_to_blendshapes(self):
-        """Switching would change the scale of gaze_x and invalidate a tuned
-        max_gaze, so it must never happen by accident."""
-        assert self.build({}).gaze_method == "blendshapes"
-        assert self.build({"effort": "thorough"}).gaze_method == "blendshapes"
-
     def test_presence_confidence_is_exposed(self):
         assert self.build({"min_face_presence_confidence": 0.2}
                           ).min_face_presence_confidence == 0.2
@@ -522,14 +516,9 @@ class TestGeometricGaze:
         assert metrics.gaze_from_geometry(
             np.zeros((metrics.N_LANDMARKS, 2))) == (0.0, 0.0)
 
-    def test_dispatch_defaults_to_blendshapes(self):
-        blend = {"eyeLookOutLeft": 0.8, "eyeLookInRight": 0.8}
-        assert metrics.gaze(self.mesh(), blend) == metrics.gaze_from_blendshapes(blend)
-
-    def test_dispatch_selects_geometry(self):
-        mesh = self.mesh(iris_offset=10.0)
-        assert metrics.gaze(mesh, {}, "geometric") == metrics.gaze_from_geometry(mesh)
-
-    def test_unknown_method_fails_loudly(self):
-        with pytest.raises(ValueError, match="unknown gaze_method"):
-            metrics.gaze(self.mesh(), {}, "vibes")
+    def test_reads_vertical_gaze_too(self):
+        """Looking up moves both irises above the corner midpoint."""
+        pts = self.mesh()
+        pts[metrics.IRIS_CENTER_A] = [120.0, 190.0]
+        pts[metrics.IRIS_CENTER_B] = [220.0, 190.0]
+        assert metrics.gaze_from_geometry(pts)[1] > 0

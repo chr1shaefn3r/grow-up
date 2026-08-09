@@ -48,29 +48,6 @@ class TestEuler:
             metrics.euler_from_matrix(np.zeros((3, 3)))
 
 
-class TestGaze:
-    def test_looking_at_the_camera_is_near_zero(self):
-        assert metrics.gaze_from_blendshapes({}) == (0.0, 0.0)
-
-    def test_both_eyes_reinforce_rather_than_cancel(self):
-        """Looking to one side turns one eye 'out' and the other 'in'."""
-        gaze_x, _ = metrics.gaze_from_blendshapes(
-            {"eyeLookOutLeft": 0.8, "eyeLookInRight": 0.8}
-        )
-        assert gaze_x == pytest.approx(0.8)
-
-    def test_the_opposite_direction_flips_the_sign(self):
-        gaze_x, _ = metrics.gaze_from_blendshapes(
-            {"eyeLookInLeft": 0.8, "eyeLookOutRight": 0.8}
-        )
-        assert gaze_x == pytest.approx(-0.8)
-
-    def test_vertical_gaze(self):
-        _, up = metrics.gaze_from_blendshapes({"eyeLookUpLeft": 0.6, "eyeLookUpRight": 0.6})
-        _, down = metrics.gaze_from_blendshapes({"eyeLookDownLeft": 0.6, "eyeLookDownRight": 0.6})
-        assert up > 0 > down
-
-
 class TestOutOfFrame:
     def landmarks(self, pts):
         return np.array(pts, dtype=np.float64)

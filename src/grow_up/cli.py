@@ -222,7 +222,6 @@ def _analyze_options(cfg: config.Config, verbose: bool = False,
         retry_equalize=bool(settings["retry_equalize"]),
         ensemble=int(settings["ensemble"]),
         max_crop_px=int(settings["max_crop_px"]),
-        gaze_method=str(cfg.get("analyze", "gaze_method", "blendshapes")),
     )
 
 

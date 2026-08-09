@@ -38,7 +38,7 @@ recognition in this pipeline at all.
 |---|---|
 | align to the eyes | 478 landmarks including **iris centres** (idx 468 / 473) |
 | head turned away | `facial_transformation_matrixes` → yaw / pitch / roll |
-| **not looking at the camera** | `eyeLookIn/Out/Up/Down` blendshapes |
+| **not looking at the camera** | where each iris sits between its own eye corners |
 | eyes closed / mid-blink | `eyeBlinkLeft` / `eyeBlinkRight` blendshapes |
 | face partly out of frame | landmarks that fall outside the image bounds |
 
@@ -248,10 +248,9 @@ Every setting a preset controls (`retry_margins`, `retry_rotations`, `retry_equa
 `max_crop_px` off, which would otherwise speed it up. Switching level should be the only
 thing that moves the numbers, which is also what makes the comparison above fair.
 
-`analyze.gaze_method = "geometric"` reads gaze from the iris position between the eye
-corners instead of summing blendshapes, at no extra inference cost. It is likely steadier,
-but it changes the *scale* of `gaze_x`/`gaze_y` — switching means re-tuning
-`filter.max_gaze`, so it is off by default.
+Gaze is measured geometrically: the iris centre's offset from the midpoint of its own eye
+corners, normalised by the corner separation. That normalisation is what makes it
+comparable between a close-up and a distant shot, and it costs no extra inference.
 
 ### Tuning the filter
 

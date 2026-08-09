@@ -91,42 +91,23 @@ def euler_from_matrix(matrix: np.ndarray) -> tuple[float, float, float]:
     return math.degrees(yaw), math.degrees(pitch), math.degrees(roll)
 
 
-def gaze_from_blendshapes(bs: dict[str, float]) -> tuple[float, float]:
-    """Signed gaze direction in roughly [-1, 1], independent of head pose.
+# Outer and inner corners of each eye, from the canonical FaceMesh topology.
+# The iris centre's offset between them is what the gaze estimate reads.
+LEFT_EYE_CORNERS = (33, 133)
+RIGHT_EYE_CORNERS = (362, 263)
+
+
+def gaze_from_geometry(landmarks: np.ndarray) -> tuple[float, float]:
+    """Signed gaze direction, from where each iris sits between its own corners.
 
     This is the metric that answers "is she looking at the camera", which head
     pose alone cannot: the face can point straight at the lens while the eyes
     are turned away.
 
-    "In" and "out" are relative to each eye's own nose side, so a subject
-    looking to one side produces `out` on one eye and `in` on the other. The
-    two are combined so they reinforce instead of cancelling.
-    """
-    g = lambda k: float(bs.get(k, 0.0))  # noqa: E731
-    horizontal = ((g("eyeLookOutLeft") - g("eyeLookInLeft"))
-                  + (g("eyeLookInRight") - g("eyeLookOutRight"))) / 2.0
-    vertical = ((g("eyeLookUpLeft") + g("eyeLookUpRight"))
-                - (g("eyeLookDownLeft") + g("eyeLookDownRight"))) / 2.0
-    return horizontal, vertical
-
-
-# Outer and inner corners of each eye, from the canonical FaceMesh topology.
-# The iris centre's offset between them is what a geometric gaze estimate reads.
-LEFT_EYE_CORNERS = (33, 133)
-RIGHT_EYE_CORNERS = (362, 263)
-GAZE_METHODS = ("blendshapes", "geometric")
-
-
-def gaze_from_geometry(landmarks: np.ndarray) -> tuple[float, float]:
-    """Gaze from where each iris sits between its own eye corners.
-
-    An alternative to the blendshape sum: measure the iris centre's offset from
-    the midpoint of the eye corners, normalised by the corner separation, so the
-    result is independent of face size and camera distance.
-
-    Scaled by 2 so a fully-deflected iris reads near 1, roughly matching the
-    blendshape range -- but only roughly, which is why switching method means
-    re-tuning `max_gaze`.
+    Measured as the iris centre's offset from the midpoint of the eye corners,
+    normalised by the corner separation, so the result is independent of face
+    size and camera distance. Scaled by 2, so a fully-deflected iris reads
+    near 1.
     """
     pts = np.asarray(landmarks, dtype=np.float64)
     horizontal, vertical = [], []
@@ -149,18 +130,6 @@ def gaze_from_geometry(landmarks: np.ndarray) -> tuple[float, float]:
     if not horizontal:
         return 0.0, 0.0
     return float(np.mean(horizontal)), float(np.mean(vertical))
-
-
-def gaze(landmarks: np.ndarray, bs: dict[str, float],
-         method: str = "blendshapes") -> tuple[float, float]:
-    """Gaze by the configured method."""
-    if method == "blendshapes":
-        return gaze_from_blendshapes(bs)
-    if method == "geometric":
-        return gaze_from_geometry(landmarks)
-    raise ValueError(
-        f"unknown gaze_method {method!r}; expected one of {', '.join(GAZE_METHODS)}"
-    )
 
 
 def blink_from_blendshapes(bs: dict[str, float]) -> tuple[float, float]:

@@ -46,10 +46,6 @@ effort = "fast"
 # Any of the settings a preset controls can be set here to override just that
 # one: retry_margins, retry_rotations, retry_equalize, ensemble, max_crop_px.
 
-# How gaze is estimated. "geometric" reads the iris position between the eye
-# corners and is likely steadier than the blendshape sum, but it changes the
-# scale of gaze_x/gaze_y -- switching means re-tuning filter.max_gaze.
-gaze_method = "blendshapes"
 min_face_presence_confidence = 0.5
 # 0 detects physical cores: sysctl on macOS, sysfs topology on Linux, capped by
 # any affinity or container limit. Apple Silicon has no hyperthreading, so an
