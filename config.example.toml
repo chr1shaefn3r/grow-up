@@ -31,9 +31,10 @@ source = "original"
 [analyze]
 model_path = "models/face_landmarker.task"
 
-# Time/accuracy trade-off. "fast" is one look per photo and is bit-identical to
-# the original behaviour; the levels above it spend time on photos where the
-# first look finds nothing, and on averaging several looks per face.
+# -- time/accuracy dial -------------------------------------------------------
+# "fast" is one look per photo and is bit-identical to the original behaviour;
+# the levels above it spend time on photos where the first look finds nothing,
+# and on averaging several looks per face.
 #
 #   fast      1x    one crop, no retries
 #   balanced  ~1.3x retries a failed detection with wider/tighter/equalised crops
@@ -42,18 +43,23 @@ model_path = "models/face_landmarker.task"
 # `grow-up trial --compare` measures all three over the same sample so the
 # trade-off is a number rather than a guess.
 effort = "fast"
-
 # Any of the settings a preset controls can be set here to override just that
 # one: retry_margins, retry_rotations, retry_equalize, ensemble, max_crop_px.
 
+# -- what counts as a face ----------------------------------------------------
+bbox_margin = 0.8      # grow Immich's face box before landmarking; the mesh wants context
+# Two thresholds, one word apart. Detection is whether the face detector finds a
+# face in the crop at all; presence is whether the landmark model still believes
+# one is there once it looks. Lower either to keep marginal faces.
+min_face_detection_confidence = 0.5
 min_face_presence_confidence = 0.5
+oob_inset = 0.0        # pixels of margin when testing landmarks against the frame edge
+
+# -- runtime ------------------------------------------------------------------
 # 0 detects physical cores: sysctl on macOS, sysfs topology on Linux, capped by
 # any affinity or container limit. Apple Silicon has no hyperthreading, so an
 # M1 Pro correctly yields 8 (6 performance + 2 efficiency), not 4.
 workers = 0
-bbox_margin = 0.8      # grow Immich's face box before landmarking; the mesh wants context
-min_face_detection_confidence = 0.5
-oob_inset = 0.0        # pixels of margin when testing landmarks against the frame edge
 # MediaPipe, TFLite and the GL context log heavily from C++ on startup -- fiber
 # init, XNNPACK delegates, feedback managers -- once per worker. Hidden by
 # default; set true (or pass --verbose) when diagnosing the model itself.
