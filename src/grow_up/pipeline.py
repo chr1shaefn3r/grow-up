@@ -338,7 +338,9 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
 
 
 def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, workers: int,
-                  log: Log, reanalyze: bool = False, limit: int | None = None) -> int:
+                  log: Log, reanalyze: bool = False, limit: int | None = None,
+                  persist: bool = True,
+                  collect: list[tuple[str, object]] | None = None) -> int:
     """Landmark every downloaded face and store its metrics."""
     where = "" if reanalyze else " LEFT JOIN metrics m ON m.asset_id = a.id WHERE m.asset_id IS NULL"
     rows = conn.execute(
@@ -360,11 +362,12 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
     }) for r in rows]
 
     if workers:
-        log(f"  analyze: {len(jobs)} images across {workers} workers (from config)")
+        log(f"  analyze: {len(jobs)} images across {workers} workers (from config), "
+            f"effort={opts.effort}")
     else:
         workers = analyze.physical_cores()
         log(f"  analyze: {len(jobs)} images across {workers} workers "
-            f"({analyze.available_cpus()} CPUs visible)")
+            f"({analyze.available_cpus()} CPUs visible), effort={opts.effort}")
 
     # Chunk finely enough that the tail stays short. Fixed coarse chunks leave
     # stragglers on heterogeneous cores -- an M1's efficiency cores run maybe a
@@ -383,7 +386,12 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
     with ProcessPoolExecutor(max_workers=workers, initializer=analyze.init_worker,
                              initargs=(opts,)) as pool:
         for asset_id, m in pool.map(analyze.analyze_one, jobs, chunksize=chunksize):
-            _store_metrics(conn, asset_id, m, stamp)
+            # `persist=False` lets `trial --compare` measure an effort level
+            # without overwriting the metrics the pipeline is actually using.
+            if persist:
+                _store_metrics(conn, asset_id, m, stamp)
+            if collect is not None:
+                collect.append((asset_id, m))
             done += 1
             bar.advance()
 

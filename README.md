@@ -187,6 +187,55 @@ Four details in there are load-bearing:
   the last week — a failure that produces a plausible-looking video, so
   `test_selection_spans_the_whole_corpus_not_just_recent_assets` guards it.)
 
+### Trading time for accuracy
+
+Analysis is fast — a thousand photos in about a minute on an M1 Pro — which leaves
+plenty of headroom to spend once you know what you want. `analyze.effort` spends it:
+
+| level | cost | what it does |
+|---|---|---|
+| `fast` | 1× | one crop per photo, no retries |
+| `balanced` | ~1.3× | retries a failed detection with wider, tighter and contrast-equalised crops |
+| `thorough` | ~3.5× | adds rotated retries, and takes the median of 3 crops per face |
+
+```bash
+grow-up trial --compare        # measure all three over the same sample
+```
+
+```
+effort        analyze   per item   detected   accepted   projected
+fast             2.0s      203ms     88/100      46/100      2m 48s
+balanced         4.8s      484ms     95/100      52/100      6m 43s
+thorough        14.1s      1.4s      97/100      55/100     19m 34s
+```
+
+It runs with metrics **not** persisted, so comparing never leaves your stored analysis
+at whichever level happened to run last. Pick one, set `analyze.effort`, then
+`grow-up analyze --reanalyze`.
+
+Two things the higher levels buy, and why:
+
+- **Detection recall.** A photo where MediaPipe finds nothing is simply lost. The retries
+  re-frame it — the face may extend past the crop, or background clutter may distract the
+  detector, or it may be too dark. BlazeFace is trained on upright faces, so `thorough`
+  also retries rotated, which rescues strongly tilted heads.
+- **Landmark precision**, which feeds pose, gaze *and* the eye alignment. MediaPipe is
+  deterministic on a fixed crop, so varying the framing is the only way to sample its
+  error; `ensemble` takes the **median** of several looks, so one bad framing cannot drag
+  the result.
+
+Every setting a preset controls (`retry_margins`, `retry_rotations`, `retry_equalize`,
+`ensemble`, `max_crop_px`) can be set individually to override just that one.
+
+`fast` is deliberately bit-identical to the original behaviour — including leaving
+`max_crop_px` off, which would otherwise speed it up. Switching level should be the only
+thing that moves the numbers, which is also what makes the comparison above fair.
+
+`analyze.gaze_method = "geometric"` reads gaze from the iris position between the eye
+corners instead of summing blendshapes, at no extra inference cost. It is likely steadier,
+but it changes the *scale* of `gaze_x`/`gaze_y` — switching means re-tuning
+`filter.max_gaze`, so it is off by default.
+
 ### Tuning the filter
 
 `out/rejects.html` is an interactive threshold tuner, not just a list of what was

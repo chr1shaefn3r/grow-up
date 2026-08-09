@@ -103,6 +103,59 @@ def gaze_from_blendshapes(bs: dict[str, float]) -> tuple[float, float]:
     return horizontal, vertical
 
 
+# Outer and inner corners of each eye, from the canonical FaceMesh topology.
+# The iris centre's offset between them is what a geometric gaze estimate reads.
+LEFT_EYE_CORNERS = (33, 133)
+RIGHT_EYE_CORNERS = (362, 263)
+GAZE_METHODS = ("blendshapes", "geometric")
+
+
+def gaze_from_geometry(landmarks: np.ndarray) -> tuple[float, float]:
+    """Gaze from where each iris sits between its own eye corners.
+
+    An alternative to the blendshape sum: measure the iris centre's offset from
+    the midpoint of the eye corners, normalised by the corner separation, so the
+    result is independent of face size and camera distance.
+
+    Scaled by 2 so a fully-deflected iris reads near 1, roughly matching the
+    blendshape range -- but only roughly, which is why switching method means
+    re-tuning `max_gaze`.
+    """
+    pts = np.asarray(landmarks, dtype=np.float64)
+    horizontal, vertical = [], []
+
+    for outer, inner in (LEFT_EYE_CORNERS, RIGHT_EYE_CORNERS):
+        if max(outer, inner, IRIS_CENTER_A, IRIS_CENTER_B) >= len(pts):
+            continue
+        corner_a, corner_b = pts[outer][:2], pts[inner][:2]
+        width = float(np.hypot(*(corner_b - corner_a)))
+        if width < 1e-6:
+            continue
+        # Whichever iris belongs to this eye is the nearer of the two.
+        midpoint = (corner_a + corner_b) / 2.0
+        iris = min((pts[IRIS_CENTER_A][:2], pts[IRIS_CENTER_B][:2]),
+                   key=lambda p: float(np.hypot(*(p - midpoint))))
+        offset = (iris - midpoint) / width
+        horizontal.append(offset[0] * 2.0)
+        vertical.append(-offset[1] * 2.0)
+
+    if not horizontal:
+        return 0.0, 0.0
+    return float(np.mean(horizontal)), float(np.mean(vertical))
+
+
+def gaze(landmarks: np.ndarray, bs: dict[str, float],
+         method: str = "blendshapes") -> tuple[float, float]:
+    """Gaze by the configured method."""
+    if method == "blendshapes":
+        return gaze_from_blendshapes(bs)
+    if method == "geometric":
+        return gaze_from_geometry(landmarks)
+    raise ValueError(
+        f"unknown gaze_method {method!r}; expected one of {', '.join(GAZE_METHODS)}"
+    )
+
+
 def blink_from_blendshapes(bs: dict[str, float]) -> tuple[float, float]:
     return float(bs.get("eyeBlinkLeft", 0.0)), float(bs.get("eyeBlinkRight", 0.0))
 

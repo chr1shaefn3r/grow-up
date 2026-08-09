@@ -14,7 +14,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from . import analyze, config, db, pipeline, review, select, timing
+from . import analyze, config, db, metrics, pipeline, review, select, timing
 from .encode import FFmpegMissing
 from .immich import (
     ANY,
@@ -190,23 +190,45 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     asyncio.run(go())
 
 
-def _analyze_options(cfg: config.Config,
-                     verbose: bool = False) -> analyze.AnalyzeOptions:
+def _analyze_options(cfg: config.Config, verbose: bool = False,
+                     effort: str | None = None) -> analyze.AnalyzeOptions:
+    """Build analyze options: preset first, explicit config settings on top.
+
+    So `effort = "thorough"` gives the whole bundle, but a lone
+    `ensemble = 5` beside it still wins for that one field.
+    """
+    level = effort or str(cfg.get("analyze", "effort", "fast"))
+    settings = analyze.preset_for(level)
+
+    section = cfg.section("analyze")
+    for key in list(settings):
+        if key in section:
+            settings[key] = section[key]
+
     return analyze.AnalyzeOptions(
         model_path=str(cfg.get("analyze", "model_path", analyze.DEFAULT_MODEL_PATH)),
         bbox_margin=float(cfg.get("analyze", "bbox_margin", 0.8)),
         min_face_detection_confidence=float(
             cfg.get("analyze", "min_face_detection_confidence", 0.5)),
+        min_face_presence_confidence=float(
+            cfg.get("analyze", "min_face_presence_confidence", 0.5)),
         oob_inset=float(cfg.get("analyze", "oob_inset", 0.0)),
         # --verbose only ever turns logging on; it never silences a config that
         # asked for it.
         verbose=bool(verbose or cfg.get("analyze", "verbose", False)),
+        effort=level,
+        retry_margins=tuple(float(x) for x in settings["retry_margins"]),
+        retry_rotations=tuple(float(x) for x in settings["retry_rotations"]),
+        retry_equalize=bool(settings["retry_equalize"]),
+        ensemble=int(settings["ensemble"]),
+        max_crop_px=int(settings["max_crop_px"]),
+        gaze_method=str(cfg.get("analyze", "gaze_method", "blendshapes")),
     )
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
-    pipeline.stage_analyze(conn, _analyze_options(cfg, args.verbose),
+    pipeline.stage_analyze(conn, _analyze_options(cfg, args.verbose, args.effort),
                            int(cfg.get("analyze", "workers", 0)), log,
                            reanalyze=args.reanalyze, limit=args.limit)
     cmd_select(args)
@@ -266,6 +288,10 @@ def cmd_trial(args: argparse.Namespace) -> None:
     and analyzes is written to the manifest and cache, so none of the work is
     repeated later. Running a trial simply gets you that much further along.
     """
+    if args.compare:
+        cmd_compare(args)
+        return
+
     cfg, conn = _open(args)
 
     total_assets = db.count_assets(conn)
@@ -314,7 +340,7 @@ def cmd_trial(args: argparse.Namespace) -> None:
 
     asyncio.run(network_stages())
 
-    opts = _analyze_options(cfg, args.verbose)
+    opts = _analyze_options(cfg, args.verbose, args.effort)
     with timing.stopwatch() as analyze_elapsed:
         analyzed = pipeline.stage_analyze(
             conn, opts, int(cfg.get("analyze", "workers", 0)), log, limit=limit)
@@ -371,6 +397,59 @@ def cmd_trial(args: argparse.Namespace) -> None:
         log("")
         log(f"Look at {out_dir / 'contact-sheet.html'} to judge alignment and framing,")
         log(f"and {out_dir / 'rejects.html'} to check the thresholds are not too tight.")
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    """Measure every effort level over the same sample and report the trade-off.
+
+    Runs with `persist=False` throughout: a comparison must not leave the stored
+    metrics at whichever level happened to run last.
+    """
+    cfg, conn = _open(args)
+    limit = int(args.limit or cfg.get("trial", "limit", 100))
+    limits, weights = cfg.section("filter"), cfg.section("score")
+    workload = pipeline.eventual_workload(conn)["analyze"]
+
+    ready = conn.execute(
+        "SELECT count(*) FROM downloads d"
+        "  JOIN faces f ON f.asset_id = d.asset_id AND f.status = 'ok'").fetchone()[0]
+    if not ready:
+        raise SystemExit("nothing downloaded yet — run `grow-up trial` first")
+
+    header = (f"{'effort':<12}{'analyze':>9}{'per item':>11}"
+              f"{'detected':>11}{'accepted':>11}{'projected':>12}")
+    rows = [header, "-" * len(header)]
+
+    for level in analyze.EFFORT_LEVELS:
+        opts = _analyze_options(cfg, args.verbose, level)
+        collected: list[tuple[str, object]] = []
+        with timing.stopwatch() as elapsed:
+            pipeline.stage_analyze(conn, opts, int(cfg.get("analyze", "workers", 0)),
+                                   log, reanalyze=True, limit=limit,
+                                   persist=False, collect=collected)
+        if not collected:
+            continue
+
+        detected = sum(1 for _, m in collected if m.detected)
+        accepted = sum(1 for _, m in collected
+                       if metrics.hard_reject(m, limits) is None)
+        stage = timing.StageTiming(level, len(collected), elapsed(), workload)
+        rows.append(
+            f"{level:<12}{timing.format_duration(stage.elapsed):>9}"
+            f"{timing.format_duration(stage.per_item):>11}"
+            f"{f'{detected}/{len(collected)}':>11}"
+            f"{f'{accepted}/{len(collected)}':>11}"
+            f"{timing.format_duration(stage.projected):>12}"
+        )
+
+    log("")
+    for row in rows:
+        log(row)
+    log("")
+    log("Projected covers the analyze stage only, over "
+        f"{workload} assets still to analyze.")
+    log("Stored metrics are untouched; set analyze.effort in config.toml, then")
+    log("`grow-up analyze --reanalyze` to apply the level you pick.")
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
@@ -519,7 +598,8 @@ def build_parser() -> argparse.ArgumentParser:
     def add(name: str, func, help_text: str) -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=func, since=None, full=False, reanalyze=False,
-                       cadence=None, no_encode=False, asset=None, limit=None)
+                       cadence=None, no_encode=False, asset=None, limit=None,
+                       effort=None, compare=False)
         return p
 
     model = add("fetch-model", cmd_fetch_model, "download the MediaPipe face landmarker model")
@@ -538,6 +618,10 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "run":
             p.add_argument("--cadence", default=None, choices=list(select.CADENCES))
             p.add_argument("--no-encode", action="store_true")
+            p.add_argument("--effort", default=None,
+                           choices=list(analyze.EFFORT_LEVELS),
+                           help="time/accuracy trade-off "
+                                "(default: analyze.effort in config)")
 
     for name, func, help_text in (
         ("faces", cmd_faces, "fetch her face bounding box per asset"),
@@ -557,11 +641,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cadence", default=None, choices=list(select.CADENCES))
     p.add_argument("--no-encode", action="store_true",
                    help="stop after the review pages, skipping the sample video")
+    p.add_argument("--effort", default=None, choices=list(analyze.EFFORT_LEVELS),
+                   help="time/accuracy trade-off (default: analyze.effort in config)")
+    p.add_argument("--compare", action="store_true",
+                   help="measure every effort level over the same sample instead")
 
     p = add("analyze", cmd_analyze, "landmark faces and compute quality metrics")
     p.add_argument("--reanalyze", action="store_true", help="re-run on already-analyzed assets")
     p.add_argument("-n", "--limit", type=int, default=None,
                    help="process at most this many assets")
+    p.add_argument("--effort", default=None, choices=list(analyze.EFFORT_LEVELS),
+                   help="time/accuracy trade-off (default: analyze.effort in config)")
 
     p = add("select", cmd_select, "re-apply thresholds and pick frames (no ML re-run)")
     p.add_argument("--cadence", default=None, choices=list(select.CADENCES))

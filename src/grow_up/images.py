@@ -7,6 +7,7 @@ must apply orientation too or every crop lands on the wrong part of the photo.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +59,90 @@ def expand_box(box: tuple[int, int, int, int], margin: float,
         min(width, int(round(x2 + dx))),
         min(height, int(round(y2 + dy))),
     )
+
+
+def downscale_to(bgr: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """Shrink a crop so its longest side is at most `max_side`.
+
+    Returns (image, scale) where `scale` maps the returned image's coordinates
+    back to the input's -- landmarks come out in the smaller space and must be
+    multiplied by it.
+
+    MediaPipe resizes to its own 256px input with a plain bilinear filter, so
+    handing it a 2000px crop wastes time and loses detail to aliasing.
+    INTER_AREA averages the discarded pixels instead.
+    """
+    if max_side <= 0:
+        return bgr, 1.0
+    height, width = bgr.shape[:2]
+    longest = max(height, width)
+    if longest <= max_side:
+        return bgr, 1.0
+
+    import cv2
+
+    scale = longest / float(max_side)
+    resized = cv2.resize(bgr, (max(1, int(round(width / scale))),
+                               max(1, int(round(height / scale)))),
+                         interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
+def equalize(bgr: np.ndarray) -> np.ndarray:
+    """Local contrast equalisation, for faces lost in shadow or backlight.
+
+    CLAHE on the L channel only, so colour is untouched -- this exists to give
+    the detector something to find, not to alter how the photo looks.
+    """
+    import cv2
+
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def rotation_matrix(degrees: float, width: int, height: int) -> np.ndarray:
+    """2x3 rotation about the centre of a `width` x `height` image.
+
+    Written out rather than taken from `cv2.getRotationMatrix2D` -- same result,
+    but it keeps the coordinate round trip testable without opencv installed,
+    which is what lets the suite stay dependency-light.
+    """
+    angle = math.radians(degrees)
+    alpha, beta = math.cos(angle), math.sin(angle)
+    cx, cy = width / 2.0, height / 2.0
+    return np.array([
+        [alpha, beta, (1.0 - alpha) * cx - beta * cy],
+        [-beta, alpha, beta * cx + (1.0 - alpha) * cy],
+    ], dtype=np.float64)
+
+
+def rotate(bgr: np.ndarray, degrees: float) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate a crop about its centre, keeping the same canvas size.
+
+    Returns (rotated, matrix). Landmarks detected on the rotated copy are in
+    that copy's coordinates, so `unrotate_points` must undo the same matrix
+    before they mean anything in the original.
+    """
+    import cv2
+
+    height, width = bgr.shape[:2]
+    matrix = rotation_matrix(degrees, width, height)
+    rotated = cv2.warpAffine(bgr, matrix, (width, height),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return rotated, matrix
+
+
+def unrotate_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Map points from a rotated image back to the original.
+
+    Pure numpy: inverting a 2x3 affine is a 2x2 solve plus a translation, and
+    keeping it dependency-free means the round trip is testable without opencv.
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    linear, offset = matrix[:, :2], matrix[:, 2]
+    return (np.linalg.solve(linear, (np.asarray(points, dtype=np.float64) - offset).T)).T
 
 
 def resize_gray(gray: np.ndarray, target_width: int) -> np.ndarray:

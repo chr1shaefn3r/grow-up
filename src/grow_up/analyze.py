@@ -84,8 +84,72 @@ class AnalyzeOptions:
     model_path: str = str(DEFAULT_MODEL_PATH)
     bbox_margin: float = 0.8
     min_face_detection_confidence: float = 0.5
+    min_face_presence_confidence: float = 0.5
     oob_inset: float = 0.0
     verbose: bool = False
+
+    # -- time/accuracy dial (see EFFORT_PRESETS) --------------------------
+    # Name of the preset the fields below came from, for reporting only.
+    effort: str = "fast"
+    # Extra crops to try when the first look finds nothing. Costs time only on
+    # photos that already failed.
+    retry_margins: tuple[float, ...] = ()
+    # Degrees to rotate a failing crop by before retrying. BlazeFace is trained
+    # on upright faces, so a strongly rolled head can defeat it outright.
+    retry_rotations: tuple[float, ...] = ()
+    # Retry a failure on a contrast-equalised copy, for dark and backlit shots.
+    retry_equalize: bool = False
+    # Number of jittered crops to combine per face. MediaPipe is deterministic
+    # on a fixed crop, so varying the framing is the only way to sample its
+    # error; the median of several looks is steadier than any one.
+    ensemble: int = 1
+    # Downscale crops longer than this before inference. 0 disables.
+    max_crop_px: int = 0
+    gaze_method: str = "blendshapes"
+
+
+# The dial itself. `fast` is deliberately identical to the original behaviour:
+# switching level should be the only thing that moves the numbers.
+EFFORT_PRESETS: dict[str, dict] = {
+    "fast": {
+        "retry_margins": (),
+        "retry_rotations": (),
+        "retry_equalize": False,
+        "ensemble": 1,
+        "max_crop_px": 0,
+    },
+    "balanced": {
+        "retry_margins": (1.6, 0.4),
+        "retry_rotations": (),
+        "retry_equalize": True,
+        "ensemble": 1,
+        "max_crop_px": 1024,
+    },
+    "thorough": {
+        "retry_margins": (1.6, 0.4, 2.5),
+        "retry_rotations": (-25.0, 25.0),
+        "retry_equalize": True,
+        "ensemble": 3,
+        "max_crop_px": 1024,
+    },
+}
+
+EFFORT_LEVELS = tuple(EFFORT_PRESETS)
+
+
+def preset_for(effort: str) -> dict:
+    """Settings for an effort level.
+
+    Fails loudly on an unknown name rather than silently falling back: a typo in
+    config.toml that quietly ran at a different level than intended would be a
+    poor way to learn what the dial does.
+    """
+    try:
+        return dict(EFFORT_PRESETS[effort])
+    except KeyError:
+        raise ValueError(
+            f"unknown analyze.effort {effort!r}; expected one of {', '.join(EFFORT_LEVELS)}"
+        ) from None
 
 
 def available_cpus() -> int:
@@ -195,6 +259,7 @@ def build_landmarker(opts: AnalyzeOptions):
         running_mode=vision.RunningMode.IMAGE,
         num_faces=1,
         min_face_detection_confidence=opts.min_face_detection_confidence,
+        min_face_presence_confidence=opts.min_face_presence_confidence,
         output_face_blendshapes=True,
         output_facial_transformation_matrixes=True,
     )
@@ -212,10 +277,154 @@ def analyze_one(job: tuple[str, str, dict]) -> tuple[str, FaceMetrics]:
     return asset_id, result
 
 
-def analyze_image(landmarker, opts: AnalyzeOptions, path: Path,
-                  face_row: dict) -> FaceMetrics:
+@dataclass(frozen=True)
+class Attempt:
+    """One framing of the face to hand the model."""
+
+    margin: float
+    equalize: bool = False
+    rotation: float = 0.0
+
+    def describe(self) -> str:
+        parts = [f"margin={self.margin:g}"]
+        if self.equalize:
+            parts.append("equalized")
+        if self.rotation:
+            parts.append(f"rot={self.rotation:g}")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
+class Look:
+    """A successful detection, already mapped into full-image coordinates."""
+
+    points: np.ndarray
+    blendshapes: dict[str, float]
+    matrix: np.ndarray | None
+    attempt: Attempt
+
+
+def ensemble_margins(opts: AnalyzeOptions) -> tuple[float, ...]:
+    """Crop margins for the ensemble, base first then alternating either side.
+
+    Deterministic rather than random: re-running analysis must reproduce the
+    same metrics, or the manifest stops being a reliable cache.
+    """
+    count = max(1, int(opts.ensemble))
+    base = float(opts.bbox_margin)
+    if count <= 1:
+        return (base,)
+
+    factors = [1.0]
+    while len(factors) < count:
+        index = len(factors)
+        delta = 0.15 * ((index + 1) // 2)
+        factors.append(1.0 - delta if index % 2 else 1.0 + delta)
+    return tuple(round(base * factor, 4) for factor in factors[:count])
+
+
+def attempt_ladder(opts: AnalyzeOptions) -> list[Attempt]:
+    """Framings to try, in order, until enough of them succeed.
+
+    The ensemble margins come first so a healthy photo is done after one look at
+    `fast`. The retries below them only ever run when those come back empty, so
+    they cost nothing on the photos that already worked.
+    """
+    base = float(opts.bbox_margin)
+    ladder = [Attempt(margin=margin) for margin in ensemble_margins(opts)]
+    ladder += [Attempt(margin=float(margin)) for margin in opts.retry_margins]
+    if opts.retry_equalize:
+        ladder.append(Attempt(margin=base, equalize=True))
+    ladder += [Attempt(margin=base, rotation=float(deg)) for deg in opts.retry_rotations]
+    return ladder
+
+
+def detect_once(landmarker, opts: AnalyzeOptions, bgr: np.ndarray,
+                box: tuple[int, int, int, int], attempt: Attempt) -> Look | None:
+    """One inference on one framing, or None if nothing was found."""
     import mediapipe as mp
 
+    height, width = bgr.shape[:2]
+    cx1, cy1, cx2, cy2 = images.expand_box(box, attempt.margin, width, height)
+    if cx2 - cx1 < 16 or cy2 - cy1 < 16:
+        return None
+
+    work = bgr[cy1:cy2, cx1:cx2]
+    if attempt.equalize:
+        work = images.equalize(work)
+
+    work, scale = images.downscale_to(work, opts.max_crop_px)
+
+    rotation_matrix = None
+    if attempt.rotation:
+        work, rotation_matrix = images.rotate(work, attempt.rotation)
+
+    work_h, work_w = work.shape[:2]
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=images.to_rgb(work))
+    result = landmarker.detect(mp_image)
+    if not result.face_landmarks:
+        return None
+
+    # Normalized landmarks may fall outside [0, 1] where the mesh extrapolates
+    # past the crop. Keeping those values is the whole basis of the
+    # out-of-frame check, so nothing is clamped on the way back.
+    pts = np.array([[lm.x * work_w, lm.y * work_h] for lm in result.face_landmarks[0]],
+                   dtype=np.float64)
+    if rotation_matrix is not None:
+        pts = images.unrotate_points(pts, rotation_matrix)
+    pts *= scale
+    pts += np.array([cx1, cy1], dtype=np.float64)
+
+    blendshapes = ({c.category_name: float(c.score) for c in result.face_blendshapes[0]}
+                   if result.face_blendshapes else {})
+    matrix = (np.asarray(result.facial_transformation_matrixes[0], dtype=np.float64)
+              if result.facial_transformation_matrixes else None)
+    return Look(points=pts, blendshapes=blendshapes, matrix=matrix, attempt=attempt)
+
+
+def gather_looks(landmarker, opts: AnalyzeOptions, bgr: np.ndarray,
+                 box: tuple[int, int, int, int]) -> list[Look]:
+    """Walk the ladder until `ensemble` looks succeed, or it runs out."""
+    wanted = max(1, int(opts.ensemble))
+    looks: list[Look] = []
+    for attempt in attempt_ladder(opts):
+        look = detect_once(landmarker, opts, bgr, box, attempt)
+        if look is not None:
+            looks.append(look)
+            if len(looks) >= wanted:
+                break
+    return looks
+
+
+def combine_looks(looks: list[Look]) -> tuple[np.ndarray, dict[str, float],
+                                              tuple[float, float, float] | None]:
+    """Median across looks: landmarks, blendshape scores and pose angles.
+
+    The median rather than the mean, so a single bad framing that throws the
+    mesh cannot drag the result with it.
+
+    Pose is combined after decomposing to Euler angles, not by averaging the
+    matrices -- the mean of rotation matrices is not itself a rotation.
+    """
+    points = np.median(np.stack([look.points for look in looks]), axis=0)
+
+    names: set[str] = set()
+    for look in looks:
+        names.update(look.blendshapes)
+    blendshapes = {
+        name: float(np.median([look.blendshapes.get(name, 0.0) for look in looks]))
+        for name in names
+    }
+
+    eulers = [metrics.euler_from_matrix(look.matrix)
+              for look in looks if look.matrix is not None]
+    pose = (tuple(float(np.median([e[axis] for e in eulers])) for axis in range(3))
+            if eulers else None)
+    return points, blendshapes, pose
+
+
+def analyze_image(landmarker, opts: AnalyzeOptions, path: Path,
+                  face_row: dict) -> FaceMetrics:
     bgr = images.load_bgr(path)
     height, width = bgr.shape[:2]
 
@@ -225,56 +434,36 @@ def analyze_image(landmarker, opts: AnalyzeOptions, path: Path,
         source_type=face_row.get("source_type"),
     )
     box = scale_bbox(face, width, height)
+    clipped = int(metrics.bbox_is_clipped(box, width, height))
 
-    crop_box = images.expand_box(box, opts.bbox_margin, width, height)
-    cx1, cy1, cx2, cy2 = crop_box
-    if cx2 - cx1 < 16 or cy2 - cy1 < 16:
-        return FaceMetrics(detected=0, reject_reason="face_too_small")
+    looks = gather_looks(landmarker, opts, bgr, box)
+    if not looks:
+        return FaceMetrics(detected=0, bbox_clipped=clipped,
+                           reject_reason="no_face_detected")
 
-    crop = bgr[cy1:cy2, cx1:cx2]
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=images.to_rgb(crop))
-    result = landmarker.detect(mp_image)
-
-    if not result.face_landmarks:
-        return FaceMetrics(
-            detected=0,
-            bbox_clipped=int(metrics.bbox_is_clipped(box, width, height)),
-            reject_reason="no_face_detected",
-        )
-
-    crop_w, crop_h = cx2 - cx1, cy2 - cy1
-    # Normalized landmarks are relative to the crop and may fall outside [0, 1]
-    # where the mesh extrapolates past it. Mapping to full-image pixels keeps
-    # that information, which is exactly what the out-of-frame check needs.
-    pts = np.array(
-        [[cx1 + lm.x * crop_w, cy1 + lm.y * crop_h] for lm in result.face_landmarks[0]],
-        dtype=np.float64,
-    )
-
+    pts, blendshapes, pose = combine_looks(looks)
     left_eye, right_eye = metrics.iris_centers(pts)
     interocular = float(np.hypot(*(right_eye - left_eye)))
 
     m = FaceMetrics(
         detected=1,
         oob_frac=metrics.out_of_bounds_fraction(pts, width, height, opts.oob_inset),
-        bbox_clipped=int(metrics.bbox_is_clipped(box, width, height)),
+        bbox_clipped=clipped,
         interocular_px=interocular,
         left_eye_x=float(left_eye[0]), left_eye_y=float(left_eye[1]),
         right_eye_x=float(right_eye[0]), right_eye_y=float(right_eye[1]),
     )
 
-    if result.facial_transformation_matrixes:
-        m.yaw, m.pitch, m.roll = metrics.euler_from_matrix(
-            np.asarray(result.facial_transformation_matrixes[0])
-        )
+    if pose is not None:
+        m.yaw, m.pitch, m.roll = pose
 
-    if result.face_blendshapes:
-        bs = {c.category_name: c.score for c in result.face_blendshapes[0]}
-        m.gaze_x, m.gaze_y = metrics.gaze_from_blendshapes(bs)
-        m.blink_l, m.blink_r = metrics.blink_from_blendshapes(bs)
+    if blendshapes:
+        m.blink_l, m.blink_r = metrics.blink_from_blendshapes(blendshapes)
+    m.gaze_x, m.gaze_y = metrics.gaze(pts, blendshapes, opts.gaze_method)
 
-    gray_face = images.to_gray(bgr[cy1:cy2, cx1:cx2])
-    m.exposure_lo, m.exposure_hi = metrics.exposure_percentiles(gray_face)
+    cx1, cy1, cx2, cy2 = images.expand_box(box, opts.bbox_margin, width, height)
+    m.exposure_lo, m.exposure_hi = metrics.exposure_percentiles(
+        images.to_gray(bgr[cy1:cy2, cx1:cx2]))
     m.sharpness = _eye_sharpness(bgr, left_eye, right_eye, interocular)
     return m
 
