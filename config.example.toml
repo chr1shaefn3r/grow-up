@@ -3,17 +3,30 @@
 # stays safe to commit.
 
 [immich]
+# The person as tagged in Immich, matched by name on the first run. Only used to
+# find the ID; once that is known this setting is never read again.
 person_name = "Her Name"
 # Filled in after the first lookup; setting it skips the name resolution.
 person_id = ""
 
+# Where everything lives, relative to this config file.
 [paths]
+# The manifest: which assets exist, what has been downloaded, analyzed, filtered
+# and warped. Every stage is resumable because of it, so deleting this file is
+# the one destructive act here -- it forces a full re-index and re-analyze.
 db = "data/grow-up.sqlite"
+# Downloaded originals, one file per asset. Much the largest directory. Safe to
+# delete when you are done; the cost is re-downloading.
 cache = "data/originals"
+# Aligned frames, rewritten from the cache on every `align` run. Purely derived,
+# so deleting it costs a warp pass and nothing else.
 frames = "data/frames"
+# The video, contact sheet and rejects page -- everything meant for a human.
 out = "out"
 
 [index]
+# Assets per request to Immich's search endpoint. A round-trip/memory trade-off
+# only: it changes how the asset list is paged, never which assets come back.
 page_size = 1000
 
 [fetch]
@@ -29,6 +42,7 @@ retries = 4
 source = "original"
 
 [analyze]
+# The MediaPipe FaceLandmarker bundle, put here by `grow-up fetch-model`.
 model_path = "models/face_landmarker.task"
 
 # -- time/accuracy dial -------------------------------------------------------
@@ -67,6 +81,8 @@ verbose = false
 
 # Hard filters. Anything failing one of these never becomes a frame.
 # Loosen these first if the rejects gallery is full of frames you would have kept.
+# `out/rejects.html` has a slider per threshold that previews the effect of a
+# change before you make it here.
 [filter]
 max_yaw = 20.0             # degrees; head turned left/right
 max_pitch = 18.0           # degrees; head nodding up/down
@@ -77,16 +93,22 @@ max_oob_frac = 0.005       # fraction of the 478 landmarks allowed outside the f
 allow_bbox_clipped = false # accept faces touching the image edge
 min_interocular_px = 60.0  # eye-to-eye distance; below this the frame upscales badly
 min_sharpness = 12.0       # Laplacian variance on the eye region at a canonical scale
-min_exposure_lo = 8.0
-max_exposure_hi = 250.0
+# Brightness limits on the face crop, in 0..255. The measurements are the 5th and
+# 95th percentile of its luma, so a few specular highlights do not condemn a
+# frame -- only genuinely crushed shadows or blown-out skin do.
+min_exposure_lo = 8.0      # reject below this: the face is lost in shadow
+max_exposure_hi = 250.0    # reject above this: the face is blown out
 
-# Relative weights for ranking the survivors. Only their ratios matter.
+# Relative weights for ranking the survivors. Only their ratios matter: the
+# score is a weighted mean of the terms below, each normalised against the very
+# threshold that would have rejected the frame. Raise one to change which photo
+# wins its bucket; none of this can rescue a frame the filters already rejected.
 [score]
-w_pose = 1.0
-w_gaze = 1.0
-w_eyes_open = 1.0
-w_sharpness = 1.0
-w_size = 0.5
+w_pose = 1.0       # how square-on the head is, averaged over yaw, pitch and roll
+w_gaze = 1.0       # how close the eyes are to looking straight down the lens
+w_eyes_open = 1.0  # 1 minus the stronger of the two blink values
+w_sharpness = 1.0  # eye-region detail, saturating at 8x min_sharpness
+w_size = 0.5       # eye-to-eye distance, saturating at 4x min_interocular_px
 
 [trial]
 # `grow-up trial` processes this many assets, measures each stage, and projects
@@ -98,11 +120,21 @@ limit = 100
 # day | week | month | all -- bucket the timeline and keep the best per bucket,
 # so a photo-heavy holiday cannot dominate the video.
 cadence = "week"
+# Frames kept per bucket, best-scoring first. Above 1 the video lingers on the
+# busier weeks, which is usually not what a timelapse wants -- widen the cadence
+# instead if the result is too short.
 per_bucket = 1
 
 [output]
+# Frame size in pixels, and therefore the video resolution. The ratio matters as
+# much as the size: it decides how much of the head fits beside the eyes, which
+# [align] then positions. 1080x1350 is 4:5 portrait.
 width = 1080
 height = 1350
+# Second pass over the finished frames that pulls each one's brightness toward
+# the median of its neighbours, damping the flicker that comes from photos shot
+# under different light on consecutive days. Costs one extra pass over the
+# frames; set false to see the original exposure of every shot.
 flicker_match = true
 
 [align]
@@ -124,8 +156,15 @@ fill = "blur"          # blur | edge | black
 fit_margin = 1.5
 
 [encode]
+# Written into paths.out. `grow-up trial` prefixes "trial-" so a trial can never
+# overwrite the real video.
 filename = "timelapse.mp4"
+# Playback rate. Together with select.cadence it sets the pace: one frame per
+# week at 10 fps covers about a year in five seconds.
 fps = 10
 codec = "libx264"          # "hevc_videotoolbox" is much faster on Apple Silicon
+# Quality for the software x264/x265 encoders, roughly 0 (lossless) to 51. Lower
+# is better and bigger; 18 is visually near-transparent. Hardware encoders like
+# hevc_videotoolbox ignore it -- they take a bitrate instead.
 crf = 18
 interpolate = false        # ffmpeg minterpolate; smoother but very slow
