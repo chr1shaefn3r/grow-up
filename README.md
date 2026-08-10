@@ -370,16 +370,16 @@ runs in a thread pool, since OpenCV releases the GIL.
 A full `grow-up run` executes these in order. Each one is also a command of its own,
 takes its input from the manifest, and skips whatever is already recorded there.
 
-| # | Stage | What it does |
+| # | Command | What it does |
 |---|---|---|
-| 1 | `index` | Enumerates the subject's assets via `POST /search/metadata`, honouring the sync watermark. Records ids, capture dates and dimensions. Downloads nothing. |
-| 2 | `faces` | For each new asset, `GET /faces?id=…` and stores *their* bounding box. This is what makes group photos usable. |
-| 3 | `fetch` | Downloads the originals into `paths.cache`, concurrently, retrying transient failures. Streams to disk and renames on completion, so an interrupted run leaves no truncated file. |
-| 4 | `analyze` | Crops around the face box, runs FaceLandmarker, and stores the metrics: pose, gaze, blink, sharpness, exposure, iris positions, face extents. The expensive stage, and the only one that runs a model. |
-| 5 | `select` | Applies the `[filter]` thresholds to those stored metrics, scores the survivors with the `[score]` weights, and keeps the best per `[select] cadence` bucket. Reads only stored numbers — no image is opened, so it is sub-second and re-runnable as often as you like. |
-| 6 | `align` | Solves a similarity transform per frame that puts both eyes on the canonical positions, warps the image to `[output]` size, and writes the frames. Optionally damps brightness flicker across neighbours. |
-| 7 | `review` | Writes `contact-sheet.html` (the accepted frames, in order) and `rejects.html` (the interactive threshold tuner). |
-| 8 | `encode` | Feeds the frames to ffmpeg and writes the video into `paths.out`. |
+| 1 | `grow-up index` | Enumerates the subject's assets via `POST /search/metadata`, honouring the sync watermark. Records ids, capture dates and dimensions. Downloads nothing. |
+| 2 | `grow-up faces` | For each new asset, `GET /faces?id=…` and stores *their* bounding box. This is what makes group photos usable. |
+| 3 | `grow-up fetch` | Downloads the originals into `paths.cache`, concurrently, retrying transient failures. Streams to disk and renames on completion, so an interrupted run leaves no truncated file. |
+| 4 | `grow-up analyze` | Crops around the face box, runs FaceLandmarker, and stores the metrics: pose, gaze, blink, sharpness, exposure, iris positions, face extents. The expensive stage, and the only one that runs a model. |
+| 5 | `grow-up select` | Applies the `[filter]` thresholds to those stored metrics, scores the survivors with the `[score]` weights, and keeps the best per `[select] cadence` bucket. Reads only stored numbers — no image is opened, so it is sub-second and re-runnable as often as you like. |
+| 6 | `grow-up align` | Solves a similarity transform per frame that puts both eyes on the canonical positions, warps the image to `[output]` size, and writes the frames. Optionally damps brightness flicker across neighbours. |
+| 7 | `grow-up review` | Writes `contact-sheet.html` (the accepted frames, in order) and `rejects.html` (the interactive threshold tuner). |
+| 8 | `grow-up encode` | Feeds the frames to ffmpeg and writes the video into `paths.out`. |
 
 `analyze` runs `select` immediately after itself, so the filter outcome is reported
 where you would expect it rather than at the end of the run.
@@ -517,3 +517,7 @@ covers the transform maths, the metric definitions, bbox coordinate mapping, the
 rejects page's filter under node against the Python one, and the watermark's failure
 modes (including that timestamps match the API's `date-time` pattern verbatim from the
 OpenAPI spec).
+
+[`CLAUDE.md`](CLAUDE.md) carries what this file does not: the invariants, the mistakes
+already made and the tests that guard against repeating them. Worth reading before
+changing anything, whether you are a person or an agent.
