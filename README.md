@@ -1,11 +1,9 @@
 # grow-up
 
 Builds an eye-aligned face timelapse from the photos of one person in a private
-[Immich](https://immich.app) library.
-
-The download is the easy part. The work is in **filtering** — dropping frames where
-the face is partly out of shot or the eyes aren't on the camera — and in **aligning**
-every remaining frame to the same eye positions so the video doesn't judder.
+[Immich](https://immich.app) library. It picks the frames where she is looking at the
+camera and warps every one of them onto the same eye positions, so the years pass
+without the face jittering around the frame.
 
 > ### Authorship
 >
@@ -19,35 +17,9 @@ every remaining frame to the same eye positions so the video doesn't judder.
 > access to, and still does not. No credentials were shared with it.
 >
 > Read the code with that in mind. It is unit-tested and the design decisions are
-> deliberate and documented, but it has been reviewed rather than hand-written, and the
-> caveats under [Verifying against a real library](#verifying-against-a-real-library)
-> apply.
-
-## How it works
-
-Two things make this tractable:
-
-**Immich already knows which face is hers.** `GET /api/faces?id=<assetId>` returns every
-detected face on an asset together with its bounding box *and the person it belongs to*.
-Even in a group photo, the right box comes back labelled — so there is no face
-recognition in this pipeline at all.
-
-**MediaPipe FaceLandmarker gives every signal the filter needs in one pass:**
-
-| Requirement | Signal |
-|---|---|
-| align to the eyes | 478 landmarks including **iris centres** (idx 468 / 473) |
-| head turned away | `facial_transformation_matrixes` → yaw / pitch / roll |
-| **not looking at the camera** | where each iris sits between its own eye corners |
-| eyes closed / mid-blink | `eyeBlinkLeft` / `eyeBlinkRight` blendshapes |
-| face partly out of frame | landmarks that fall outside the image bounds |
-
-That fourth row is why gaze is tracked separately from pose: a face can point straight
-at the lens while the eyes look somewhere else, and head pose alone cannot tell.
-
-Everything heavy — JPEG decode, inference, warping, encoding — is native code. The
-Python is glue, and a process pool over physical cores keeps every core busy on both
-an M1 and a desktop.
+> deliberate and documented, but it has been reviewed rather than hand-written, and no
+> claim here about how it behaves on real photographs comes from the model having seen
+> any.
 
 ## Setup
 
@@ -83,7 +55,73 @@ key fails in one second with the missing names rather than after hundreds of req
 `person.statistics` is optional — without it, watermark drift detection is skipped and
 `grow-up` says so rather than disabling it silently.
 
+Every setting lives in `config.toml`, and every setting in
+[`config.example.toml`](config.example.toml) carries a comment saying what turning it
+does. Nothing below asks you to guess a value.
+
 ## Usage
+
+### Your first run
+
+You do not have to commit to the whole library to find out whether this works on your
+photos. Start small, look at what comes out, and only then spend the hours.
+
+**1. See what there is.** Indexing downloads nothing — it just enumerates her assets,
+and takes seconds.
+
+```bash
+grow-up index
+grow-up status            # how many assets that found
+```
+
+**2. Do a real run over a sample.** `trial` goes end to end on a few dozen photos —
+download, landmark, filter, align, encode — and tells you what the full set would cost.
+
+```bash
+grow-up trial -n 50
+```
+
+**3. Look at the two pages it wrote**, in this order:
+
+- `out/rejects.html` — what was dropped and why, with a slider per threshold. If good
+  photos are sitting under a rejection reason, that threshold is too tight. Move the
+  slider until the page shows the set you want, then copy the generated `[filter]` block
+  into `config.toml`.
+- `out/contact-sheet.html` — the frames that survived, aligned, in order. Judge framing
+  here: too tight, and hair and chins are cut off; too loose, and she is a dot.
+  `[align] eye_distance` is the knob.
+
+**4. Change one thing and see it.** Most tweaks do not re-run the machine learning,
+because every metric is stored per asset:
+
+| What you changed | What to re-run | Cost |
+|---|---|---|
+| `[filter]` thresholds, `[score]` weights, `[select]` cadence | `grow-up select` | sub-second |
+| `[align]` framing, `[output]` size | `grow-up align && grow-up encode` | a warp pass |
+| `analyze.effort` | `grow-up analyze --reanalyze` | a full re-analysis |
+
+After any of them, `grow-up review` rewrites both pages so you can look again.
+
+**5. Decide how much accuracy you want to pay for.** With a sample already downloaded,
+this measures itself:
+
+```bash
+grow-up trial --compare
+```
+
+Set `analyze.effort` to whichever line you like the look of.
+
+**6. Run the whole thing.** The trial's downloads and analyses are already banked, so
+this picks up where it left off.
+
+```bash
+grow-up run
+```
+
+From then on, a bare `grow-up run` is incremental — it indexes only what changed since
+the last successful run.
+
+### Everyday commands
 
 ```bash
 grow-up run          # everything: index → faces → fetch → analyze → select → align → review → encode
@@ -248,10 +286,6 @@ Every setting a preset controls (`retry_margins`, `retry_rotations`, `retry_equa
 `max_crop_px` off, which would otherwise speed it up. Switching level should be the only
 thing that moves the numbers, which is also what makes the comparison above fair.
 
-Gaze is measured geometrically: the iris centre's offset from the midpoint of its own eye
-corners, normalised by the corner separation. That normalisation is what makes it
-comparable between a close-up and a distant shot, and it costs no extra inference.
-
 ### Tuning the filter
 
 `out/rejects.html` is an interactive threshold tuner, not just a list of what was
@@ -285,6 +319,79 @@ rejection reason, that threshold is too tight.
 Landmarks cannot catch sunglasses, a hand over the face, or another child mistagged as
 her. `out/contact-sheet.html` shows the aligned frames in order; click to reject, save
 `rejects.json` next to it, and re-run `grow-up encode`.
+
+## How it works
+
+Two things make this tractable:
+
+**Immich already knows which face is hers.** `GET /api/faces?id=<assetId>` returns every
+detected face on an asset together with its bounding box *and the person it belongs to*.
+Even in a group photo, the right box comes back labelled — so there is no face
+recognition in this pipeline at all. Everything downstream depends on her being tagged
+in Immich; that tagging is the input this tool does not attempt to reproduce.
+
+**MediaPipe FaceLandmarker gives every signal the filter needs in one pass:**
+
+| Requirement | Signal |
+|---|---|
+| align to the eyes | 478 landmarks including **iris centres** (idx 468 / 473) |
+| head turned away | `facial_transformation_matrixes` → yaw / pitch / roll |
+| **not looking at the camera** | where each iris sits between its own eye corners |
+| eyes closed / mid-blink | `eyeBlinkLeft` / `eyeBlinkRight` blendshapes |
+| face partly out of frame | landmarks that fall outside the image bounds |
+
+That fourth row is why gaze is tracked separately from pose: a face can point straight
+at the lens while the eyes look somewhere else, and head pose alone cannot tell. Gaze is
+measured geometrically — the iris centre's offset from the midpoint of its own eye
+corners, normalised by the corner separation. That normalisation is what makes it
+comparable between a close-up and a distant shot, and it costs no extra inference.
+
+Everything heavy is native code, and the Python is glue:
+
+| Dependency | Does |
+|---|---|
+| [Immich](https://immich.app) | the library itself, and the person tagging every stage builds on |
+| `mediapipe` | face landmarks, head pose and blendshapes |
+| `opencv-python` | affine warping, colour conversion, sharpness |
+| `numpy` | the transform maths and every metric |
+| `pillow` + `pillow-heif` | decoding, HEIC included |
+| `httpx` | the async Immich client |
+| ffmpeg (external binary) | encoding |
+| SQLite (stdlib) | the manifest — what exists, what is done, what was rejected |
+
+The manifest is what makes every stage resumable and every tweak cheap: metrics are
+stored per asset rather than a pass/fail verdict, so re-filtering never re-runs the
+model. Inference runs in a process pool sized to *physical* cores — detected properly,
+so an M1 Pro uses 8 rather than assuming hyperthreading and halving it — and warping
+runs in a thread pool, since OpenCV releases the GIL.
+
+### Stages
+
+A full `grow-up run` executes these in order. Each one is also a command of its own,
+takes its input from the manifest, and skips whatever is already recorded there.
+
+| # | Stage | What it does |
+|---|---|---|
+| 1 | `index` | Enumerates her assets via `POST /search/metadata`, honouring the sync watermark. Records ids, capture dates and dimensions. Downloads nothing. |
+| 2 | `faces` | For each new asset, `GET /faces?id=…` and stores *her* bounding box. This is what makes group photos usable. |
+| 3 | `fetch` | Downloads the originals into `paths.cache`, concurrently, retrying transient failures. Streams to disk and renames on completion, so an interrupted run leaves no truncated file. |
+| 4 | `analyze` | Crops around the face box, runs FaceLandmarker, and stores the metrics: pose, gaze, blink, sharpness, exposure, iris positions, face extents. The expensive stage, and the only one that runs a model. |
+| 5 | `select` | Applies the `[filter]` thresholds to those stored metrics, scores the survivors with the `[score]` weights, and keeps the best per `[select] cadence` bucket. Reads only stored numbers — no image is opened, so it is sub-second and re-runnable as often as you like. |
+| 6 | `align` | Solves a similarity transform per frame that puts both eyes on the canonical positions, warps the image to `[output]` size, and writes the frames. Optionally damps brightness flicker across neighbours. |
+| 7 | `review` | Writes `contact-sheet.html` (the accepted frames, in order) and `rejects.html` (the interactive threshold tuner). |
+| 8 | `encode` | Feeds the frames to ffmpeg and writes the video into `paths.out`. |
+
+`analyze` runs `select` immediately after itself, so the filter outcome is reported
+where you would expect it rather than at the end of the run.
+
+Outside that sequence:
+
+| Command | |
+|---|---|
+| `fetch-model` | Downloads the FaceLandmarker bundle. Run once, at setup. |
+| `trial` | Runs stages 2–8 over a sample and projects the full run. `--compare` measures the effort levels instead. |
+| `status` | Manifest counts, filter outcome, stored watermark, recent runs. |
+| `doctor` | Probes each Immich endpoint once and reports exactly what came back. |
 
 ## Troubleshooting
 
@@ -322,6 +429,10 @@ Immich will shed load long before Immich does. Requests retry transient failures
 persist, lower `fetch.concurrency` in `config.toml`. The reported status says which —
 429 is rate limiting, 502/503/504 is a proxy or server refusing load.
 
+**If `analyze` finds no face in photos where you can plainly see one**, raise
+`analyze.effort` before touching the confidence thresholds — the retries re-frame the
+crop, which is usually the actual problem.
+
 MediaPipe, TFLite and the GL context log heavily from C++ on startup — fiber init,
 XNNPACK delegates, feedback managers — once per worker, so eight workers means eight
 copies interleaved. None of it is actionable, and it drowns the progress output, so it is
@@ -329,8 +440,8 @@ suppressed by default. `-v/--verbose` (or `analyze.verbose` in `config.toml`) br
 back when the model itself is what needs diagnosing.
 
 Budget disk for the cache: a few thousand originals at ~4 MB each runs to several GB.
-Downloads stream to disk and are renamed into place only when complete, so an interrupted
-run never leaves a truncated file that would be mistaken for a cached one.
+Of the directories in `[paths]`, only the database is irreplaceable — `frames` is
+rewritten by every `align`, and `cache` costs only re-downloading.
 
 ## Notes on the output
 
@@ -383,8 +494,12 @@ Nor would a corrected version buy much. What remains after exact eye alignment i
 genuine head pose and expression change, which no similarity transform can smooth
 away — it can only unpin the eyes while trying.
 
+### Pacing
+
 `[select] cadence` buckets the timeline and keeps the best frame per bucket. Without it,
-a photo-heavy holiday dominates the video while quiet months flash past.
+a photo-heavy holiday dominates the video while quiet months flash past. Together with
+`encode.fps` it sets the pace: one frame per week at 10 fps covers about a year in five
+seconds.
 
 ## Tests
 
@@ -398,18 +513,7 @@ Every push to `main` (and every PR targeting it) runs the suite on Python 3.11, 
 and tie the build to mediapipe's wheel availability for each Python version.
 
 The suite needs no network, no Immich instance, no model download, and no ffmpeg — it
-covers the transform maths, the metric definitions, bbox coordinate mapping, and the
-watermark's failure modes (including that timestamps match the API's `date-time` pattern
-verbatim from the OpenAPI spec).
-
-## Verifying against a real library
-
-1. `grow-up index --since <yesterday>` — check pagination and that face boxes come back.
-2. `grow-up run --cadence month --no-encode`, then open `out/contact-sheet.html`.
-   If a crop is not her face, the bbox coordinate mapping is wrong (most likely EXIF
-   orientation).
-3. `grow-up run` twice back to back — the second should report a stored watermark, find
-   ~0 new assets, and produce an identical video.
-4. Interrupt `grow-up index` mid-pagination — `grow-up status` should show the watermark
-   *unchanged*.
-5. Tag her in an old photo and re-run — the drift check should fire and re-index in full.
+covers the transform maths, the metric definitions, bbox coordinate mapping, the
+rejects page's filter under node against the Python one, and the watermark's failure
+modes (including that timestamps match the API's `date-time` pattern verbatim from the
+OpenAPI spec).
