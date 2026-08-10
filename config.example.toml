@@ -9,6 +9,31 @@ person_name = "Their Name"
 # Filled in after the first lookup; setting it skips the name resolution.
 person_id = ""
 
+# More than one account? Immich scopes face recognition per account, so a search
+# with your person id never returns photos sitting in a partner's library -- the
+# association between a face and a person belongs to whoever owns it. Asking
+# again as them is the only way to reach those photos.
+#
+# Uncomment and fill in one block per account. Doing so replaces the two settings
+# above; leaving it commented out keeps the single-account behaviour, which is
+# what most libraries want.
+#
+# `name` is an identity rather than a label: it is stored on every indexed asset
+# so later stages know which key can download it, so renaming one re-indexes it.
+# Each account needs its own API key in its own environment variable, and the
+# partner's key needs the same four permissions as yours.
+#
+#   [[immich.sources]]
+#   name = "me"
+#   person_id = ""                       # your account's record for the subject
+#   key_env = "IMMICH_API_KEY"           # default
+#   url_env = "IMMICH_URL"               # default; set it if they are on another server
+#
+#   [[immich.sources]]
+#   name = "partner"
+#   person_id = ""                       # *their* account's record for the same person
+#   key_env = "IMMICH_API_KEY_PARTNER"
+
 # Where everything lives, relative to this config file.
 [paths]
 # The manifest: which assets exist, what has been downloaded, analyzed, filtered

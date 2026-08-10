@@ -38,11 +38,23 @@ Keeping maths out of the heavy dependencies is a deliberate design choice, not a
 accident: `metrics.py` and the transform maths in `align.py` are plain numpy so they stay
 testable in a bare environment. Preserve that when adding to them.
 
-**Config has no back-compat, and settings must not rot.** The repo has one user, so a
-renamed setting is renamed, not aliased. Put the old name in `config.REMOVED_KEYS` with
-its replacement so it fails loudly instead of being silently ignored. Two tests in
-`tests/test_config_example.py` hold the example file honest: every `[analyze]` key must
-be one the code actually reads, and every key in the file must carry a comment.
+**Since 1.0.0, an existing `config.toml` must never break.** This rule reversed at the
+release and the old text is preserved here because an agent that finds only the new rule
+will not understand why `REMOVED_KEYS` exists. Before 1.0.0 the repo had one user, so a
+renamed setting was simply renamed and the old name went into `config.REMOVED_KEYS` to
+fail loudly. That table is now **frozen** at its pre-1.0 contents — everything in it
+predates the release, so no published config can contain one. Do not add to it.
+
+New settings arrive with a default and a fallback for their absence. `config.sources()`
+is the worked example: a file with no `[[immich.sources]]` yields exactly the single
+source 1.0.0 assumed, on the same two environment variables, and
+`TestTheReleasedConfigStillWorks` in `tests/test_sources.py` is that promise written
+down. Schema changes go through `db.ADDED_COLUMNS` so a database from an earlier version
+migrates in place.
+
+Settings must also not rot. Two tests in `tests/test_config_example.py` hold the example
+file honest: every `[analyze]` key must be one the code actually reads, and every key in
+the file must carry a comment.
 
 ## Traps
 
@@ -58,6 +70,8 @@ specifically to avoid. They all look like improvements.
 | Assume SMT when counting cores | Apple Silicon has no hyperthreading, so halving the logical count gives an M1 Pro 4 workers instead of 8. `analyze.physical_cores()` detects properly per platform. | `tests/test_cores.py` |
 | Log `type(exc).__name__` for a failed request | Discarding the HTTP status cost an entire debugging round on a real library. `ImmichHTTPError` carries status, path and body. | `test_keeps_the_status_code` (`tests/test_client_errors.py`) |
 | Clear a progress line by padding with spaces | Leaves trailing whitespace in the terminal buffer. Use the ANSI erase-to-end-of-line already in `progress.py`. | `test_summary_line_has_no_trailing_whitespace` (`tests/test_progress.py`) |
+| Ask one Immich account about another's asset | Face lookups and downloads must go to the account that owns the asset — a key that cannot see an id gets 404, so this fails on exactly the other account's half of the library. `assets.source` records the owner. | `TestStagesStayInTheirOwnAccount` (`tests/test_sources.py`) |
+| Apply `--limit` per account instead of splitting it | `trial -n 100` would sample 200 across two accounts, and the projection multiplies a per-item cost by the whole workload — so the estimate is wrong with nothing on screen to say so. | `TestSplittingASample` (`tests/test_sources.py`) |
 
 One more, without a test because it is a shape rather than a behaviour: EXIF orientation
 is handled in exactly one place, `images.py`. Immich reports face boxes in oriented
@@ -67,8 +81,8 @@ coordinates; decoding elsewhere without the same rule silently crops the wrong r
 
 | File | |
 |---|---|
-| `cli.py` | argparse surface, one function per command. `--since` reaches `index` and nothing else. |
-| `config.py` | TOML loading, `REMOVED_KEYS`, credentials from the environment. |
+| `cli.py` | argparse surface, one function per command. `--since` reaches `index` and nothing else. Iterates sources for every stage that talks to Immich. |
+| `config.py` | TOML loading, `REMOVED_KEYS`, credentials from the environment, and `sources()` — one Immich account each, with the pre-1.0 single-account shape as the fallback. |
 | `db.py` | The SQLite manifest: schema, additive migrations, watermark and run bookkeeping. |
 | `immich.py` | Async API client, written against the Immich OpenAPI spec 3.1.0. Permission preflight, `ImmichHTTPError`, retry policy. |
 | `pipeline.py` | Stage orchestration — the only module that knows the stage order. |

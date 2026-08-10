@@ -33,20 +33,72 @@ def log(message: str) -> None:
 def _open(args: argparse.Namespace):
     cfg = config.load(args.config)
     conn = db.connect(cfg.path("db"))
+    # A database written before assets carried a source has exactly one
+    # account's photos in it, so the first configured source owns them. Done
+    # here because this is the only place holding both the config and the
+    # connection, and it is a no-op from the second run onwards.
+    db.adopt_unsourced(conn, config.sources(cfg)[0].name)
     return cfg, conn
 
 
-def _client(cfg: config.Config) -> ImmichClient:
+def _sources(cfg: config.Config, only: str | None = None) -> list[config.Source]:
+    """The configured accounts, optionally narrowed to one by name."""
+    found = config.sources(cfg)
+    if only is None:
+        return found
+    chosen = [s for s in found if s.name == only]
+    if not chosen:
+        known = ", ".join(repr(s.name) for s in found)
+        raise SystemExit(f"no source named {only!r}; configured sources are {known}")
+    return chosen
+
+
+def _labelled(stage: str, source: config.Source, sources: list[config.Source]) -> str:
+    """Tag progress with the account, but only when there is more than one.
+
+    A single-account run is the overwhelming majority and its output should not
+    change just because the plumbing underneath it grew.
+    """
+    return stage if len(sources) < 2 else f"{stage}[{source.name}]"
+
+
+def _apportion(limit: int | None, sources: list[config.Source], conn,
+               stage: str) -> list[int | None]:
+    """Share a `--limit` out across accounts, so the total is what was asked for."""
+    if limit is None:
+        return [None] * len(sources)
+    if len(sources) == 1:
+        return [limit]
+    weights = [pipeline.pending_counts(conn, s.name)[stage] for s in sources]
+    return list(pipeline.split_limit(limit, weights))
+
+
+def _client(cfg: config.Config, source: config.Source | None = None) -> ImmichClient:
     """Build a client with the configured concurrency and retry budget.
 
     Concurrency is shared with the stages' own limiting, so lowering
     fetch.concurrency genuinely reduces simultaneous load on the server.
     """
     return ImmichClient(
-        config.credentials(),
+        source.credentials() if source else config.credentials(),
         concurrency=int(cfg.get("fetch", "concurrency", 8)),
         retries=int(cfg.get("fetch", "retries", 4)),
     )
+
+
+async def preflight_all(cfg: config.Config, sources: list[config.Source]) -> None:
+    """Check every account before any of them does work.
+
+    Ordering matters more than it looks: preflighting lazily would let the first
+    account download a gigabyte before a typo in the second key surfaced. One
+    failure aborts the run, because a video quietly missing one account's photos
+    looks entirely fine.
+    """
+    for source in sources:
+        if len(sources) > 1:
+            log(f"  source {source.name}:")
+        async with _client(cfg, source) as client:
+            await preflight(client)
 
 
 async def preflight(client: ImmichClient) -> set[str]:
@@ -77,24 +129,30 @@ async def preflight(client: ImmichClient) -> set[str]:
     return granted
 
 
-def _person_id(cfg: config.Config, conn) -> str:
-    """Resolve the target person, caching the id in config for later runs."""
-    person_id = cfg.get("immich", "person_id")
-    if person_id:
-        return str(person_id)
+async def _resolve_person(cfg: config.Config, source: config.Source) -> str:
+    """Resolve the person within one account.
 
-    name = cfg.get("immich", "person_name")
-    if not name:
-        raise SystemExit("set immich.person_id or immich.person_name in config.toml")
+    Each account keeps its own person record for the same human, so the id is a
+    property of the source rather than of the subject.
 
-    async def resolve() -> str:
-        async with _client(cfg) as client:
-            person = await client.resolve_person(str(name))
-            log(f"  person: {person.name!r} -> {person.id}")
-            log("  note: set immich.person_id in config.toml to skip this lookup")
-            return person.id
+    A coroutine rather than a blocking call because every caller now resolves
+    inside the loop that is already iterating accounts, and `asyncio.run` from
+    within a running loop raises.
+    """
+    if source.person_id:
+        return source.person_id
 
-    return asyncio.run(resolve())
+    if not source.person_name:
+        where = ("immich.person_id or immich.person_name"
+                 if source.name == config.LEGACY_SOURCE_NAME
+                 else f"person_id or person_name for source {source.name!r}")
+        raise SystemExit(f"set {where} in config.toml")
+
+    async with _client(cfg, source) as client:
+        person = await client.resolve_person(source.person_name)
+        log(f"  person: {person.name!r} -> {person.id}")
+        log("  note: set person_id in config.toml to skip this lookup")
+        return person.id
 
 
 # --------------------------------------------------------------------------- #
@@ -114,12 +172,28 @@ def cmd_fetch_model(args: argparse.Namespace) -> None:
 
 def cmd_index(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
-    person_id = _person_id(cfg, conn)
-    asyncio.run(_index(cfg, conn, person_id, args.since, args.full))
+    sources = _sources(cfg, args.source)
+
+    async def go() -> None:
+        await preflight_all(cfg, sources)
+        for source in sources:
+            if len(sources) > 1:
+                log(f"  -- {source.name} --")
+            await _index(cfg, conn, await _resolve_person(cfg, source),
+                         args.since, args.full, source)
+
+    asyncio.run(go())
 
 
-async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> int:
-    """Index stage plus watermark bookkeeping. Returns assets newly added."""
+async def _index(cfg, conn, person_id: str, since: str | None, full: bool,
+                 source: config.Source | None = None) -> int:
+    """Index stage plus watermark bookkeeping. Returns assets newly added.
+
+    The watermark, the run row and the drift check are all keyed on `person_id`,
+    which is already per-account -- so two sources keep two independent sync
+    states with no extra bookkeeping.
+    """
+    source = source or config.sources(cfg)[0]
     started_at = db.now_utc()
     watermark = pipeline.resolve_watermark(conn, person_id, since, full)
     log(f"  watermark: {watermark.value or '(none — full index)'}  [{watermark.source}]")
@@ -128,10 +202,12 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
     page_size = int(cfg.get("index", "page_size", 1000))
 
     try:
-        async with _client(cfg) as client:
-            await preflight(client)
+        async with _client(cfg, source) as client:
+            # No preflight here: preflight_all has already checked every account,
+            # which is the point -- a bad second key must not surface only after
+            # the first account has finished downloading.
             _, new = await pipeline.stage_index(
-                client, conn, person_id, watermark, page_size, log
+                client, conn, person_id, watermark, page_size, log, source.name
             )
 
             current_count = await client.person_asset_count(person_id)
@@ -149,7 +225,7 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
                 )
                 _, new = await pipeline.stage_index(
                     client, conn, person_id, pipeline.Watermark(None, "full: drift detected"),
-                    page_size, log,
+                    page_size, log, source.name,
                 )
                 current_count = await client.person_asset_count(person_id)
     except Exception:
@@ -165,27 +241,45 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
 
 def cmd_faces(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
-    person_id = _person_id(cfg, conn)
+    sources = _sources(cfg, args.source)
 
     async def go() -> None:
-        async with _client(cfg) as client:
-            await pipeline.stage_faces(client, conn, person_id, log,
-                                       int(cfg.get("fetch", "concurrency", 16)),
-                                       limit=args.limit)
+        # Single-account `faces` and `fetch` never preflighted, and bolting a
+        # round-trip plus its notes onto a command that worked fine is a change
+        # nobody asked for. With two accounts it earns its keep: the second key
+        # is otherwise unexercised until half the work is already done.
+        if len(sources) > 1:
+            await preflight_all(cfg, sources)
+        for source, share in zip(sources, _apportion(args.limit, sources, conn, "faces")):
+            async with _client(cfg, source) as client:
+                await pipeline.stage_faces(
+                    client, conn, await _resolve_person(cfg, source), log,
+                    int(cfg.get("fetch", "concurrency", 16)),
+                    limit=share, source=source.name,
+                    label=_labelled("faces", source, sources))
 
     asyncio.run(go())
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
+    sources = _sources(cfg, args.source)
 
     async def go() -> None:
-        async with _client(cfg) as client:
-            await pipeline.stage_fetch(
-                client, conn, cfg.path("cache"),
-                str(cfg.get("fetch", "source", "original")), log,
-                int(cfg.get("fetch", "concurrency", 8)), limit=args.limit,
-            )
+        # Single-account `faces` and `fetch` never preflighted, and bolting a
+        # round-trip plus its notes onto a command that worked fine is a change
+        # nobody asked for. With two accounts it earns its keep: the second key
+        # is otherwise unexercised until half the work is already done.
+        if len(sources) > 1:
+            await preflight_all(cfg, sources)
+        for source, share in zip(sources, _apportion(args.limit, sources, conn, "fetch")):
+            async with _client(cfg, source) as client:
+                await pipeline.stage_fetch(
+                    client, conn, cfg.path("cache"),
+                    str(cfg.get("fetch", "source", "original")), log,
+                    int(cfg.get("fetch", "concurrency", 8)), limit=share,
+                    account=source.name,
+                    label=_labelled("fetch", source, sources))
 
     asyncio.run(go())
 
@@ -298,7 +392,7 @@ def cmd_trial(args: argparse.Namespace) -> None:
     if not total_assets:
         raise SystemExit("no assets indexed yet — run `grow-up index` first")
 
-    person_id = _person_id(cfg, conn)
+    sources = _sources(cfg, args.source)
     limit = int(args.limit or cfg.get("trial", "limit", 100))
     # Sized off the eventual population, not what is actionable right now:
     # nothing is downloaded when a trial starts, so an actionable count would
@@ -311,32 +405,46 @@ def cmd_trial(args: argparse.Namespace) -> None:
         "SELECT coalesce(sum(bytes), 0) FROM downloads").fetchone()[0]
 
     async def network_stages() -> None:
-        async with _client(cfg) as client:
-            await preflight(client)
+        await preflight_all(cfg, sources)
 
-            with timing.stopwatch() as faces_elapsed:
-                found, _ = await pipeline.stage_faces(
-                    client, conn, person_id, log,
-                    int(cfg.get("fetch", "concurrency", 16)), limit=limit)
-            trial.stages.append(timing.StageTiming(
-                "faces", found, faces_elapsed(), before["faces"]))
+        # The sample is split across accounts rather than repeated per account,
+        # so `-n 100` measures a hundred photos and the projection stays honest.
+        face_shares = _apportion(limit, sources, conn, "faces")
+        found = 0
+        with timing.stopwatch() as faces_elapsed:
+            for source, share in zip(sources, face_shares):
+                async with _client(cfg, source) as client:
+                    got, _ = await pipeline.stage_faces(
+                        client, conn, await _resolve_person(cfg, source), log,
+                        int(cfg.get("fetch", "concurrency", 16)), limit=share,
+                        source=source.name,
+                        label=_labelled("faces", source, sources))
+                found += got
+        trial.stages.append(timing.StageTiming(
+            "faces", found, faces_elapsed(), before["faces"]))
 
-            with timing.stopwatch() as fetch_elapsed:
-                fetched = await pipeline.stage_fetch(
-                    client, conn, cfg.path("cache"),
-                    str(cfg.get("fetch", "source", "original")), log,
-                    int(cfg.get("fetch", "concurrency", 8)), limit=limit)
-            downloaded = conn.execute(
-                "SELECT coalesce(sum(bytes), 0) FROM downloads").fetchone()[0] - bytes_before
-            note = ""
-            if fetched and downloaded:
-                rate = downloaded / max(fetch_elapsed(), 1e-6)
-                projected_bytes = downloaded / fetched * before["fetch"]
-                note = (f"{timing.format_bytes(downloaded)} at "
-                        f"{timing.format_bytes(rate)}/s -> "
-                        f"{timing.format_bytes(projected_bytes)} total")
-            trial.stages.append(timing.StageTiming(
-                "fetch", fetched, fetch_elapsed(), before["fetch"], note=note))
+        fetch_shares = _apportion(limit, sources, conn, "fetch")
+        fetched = 0
+        with timing.stopwatch() as fetch_elapsed:
+            for source, share in zip(sources, fetch_shares):
+                async with _client(cfg, source) as client:
+                    fetched += await pipeline.stage_fetch(
+                        client, conn, cfg.path("cache"),
+                        str(cfg.get("fetch", "source", "original")), log,
+                        int(cfg.get("fetch", "concurrency", 8)), limit=share,
+                        account=source.name,
+                        label=_labelled("fetch", source, sources))
+        downloaded = conn.execute(
+            "SELECT coalesce(sum(bytes), 0) FROM downloads").fetchone()[0] - bytes_before
+        note = ""
+        if fetched and downloaded:
+            rate = downloaded / max(fetch_elapsed(), 1e-6)
+            projected_bytes = downloaded / fetched * before["fetch"]
+            note = (f"{timing.format_bytes(downloaded)} at "
+                    f"{timing.format_bytes(rate)}/s -> "
+                    f"{timing.format_bytes(projected_bytes)} total")
+        trial.stages.append(timing.StageTiming(
+            "fetch", fetched, fetch_elapsed(), before["fetch"], note=note))
 
     asyncio.run(network_stages())
 
@@ -461,58 +569,78 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     error lines.
     """
     cfg, conn = _open(args)
+    sources = _sources(cfg, args.source)
 
-    row = conn.execute(
-        "SELECT a.id FROM assets a JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
-        " LIMIT 1"
-    ).fetchone()
-    asset_id = args.asset or (row["id"] if row else None)
-    person_id = str(cfg.get("immich", "person_id") or "")
+    async def probe_source(source: config.Source) -> None:
+        # Probe with an asset this account actually owns: another account's id
+        # answers 404, which would read as a broken endpoint rather than the
+        # wrong key.
+        row = conn.execute(
+            "SELECT a.id FROM assets a JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
+            " WHERE a.source = ? LIMIT 1", (source.name,)
+        ).fetchone()
+        asset_id = args.asset or (row["id"] if row else None)
+        person_id = source.person_id
+
+        if not asset_id:
+            log("note: no indexed asset to probe with; run `grow-up index` first "
+                "or pass --asset <uuid>")
+        await _probe(cfg, source, asset_id, person_id)
 
     async def go() -> None:
-        async with _client(cfg) as client:
-            log(f"server:  {config.credentials().url}")
+        for source in sources:
+            if len(sources) > 1:
+                log(f"\n== {source.name} ==")
+            await probe_source(source)
 
-            probes: list[tuple[str, str, str, dict | None]] = [
-                ("connectivity", "/server/ping", "application/json", None),
-                ("key metadata", "/api-keys/me", "application/json", None),
+    asyncio.run(go())
+
+
+async def _probe(cfg: config.Config, source: config.Source,
+                 asset_id: str | None, person_id: str) -> None:
+    async with _client(cfg, source) as client:
+        log(f"server:  {source.credentials().url}")
+
+        probes: list[tuple[str, str, str, dict | None]] = [
+            ("connectivity", "/server/ping", "application/json", None),
+            ("key metadata", "/api-keys/me", "application/json", None),
+        ]
+        if person_id:
+            probes.append(("person stats", f"/people/{person_id}/statistics",
+                           "application/json", None))
+        if asset_id:
+            probes += [
+                ("faces", "/faces", "application/json", {"id": asset_id}),
+                # The failing call, and the two things it could be confused
+                # with: same endpoint asking for JSON, and the view-scoped
+                # rendition. Whichever succeeds localises the fault.
+                ("download (Accept: */*)", f"/assets/{asset_id}/original", ANY, None),
+                ("download (Accept: json)", f"/assets/{asset_id}/original",
+                 "application/json", None),
+                ("preview", f"/assets/{asset_id}/thumbnail", ANY, {"size": "preview"}),
             ]
-            if person_id:
-                probes.append(("person stats", f"/people/{person_id}/statistics",
-                               "application/json", None))
-            if asset_id:
-                probes += [
-                    ("faces", "/faces", "application/json", {"id": asset_id}),
-                    # The failing call, and the two things it could be confused
-                    # with: same endpoint asking for JSON, and the view-scoped
-                    # rendition. Whichever succeeds localises the fault.
-                    ("download (Accept: */*)", f"/assets/{asset_id}/original", ANY, None),
-                    ("download (Accept: json)", f"/assets/{asset_id}/original",
-                     "application/json", None),
-                    ("preview", f"/assets/{asset_id}/thumbnail", ANY, {"size": "preview"}),
-                ]
 
+        log("")
+        for label, path, accept, params in probes:
+            result = await client.probe(path, accept, params)
+            mark = "ok  " if result["ok"] else "FAIL"
+            status = result["status"] if result["status"] is not None else "---"
+            line = f"  [{mark}] {label:<24} {status}"
+            if result["ok"]:
+                line += f"  {result.get('content_type', '')} {result.get('length', 0)}B"
+            log(line)
+            if result["detail"]:
+                log(f"         {result['detail'][:400]}")
+
+        try:
+            granted = await client.my_permissions()
+        except ImmichHTTPError:
+            granted = set()
+        if granted:
+            missing = missing_permissions(granted, REQUIRED_PERMISSIONS)
             log("")
-            for label, path, accept, params in probes:
-                result = await client.probe(path, accept, params)
-                mark = "ok  " if result["ok"] else "FAIL"
-                status = result["status"] if result["status"] is not None else "---"
-                line = f"  [{mark}] {label:<24} {status}"
-                if result["ok"]:
-                    line += f"  {result.get('content_type', '')} {result.get('length', 0)}B"
-                log(line)
-                if result["detail"]:
-                    log(f"         {result['detail'][:400]}")
-
-            try:
-                granted = await client.my_permissions()
-            except ImmichHTTPError:
-                granted = set()
-            if granted:
-                missing = missing_permissions(granted, REQUIRED_PERMISSIONS)
-                log("")
-                log(f"key permissions: {'all (wildcard)' if 'all' in granted else len(granted)}")
-                log(f"missing required: {missing or 'none'}")
+            log(f"key permissions: {'all (wildcard)' if 'all' in granted else len(granted)}")
+            log(f"missing required: {missing or 'none'}")
 
     if not asset_id:
         log("note: no indexed asset to probe with; run `grow-up index` first "
@@ -522,7 +650,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
-    person_id = str(cfg.get("immich", "person_id") or "")
+    sources = _sources(cfg)
     log(f"database: {cfg.path('db')}")
     for table in ("assets", "faces", "downloads", "metrics", "selection", "frames"):
         n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
@@ -535,13 +663,17 @@ def cmd_status(args: argparse.Namespace) -> None:
                                              label="filter outcome (last select)"):
         log(line)
 
-    state = db.get_sync_state(conn, person_id) if person_id else None
-    if state:
-        log(f"\nwatermark   {state.watermark}")
-        log(f"last run    {state.last_run_at}")
-        log(f"person has  {state.person_assets} assets per Immich at that point")
-    else:
-        log("\nno watermark stored yet — the next run will be a full index")
+    # One block per account, because each keeps its own watermark: a partner's
+    # library being months behind is exactly what this is for.
+    for source in sources:
+        heading = "" if len(sources) < 2 else f" [{source.name}]"
+        state = db.get_sync_state(conn, source.person_id) if source.person_id else None
+        if state:
+            log(f"\nwatermark{heading}   {state.watermark}")
+            log(f"last run    {state.last_run_at}")
+            log(f"person has  {state.person_assets} assets per Immich at that point")
+        else:
+            log(f"\nno watermark stored yet{heading} — the next run will be a full index")
 
     rows = conn.execute(
         "SELECT started_at, watermark_source, assets_indexed, status"
@@ -557,19 +689,29 @@ def cmd_status(args: argparse.Namespace) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     """The whole pipeline. A bare `run` is implicitly incremental."""
     cfg, conn = _open(args)
-    person_id = _person_id(cfg, conn)
+    sources = _sources(cfg, args.source)
 
     async def network_stages() -> None:
-        # --since / --full apply here and stop here.
-        await _index(cfg, conn, person_id, args.since, args.full)
-        async with _client(cfg) as client:
-            await pipeline.stage_faces(client, conn, person_id, log,
-                                       int(cfg.get("fetch", "concurrency", 16)))
-            await pipeline.stage_fetch(
-                client, conn, cfg.path("cache"),
-                str(cfg.get("fetch", "source", "original")), log,
-                int(cfg.get("fetch", "concurrency", 8)),
-            )
+        # Every key is checked before any of them does work: a typo in the
+        # second one should not surface after the first has pulled a gigabyte.
+        await preflight_all(cfg, sources)
+        for source in sources:
+            if len(sources) > 1:
+                log(f"  -- {source.name} --")
+            person_id = await _resolve_person(cfg, source)
+            # --since / --full apply here and stop here.
+            await _index(cfg, conn, person_id, args.since, args.full, source)
+            async with _client(cfg, source) as client:
+                await pipeline.stage_faces(
+                    client, conn, person_id, log,
+                    int(cfg.get("fetch", "concurrency", 16)),
+                    source=source.name, label=_labelled("faces", source, sources))
+                await pipeline.stage_fetch(
+                    client, conn, cfg.path("cache"),
+                    str(cfg.get("fetch", "source", "original")), log,
+                    int(cfg.get("fetch", "concurrency", 8)),
+                    account=source.name, label=_labelled("fetch", source, sources),
+                )
 
     log("== index ==")
     asyncio.run(network_stages())
@@ -607,8 +749,12 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=func, since=None, full=False, reanalyze=False,
                        cadence=None, no_encode=False, asset=None, limit=None,
-                       effort=None, compare=False)
+                       effort=None, compare=False, source=None)
         return p
+
+    def add_source_flag(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--source", default=None, metavar="NAME",
+                       help="work on one configured [[immich.sources]] account only")
 
     model = add("fetch-model", cmd_fetch_model, "download the MediaPipe face landmarker model")
     model.add_argument("-o", "--output", default=None)
@@ -623,6 +769,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="override the stored watermark (ISO-8601, e.g. 2026-01-01T00:00:00Z)")
         p.add_argument("--full", action="store_true",
                        help="ignore the stored watermark and re-index everything")
+        add_source_flag(p)
         if name == "run":
             p.add_argument("--cadence", default=None, choices=list(select.CADENCES))
             p.add_argument("--no-encode", action="store_true")
@@ -638,9 +785,11 @@ def build_parser() -> argparse.ArgumentParser:
         p = add(name, func, help_text)
         p.add_argument("-n", "--limit", type=int, default=None,
                        help="process at most this many assets")
+        add_source_flag(p)
 
     p = add("doctor", cmd_doctor, "probe each endpoint once and report what it returns")
     p.add_argument("--asset", default=None, help="asset UUID to probe with")
+    add_source_flag(p)
 
     p = add("trial", cmd_trial,
             "process a sample, measure it, and project the full run")
@@ -653,6 +802,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="time/accuracy trade-off (default: analyze.effort in config)")
     p.add_argument("--compare", action="store_true",
                    help="measure every effort level over the same sample instead")
+    add_source_flag(p)
 
     p = add("analyze", cmd_analyze, "landmark faces and compute quality metrics")
     p.add_argument("--reanalyze", action="store_true", help="re-run on already-analyzed assets")

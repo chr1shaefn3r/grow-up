@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS assets (
     height             INTEGER,
     checksum           TEXT,
     original_file_name TEXT,
+    source             TEXT,               -- which configured account it came from;
+                                           -- only that account's key can download it
     indexed_at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS assets_local_datetime ON assets (local_datetime);
@@ -165,6 +167,7 @@ class SyncState:
 ADDED_COLUMNS = {
     "metrics": (("span_w", "REAL"), ("span_up", "REAL"), ("span_down", "REAL"),
                 ("filtered_at", "TEXT")),
+    "assets": (("source", "TEXT"),),
 }
 
 
@@ -251,18 +254,33 @@ def fail_run(conn: sqlite3.Connection, run_id: int) -> None:
 def upsert_asset(conn: sqlite3.Connection, asset: dict) -> None:
     conn.execute(
         "INSERT INTO assets (id, local_datetime, file_created_at, updated_at, width, height,"
-        "                    checksum, original_file_name, indexed_at)"
+        "                    checksum, original_file_name, source, indexed_at)"
         " VALUES (:id, :local_datetime, :file_created_at, :updated_at, :width, :height,"
-        "         :checksum, :original_file_name, :indexed_at)"
+        "         :checksum, :original_file_name, :source, :indexed_at)"
         " ON CONFLICT (id) DO UPDATE SET"
         "   local_datetime = excluded.local_datetime,"
         "   updated_at = excluded.updated_at,"
         "   width = excluded.width,"
         "   height = excluded.height,"
         "   checksum = excluded.checksum,"
+        "   source = excluded.source,"
         "   indexed_at = excluded.indexed_at",
-        {**asset, "indexed_at": iso_z(now_utc())},
+        {"source": None, **asset, "indexed_at": iso_z(now_utc())},
     )
+
+
+def adopt_unsourced(conn: sqlite3.Connection, source: str) -> int:
+    """Claim rows indexed before assets.source existed. Returns how many.
+
+    A database written by 1.0.0 has one account's assets in it and no record of
+    which, because there was only ever one. Stamping them with the first
+    configured source is therefore correct by construction, and it means every
+    query downstream is a plain `source = ?` rather than carrying a coalesce for
+    the rest of the project's life.
+    """
+    cur = conn.execute(
+        "UPDATE assets SET source = ? WHERE source IS NULL", (source,))
+    return int(cur.rowcount or 0)
 
 
 def count_assets(conn: sqlite3.Connection) -> int:

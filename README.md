@@ -158,6 +158,50 @@ something:
 When output is not a terminal — redirected to a file, or running under CI — the bar
 degrades to occasional plain lines instead of repainting, so logs stay readable.
 
+### Photos in a partner's account
+
+Immich scopes face recognition per account. The link between a detected face and
+a person belongs to whoever owns it, so a search with *your* person id never returns
+photos sitting in your partner's account — even when the same child is tagged in both
+libraries. If half the photos of your kid were taken on someone else's phone, half of
+them are invisible to a single-account run.
+
+The fix is to ask twice. Add a `[[immich.sources]]` block per account:
+
+```toml
+[[immich.sources]]
+name = "me"
+person_id = "…"                      # your account's person record
+
+[[immich.sources]]
+name = "partner"
+person_id = "…"                      # *their* account's record for the same person
+key_env = "IMMICH_API_KEY_PARTNER"
+```
+
+```bash
+export IMMICH_API_KEY=…              # yours
+export IMMICH_API_KEY_PARTNER=…      # theirs, from their own Account Settings → API Keys
+```
+
+Their key needs the same four permissions as yours. `url_env` can be set per source too,
+if the two accounts are on different servers.
+
+Everything up to and including download runs once per account; filtering, alignment and
+encoding then see one merged pool of photos, so the timelapse interleaves both libraries
+by date. Each account keeps its own watermark, so they stay incremental independently —
+`grow-up status` shows a block per account.
+
+Every key is checked before any of them starts work, and a failure anywhere aborts the
+run. A video quietly missing one account's photos would look completely fine, which is
+the kind of failure this project goes out of its way not to produce. Use
+`--source NAME` on `index`, `faces`, `fetch`, `run`, `trial` or `doctor` to work on one
+account at a time.
+
+**None of this is required.** With no `[[immich.sources]]` block, `[immich] person_name`
+/ `person_id` and the plain `IMMICH_URL` / `IMMICH_API_KEY` keep working exactly as
+before — that is simply the one-account case, and existing databases upgrade in place.
+
 ### Trial runs
 
 Before committing to a few thousand photos, measure a sample:

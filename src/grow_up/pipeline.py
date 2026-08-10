@@ -17,7 +17,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-from . import align, analyze, db, images, review, select
+from . import align, analyze, config, db, images, review, select
 from .encode import encode
 from .immich import ImmichClient, pick_face
 from .progress import Progress
@@ -118,7 +118,8 @@ def detect_drift(stored_count: int | None, current_count: int | None,
 
 
 async def stage_index(client: ImmichClient, conn: sqlite3.Connection, person_id: str,
-                      watermark: Watermark, page_size: int, log: Log) -> tuple[int, int]:
+                      watermark: Watermark, page_size: int, log: Log,
+                      source: str = config.LEGACY_SOURCE_NAME) -> tuple[int, int]:
     """Index assets, returning (seen, newly_added)."""
     known = {row[0] for row in conn.execute("SELECT id FROM assets")}
     seen = new = 0
@@ -137,12 +138,26 @@ async def stage_index(client: ImmichClient, conn: sqlite3.Connection, person_id:
             "height": exif.get("exifImageHeight"),
             "checksum": item.get("checksum"),
             "original_file_name": item.get("originalFileName"),
+            "source": source,
         })
         if seen % 500 == 0:
             log(f"  index: {seen} assets so far…")
 
     log(f"  index: {seen} assets ({new} new)")
     return seen, new
+
+
+def _source_clause(source: str | None) -> tuple[str, tuple]:
+    """Restrict a pending query to one account's assets.
+
+    A face lookup or a download must go to the account that owns the asset --
+    another account's key answers 400 or 404 for an id it cannot see. `None`
+    means every source, which is what a single-account run wants and what the
+    stage-level tests use.
+    """
+    if source is None:
+        return "", ()
+    return " AND a.source = ?", (source,)
 
 
 def _limit_clause(limit: int | None) -> str:
@@ -189,37 +204,80 @@ def eventual_workload(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
-def pending_counts(conn: sqlite3.Connection) -> dict[str, int]:
+def pending_counts(conn: sqlite3.Connection,
+                   source: str | None = None) -> dict[str, int]:
     """Work each stage can act on *right now*, for progress-bar denominators.
 
     Downstream stages are gated on upstream rows existing, so these are zero
     until the stage before has run. Use `eventual_workload` for projections.
+    `source` narrows to one account, which is what apportioning a sample across
+    several of them needs.
     """
+    where, params = _source_clause(source)
+
+    def count(sql: str) -> int:
+        return int(conn.execute(sql + where, params).fetchone()[0])
+
     return {
-        "faces": conn.execute(
+        "faces": count(
             "SELECT count(*) FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"
-            " WHERE f.asset_id IS NULL").fetchone()[0],
-        "fetch": conn.execute(
+            " WHERE f.asset_id IS NULL"),
+        "fetch": count(
             "SELECT count(*) FROM assets a"
             "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
             "  LEFT JOIN downloads d ON d.asset_id = a.id"
-            " WHERE d.asset_id IS NULL").fetchone()[0],
-        "analyze": conn.execute(
+            " WHERE d.asset_id IS NULL"),
+        "analyze": count(
             "SELECT count(*) FROM assets a"
             "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
             "  JOIN downloads d ON d.asset_id = a.id"
             "  LEFT JOIN metrics m ON m.asset_id = a.id"
-            " WHERE m.asset_id IS NULL").fetchone()[0],
+            " WHERE m.asset_id IS NULL"),
     }
+
+
+def split_limit(limit: int, weights: list[int]) -> list[int]:
+    """Divide a sample across accounts in proportion to what each has pending.
+
+    A trial projects the full run from what it measured, so processing `limit`
+    per account instead of `limit` in total would silently double the sample and
+    make the projection wrong in a way nothing on screen would reveal.
+
+    Largest-remainder, capped at each account's own pending count -- there is no
+    sense asking for eighty from an account that only has nine left.
+    """
+    total = sum(max(0, w) for w in weights)
+    if not weights:
+        return []
+    if total <= 0:
+        # Nothing pending anywhere, or no idea: an even split is as good a guess
+        # as any, and every stage no-ops on an empty queue regardless.
+        base, extra = divmod(limit, len(weights))
+        return [base + (1 if i < extra else 0) for i in range(len(weights))]
+
+    exact = [limit * max(0, w) / total for w in weights]
+    shares = [min(int(value), max(0, w)) for value, w in zip(exact, weights)]
+
+    # Hand out what flooring dropped, biggest fractional part first, skipping
+    # anyone already at their own ceiling.
+    order = sorted(range(len(weights)), key=lambda i: exact[i] - int(exact[i]), reverse=True)
+    for i in order:
+        if sum(shares) >= min(limit, total):
+            break
+        if shares[i] < max(0, weights[i]):
+            shares[i] += 1
+    return shares
 
 
 async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id: str,
                       log: Log, concurrency: int = 16,
-                      limit: int | None = None) -> tuple[int, int]:
+                      limit: int | None = None, source: str | None = None,
+                      label: str = "faces") -> tuple[int, int]:
     """Fetch the subject's face box per asset. Immich associates it, so no recognition."""
+    where, params = _source_clause(source)
     pending = [row[0] for row in conn.execute(
         "SELECT a.id FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"
-        " WHERE f.asset_id IS NULL" + _limit_clause(limit)
+        " WHERE f.asset_id IS NULL" + where + _limit_clause(limit), params
     )]
     if not pending:
         log("  faces: nothing new to look up")
@@ -233,7 +291,7 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
     # in the whole job, so ask how much is outstanding overall.
     total_assets = conn.execute("SELECT count(*) FROM assets").fetchone()[0]
     outstanding = pending_counts(conn)["faces"]
-    bar = Progress("faces", len(pending), emit=log,
+    bar = Progress(label, len(pending), emit=log,
                    overall=total_assets, already_done=total_assets - outstanding)
 
     async def one(asset_id: str) -> None:
@@ -283,14 +341,21 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
 
 async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir: Path,
                       source: str, log: Log, concurrency: int = 8,
-                      limit: int | None = None) -> int:
-    """Download originals, skipping anything already cached."""
+                      limit: int | None = None, account: str | None = None,
+                      label: str = "fetch") -> int:
+    """Download originals, skipping anything already cached.
+
+    `source` is the Immich rendition (original | preview); `account` is which
+    configured source's assets to download. Two different things that both
+    wanted the same word, so the older one keeps it.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
+    where, params = _source_clause(account)
     pending = conn.execute(
         "SELECT a.id, a.original_file_name FROM assets a"
         "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
         "  LEFT JOIN downloads d ON d.asset_id = a.id"
-        " WHERE d.asset_id IS NULL" + _limit_clause(limit)
+        " WHERE d.asset_id IS NULL" + where + _limit_clause(limit), params
     ).fetchall()
     if not pending:
         log("  fetch: nothing new to download")
@@ -305,7 +370,7 @@ async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir:
     downloadable = conn.execute(
         "SELECT count(*) FROM faces WHERE status = 'ok'").fetchone()[0]
     outstanding = pending_counts(conn)["fetch"]
-    bar = Progress("fetch", len(pending), emit=log, show_bytes=True,
+    bar = Progress(label, len(pending), emit=log, show_bytes=True,
                    overall=downloadable, already_done=downloadable - outstanding)
 
     async def one(asset_id: str, filename: str | None) -> None:
