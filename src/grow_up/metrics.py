@@ -100,7 +100,7 @@ RIGHT_EYE_CORNERS = (362, 263)
 def gaze_from_geometry(landmarks: np.ndarray) -> tuple[float, float]:
     """Signed gaze direction, from where each iris sits between its own corners.
 
-    This is the metric that answers "is she looking at the camera", which head
+    This is the metric that answers "are the eyes on the camera", which head
     pose alone cannot: the face can point straight at the lens while the eyes
     are turned away.
 

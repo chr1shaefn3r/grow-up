@@ -109,7 +109,7 @@ def detect_drift(stored_count: int | None, current_count: int | None,
     check immune to the constant offset from videos and trashed assets, which
     the count includes but this image-only pipeline does not.
 
-    A video newly tagged with her can trigger a false positive here. That costs
+    A video newly tagged with the person can trigger a false positive here. That costs
     one unnecessary full re-index, which is the right way round to be wrong.
     """
     if stored_count is None or current_count is None:
@@ -216,7 +216,7 @@ def pending_counts(conn: sqlite3.Connection) -> dict[str, int]:
 async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id: str,
                       log: Log, concurrency: int = 16,
                       limit: int | None = None) -> tuple[int, int]:
-    """Fetch her face box per asset. Immich's association means no recognition here."""
+    """Fetch the subject's face box per asset. Immich associates it, so no recognition."""
     pending = [row[0] for row in conn.execute(
         "SELECT a.id FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"
         " WHERE f.asset_id IS NULL" + _limit_clause(limit)

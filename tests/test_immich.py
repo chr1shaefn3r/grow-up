@@ -4,7 +4,7 @@ import pytest
 
 from grow_up.immich import AspectMismatch, Face, pick_face, scale_bbox
 
-HER = "11111111-1111-4111-8111-111111111111"
+SUBJECT = "11111111-1111-4111-8111-111111111111"
 SIBLING = "22222222-2222-4222-8222-222222222222"
 
 
@@ -22,29 +22,29 @@ def face_json(person_id: str | None, box=(100, 120, 200, 240), size=(1440, 1080)
 class TestPickFace:
     def test_finds_her_among_several_people(self):
         """Immich's own person association is why no face recognition is needed here."""
-        faces = [face_json(SIBLING), face_json(HER, box=(300, 100, 400, 220)), face_json(None)]
-        face, n = pick_face(faces, HER)
+        faces = [face_json(SIBLING), face_json(SUBJECT, box=(300, 100, 400, 220)), face_json(None)]
+        face, n = pick_face(faces, SUBJECT)
         assert face is not None and (face.x1, face.y1) == (300, 100)
         assert n == 1
 
     def test_returns_none_when_she_is_not_detected(self):
-        face, n = pick_face([face_json(SIBLING), face_json(None)], HER)
+        face, n = pick_face([face_json(SIBLING), face_json(None)], SUBJECT)
         assert face is None and n == 0
 
     def test_empty_face_list(self):
-        assert pick_face([], HER) == (None, 0)
+        assert pick_face([], SUBJECT) == (None, 0)
 
     def test_largest_wins_when_a_merge_left_duplicates(self):
         faces = [
-            face_json(HER, box=(0, 0, 50, 50)),
-            face_json(HER, box=(100, 100, 400, 400)),
+            face_json(SUBJECT, box=(0, 0, 50, 50)),
+            face_json(SUBJECT, box=(100, 100, 400, 400)),
         ]
-        face, n = pick_face(faces, HER)
+        face, n = pick_face(faces, SUBJECT)
         assert face is not None and face.area == 300 * 300
         assert n == 2, "the count is returned so the caller can flag the duplicate"
 
     def test_tolerates_a_null_person(self):
-        assert pick_face([face_json(None)], HER) == (None, 0)
+        assert pick_face([face_json(None)], SUBJECT) == (None, 0)
 
 
 class TestScaleBbox:

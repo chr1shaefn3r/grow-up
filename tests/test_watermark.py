@@ -110,7 +110,7 @@ def test_failed_run_does_not_advance_the_watermark(conn):
 
 
 class TestDriftDetection:
-    """Tagging her in an *old* photo need not bump that asset's updatedAt."""
+    """Tagging the person in an *old* photo need not bump that asset's updatedAt."""
 
     def test_no_drift_when_new_tags_are_on_new_photos(self):
         # Three new photos indexed, count up by exactly three.

@@ -427,7 +427,7 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path) -> int:
         "without moving the image, which is how alignment jitter becomes visible. Press r "
         "(or the reject button) to drop a frame, then download rejects.json into this "
         "directory and re-run encode. This catches what landmarks cannot: sunglasses, a "
-        "hand over the face, or another child mistagged as her."
+        "hand over the face, or someone else mistagged as the subject."
     )
     out_path.write_text(_page("grow-up — accepted frames", lede, body, _JS), encoding="utf-8")
     return len(rows)

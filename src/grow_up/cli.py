@@ -145,7 +145,7 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool) -> in
                 log(
                     f"  drift detected: Immich reports {current_count} assets for this person "
                     f"(was {stored_count}) but the incremental window only found {new} new. "
-                    "She was likely tagged in older photos — re-indexing in full."
+                    "The person was likely tagged in older photos — re-indexing in full."
                 )
                 _, new = await pipeline.stage_index(
                     client, conn, person_id, pipeline.Watermark(None, "full: drift detected"),
@@ -615,7 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--force", action="store_true")
 
     for name, func, help_text in (
-        ("index", cmd_index, "enumerate her photos (honours the sync watermark)"),
+        ("index", cmd_index, "enumerate the person's photos (honours the sync watermark)"),
         ("run", cmd_run, "run every stage; incremental by default"),
     ):
         p = add(name, func, help_text)
@@ -632,7 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
                                 "(default: analyze.effort in config)")
 
     for name, func, help_text in (
-        ("faces", cmd_faces, "fetch her face bounding box per asset"),
+        ("faces", cmd_faces, "fetch the person's face bounding box per asset"),
         ("fetch", cmd_fetch, "download originals"),
     ):
         p = add(name, func, help_text)

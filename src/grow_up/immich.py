@@ -49,7 +49,7 @@ ENDPOINT_PERMISSIONS = {
 # What the pipeline needs to complete a run, and why.
 REQUIRED_PERMISSIONS = {
     "person.read": "resolve the person by name",
-    "asset.read": "index her photos",
+    "asset.read": "index their photos",
     "face.read": "read face bounding boxes",
     "asset.download": "download originals",
 }

@@ -5,7 +5,7 @@
 [immich]
 # The person as tagged in Immich, matched by name on the first run. Only used to
 # find the ID; once that is known this setting is never read again.
-person_name = "Her Name"
+person_name = "Their Name"
 # Filled in after the first lookup; setting it skips the name resolution.
 person_id = ""
 

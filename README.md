@@ -1,8 +1,8 @@
 # grow-up
 
 Builds an eye-aligned face timelapse from the photos of one person in a private
-[Immich](https://immich.app) library. It picks the frames where she is looking at the
-camera and warps every one of them onto the same eye positions, so the years pass
+[Immich](https://immich.app) library. It picks the frames where the subject is looking
+at the camera and warps every one of them onto the same eye positions, so the years pass
 without the face jittering around the frame.
 
 > ### Authorship
@@ -47,8 +47,8 @@ key fails in one second with the missing names rather than after hundreds of req
 
 | Permission | Used for |
 |---|---|
-| `person.read` | resolving her by name |
-| `asset.read` | indexing her photos |
+| `person.read` | resolving the person by name |
+| `asset.read` | indexing their photos |
 | `face.read` | reading face bounding boxes |
 | `asset.download` | downloading originals |
 
@@ -66,8 +66,8 @@ does. Nothing below asks you to guess a value.
 You do not have to commit to the whole library to find out whether this works on your
 photos. Start small, look at what comes out, and only then spend the hours.
 
-**1. See what there is.** Indexing downloads nothing — it just enumerates her assets,
-and takes seconds.
+**1. See what there is.** Indexing downloads nothing — it just enumerates the tagged
+assets, and takes seconds.
 
 ```bash
 grow-up index
@@ -88,7 +88,7 @@ grow-up trial -n 50
   slider until the page shows the set you want, then copy the generated `[filter]` block
   into `config.toml`.
 - `out/contact-sheet.html` — the frames that survived, aligned, in order. Judge framing
-  here: too tight, and hair and chins are cut off; too loose, and she is a dot.
+  here: too tight, and hair and chins are cut off; too loose, and the face is a dot.
   `[align] eye_distance` is the knob.
 
 **4. Change one thing and see it.** Most tweaks do not re-run the machine learning,
@@ -233,7 +233,7 @@ Four details in there are load-bearing:
   An asset uploaded mid-run would otherwise land in the gap between the query and the
   write and be missed forever; storing the start means it is merely re-seen next run,
   which costs nothing. A crash leaves the old watermark in place.
-- **It detects the case `updatedAfter` cannot see.** Tagging her in an *old* photo need
+- **It detects the case `updatedAfter` cannot see.** Tagging someone in an *old* photo need
   not bump that asset's `updatedAt`. So the person's asset count from
   `/people/{id}/statistics` is stored alongside the watermark; if it climbs by more than
   the incremental query found, `grow-up` re-indexes in full and says why.
@@ -316,19 +316,19 @@ rejection reason, that threshold is too tight.
 
 ### Manual review
 
-Landmarks cannot catch sunglasses, a hand over the face, or another child mistagged as
-her. `out/contact-sheet.html` shows the aligned frames in order; click to reject, save
+Landmarks cannot catch sunglasses, a hand over the face, or someone else mistagged as
+the subject. `out/contact-sheet.html` shows the aligned frames in order; click to reject, save
 `rejects.json` next to it, and re-run `grow-up encode`.
 
 ## How it works
 
 Two things make this tractable:
 
-**Immich already knows which face is hers.** `GET /api/faces?id=<assetId>` returns every
+**Immich already knows which face belongs to whom.** `GET /api/faces?id=<assetId>` returns every
 detected face on an asset together with its bounding box *and the person it belongs to*.
 Even in a group photo, the right box comes back labelled — so there is no face
-recognition in this pipeline at all. Everything downstream depends on her being tagged
-in Immich; that tagging is the input this tool does not attempt to reproduce.
+recognition in this pipeline at all. Everything downstream depends on the subject being
+tagged in Immich; that tagging is the input this tool does not attempt to reproduce.
 
 **MediaPipe FaceLandmarker gives every signal the filter needs in one pass:**
 
@@ -372,8 +372,8 @@ takes its input from the manifest, and skips whatever is already recorded there.
 
 | # | Stage | What it does |
 |---|---|---|
-| 1 | `index` | Enumerates her assets via `POST /search/metadata`, honouring the sync watermark. Records ids, capture dates and dimensions. Downloads nothing. |
-| 2 | `faces` | For each new asset, `GET /faces?id=…` and stores *her* bounding box. This is what makes group photos usable. |
+| 1 | `index` | Enumerates the subject's assets via `POST /search/metadata`, honouring the sync watermark. Records ids, capture dates and dimensions. Downloads nothing. |
+| 2 | `faces` | For each new asset, `GET /faces?id=…` and stores *their* bounding box. This is what makes group photos usable. |
 | 3 | `fetch` | Downloads the originals into `paths.cache`, concurrently, retrying transient failures. Streams to disk and renames on completion, so an interrupted run leaves no truncated file. |
 | 4 | `analyze` | Crops around the face box, runs FaceLandmarker, and stores the metrics: pose, gaze, blink, sharpness, exposure, iris positions, face extents. The expensive stage, and the only one that runs a model. |
 | 5 | `select` | Applies the `[filter]` thresholds to those stored metrics, scores the survivors with the `[score]` weights, and keeps the best per `[select] cadence` bucket. Reads only stored numbers — no image is opened, so it is sub-second and re-runnable as often as you like. |

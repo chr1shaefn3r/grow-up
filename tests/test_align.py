@@ -51,7 +51,7 @@ class TestSimilarityTransform:
         assert apply(m, left)[1] == pytest.approx(apply(m, right)[1], abs=0.5)
 
     def test_normalises_face_size(self):
-        """Interocular normalisation is what keeps head size constant as she grows."""
+        """Interocular normalisation is what keeps head size constant as the child grows."""
         dst_left, dst_right = align.target_eyes(WIDTH, HEIGHT, (0.36, 0.42), (0.64, 0.42))
         target_distance = float(np.hypot(*(dst_right - dst_left)))
 
