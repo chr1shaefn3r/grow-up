@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 
 import pytest
@@ -312,3 +313,58 @@ class TestAlternatesAreKeptButNotEncoded:
         rows = self.rows(conn)
         assert [(r["asset_id"], r["alternate"]) for r in rows] == [
             ("second", 0), ("third", 1), ("fourth", 1)]
+
+
+class TestADatabaseFromTheLastReleaseUpgrades:
+    """1.2.0 wrote a selection table with no `alternate` column.
+
+    It arrives through db.ADDED_COLUMNS, and every existing row must default to
+    0 -- a stored selection is a pick, not a runner-up. Get that backwards and
+    the first run after upgrading encodes nothing.
+    """
+
+    RELEASED_SCHEMA = """
+    CREATE TABLE assets (
+        id TEXT PRIMARY KEY, local_datetime TEXT, indexed_at TEXT NOT NULL
+    );
+    CREATE TABLE selection (
+        asset_id    TEXT PRIMARY KEY,
+        bucket      TEXT NOT NULL,
+        rank        INTEGER NOT NULL,
+        selected_at TEXT NOT NULL
+    );
+    """
+
+    def released_database(self, path):
+        raw = sqlite3.connect(path)
+        raw.executescript(self.RELEASED_SCHEMA)
+        raw.execute("INSERT INTO assets (id, indexed_at) VALUES ('a', '2026-01-01')")
+        raw.execute("INSERT INTO selection (asset_id, bucket, rank, selected_at)"
+                    " VALUES ('a', '2026-W10', 0, '2026-01-01')")
+        raw.commit()
+        raw.close()
+
+    def test_the_column_arrives(self, tmp_path):
+        path = tmp_path / "released.sqlite"
+        self.released_database(path)
+        columns = {r["name"] for r in db.connect(path).execute("PRAGMA table_info(selection)")}
+        assert "alternate" in columns
+
+    def test_an_existing_selection_is_a_pick_not_a_runner_up(self, tmp_path):
+        path = tmp_path / "released.sqlite"
+        self.released_database(path)
+        rows = db.connect(path).execute("SELECT asset_id, alternate FROM selection").fetchall()
+        assert [(r["asset_id"], r["alternate"]) for r in rows] == [("a", 0)]
+
+    def test_such_a_row_still_reaches_the_video(self, tmp_path):
+        """The join stage_encode uses, run against the upgraded database."""
+        path = tmp_path / "released.sqlite"
+        self.released_database(path)
+        conn = db.connect(path)
+        conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                     " VALUES ('a', '/tmp/a.jpg', 0, '2026-01-01')")
+
+        kept = conn.execute(
+            "SELECT f.asset_id FROM frames f JOIN selection s ON s.asset_id = f.asset_id"
+            " WHERE s.alternate = 0").fetchall()
+        assert [r["asset_id"] for r in kept] == ["a"]

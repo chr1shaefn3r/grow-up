@@ -111,7 +111,7 @@ pip install pillow                   # unlocks the footer-drawing tests
 # node on PATH                       # unlocks the Python/JavaScript filter parity tests
 ```
 
-With none of them, 14 tests skip and the rest still assert everything that matters.
+With none of them, 34 tests skip and the rest still assert everything that matters.
 
 **You cannot verify anything that needs real photographs.** mediapipe generally will not
 install in a sandbox, there is no Immich instance, and no credentials will be shared.
