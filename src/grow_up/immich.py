@@ -39,6 +39,7 @@ _UUID = re.compile(
 # message that names the missing scope.
 ENDPOINT_PERMISSIONS = {
     "/search/person": "person.read",
+    "/people/{id}": "person.read",
     "/people/{id}/statistics": "person.statistics",
     "/search/metadata": "asset.read",
     "/faces": "face.read",
@@ -157,6 +158,8 @@ def _message_from(response: httpx.Response) -> str:
 class Person:
     id: str
     name: str
+    # Immich stores this only if the user filled it in, so it is routinely None.
+    birth_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -316,7 +319,21 @@ class ImmichClient:
                 "Set immich.person_id in config.toml to disambiguate."
             )
         p = candidates[0]
-        return Person(id=p["id"], name=p.get("name") or "")
+        return Person(id=p["id"], name=p.get("name") or "",
+                      birth_date=p.get("birthDate") or None)
+
+    async def person(self, person_id: str) -> Person | None:
+        """The person record, for the birth date the age footer needs.
+
+        None on any failure: a missing birth date only costs an annotation, so
+        it must never be able to fail a run that would otherwise finish.
+        """
+        try:
+            p = (await self._get(f"/people/{person_id}")).json()
+        except ImmichHTTPError:
+            return None
+        return Person(id=p.get("id") or person_id, name=p.get("name") or "",
+                      birth_date=p.get("birthDate") or None)
 
     async def person_asset_count(self, person_id: str) -> int | None:
         """Assets this person appears in, or None if the count is unavailable.

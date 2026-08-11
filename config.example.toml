@@ -193,3 +193,24 @@ codec = "libx264"          # "hevc_videotoolbox" is much faster on Apple Silicon
 # hevc_videotoolbox ignore it -- they take a bitrate instead.
 crf = 18
 interpolate = false        # ffmpeg minterpolate; smoother but very slow
+
+# Burn a footer into the video: capture date bottom left, age bottom right. The
+# age comes from the birth date on the person in Immich; without one, only the
+# date is drawn and the run says so. Enabling this writes *both* videos -- the
+# plain one and `<filename>-annotated` -- so a date format you end up disliking
+# can never cost you the clean render.
+[encode.annotate]
+# false leaves the run exactly as it was: one video, no footer, nothing read.
+enabled = false
+date = true                 # the capture date, bottom left
+# days | months | year_months | off -- bottom right. year_months omits a zero
+# part ("5 months", not "0 years, 5 months") and falls back to days under one
+# month, because "0 months" is wrong exactly where change is fastest.
+age = "year_months"
+language = "en"             # en | de | fr | es | it -- month names, plurals, separators
+# Tokens, not strftime: YYYY YY MMMM MMM MM DD D. Month names follow `language`,
+# so "D MMMM YYYY" reads 5 August 2026 or 5 août 2026.
+date_format = "YYYY-MM-DD"
+# Path to a .ttf or .otf. Empty picks a system face, falling back to the one
+# bundled with Pillow. Set it if your language needs glyphs the default lacks.
+font = ""

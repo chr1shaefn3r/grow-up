@@ -71,6 +71,7 @@ specifically to avoid. They all look like improvements.
 | Log `type(exc).__name__` for a failed request | Discarding the HTTP status cost an entire debugging round on a real library. `ImmichHTTPError` carries status, path and body. | `test_keeps_the_status_code` (`tests/test_client_errors.py`) |
 | Clear a progress line by padding with spaces | Leaves trailing whitespace in the terminal buffer. Use the ANSI erase-to-end-of-line already in `progress.py`. | `test_summary_line_has_no_trailing_whitespace` (`tests/test_progress.py`) |
 | Ask one Immich account about another's asset | Face lookups and downloads must go to the account that owns the asset — a key that cannot see an id gets 404, so this fails on exactly the other account's half of the library. `assets.source` records the owner. | `TestStagesStayInTheirOwnAccount` (`tests/test_sources.py`) |
+| Take month names or number grouping from the stdlib `locale` module | It depends on which locales the host has generated, so the same config renders a different video on a Mac and on a Linux desktop. `annotate.LANGUAGES` is a table for that reason, and because `mois` is invariable in French — a rule with an `s` on the end is wrong. | `TestLanguages` (`tests/test_annotate.py`) |
 | Apply `--limit` per account instead of splitting it | `trial -n 100` would sample 200 across two accounts, and the projection multiplies a per-item cost by the whole workload — so the estimate is wrong with nothing on screen to say so. | `TestSplittingASample` (`tests/test_sources.py`) |
 
 One more, without a test because it is a shape rather than a behaviour: EXIF orientation
@@ -92,6 +93,7 @@ coordinates; decoding elsewhere without the same rule silently crops the wrong r
 | `align.py` | The similarity transform. Maths is pure numpy; opencv is imported lazily, only for the warp. |
 | `select.py` | Apply the filters, score the survivors, bucket them by cadence. |
 | `review.py` | The two static HTML pages. No CDN — they open over `file://`. The rejects page is a threshold tuner driven by the serialized `RULES`. |
+| `annotate.py` | The date/age footer. Age arithmetic, date tokens and the five language tables are plain Python; Pillow is imported lazily, only to draw. |
 | `encode.py` | The ffmpeg invocation. |
 | `progress.py` | The progress bar. Repaints on a terminal, degrades to plain lines when piped. |
 | `timing.py` | Stage timing and the full-run projection behind `grow-up trial`. |
@@ -103,8 +105,11 @@ coordinates; decoding elsewhere without the same rule silently crops the wrong r
 
 ```bash
 pip install opencv-python-headless   # unlocks the warp and framing tests
+pip install pillow                   # unlocks the footer-drawing tests
 # node on PATH                       # unlocks the Python/JavaScript filter parity tests
 ```
+
+With none of them, 14 tests skip and the rest still assert everything that matters.
 
 **You cannot verify anything that needs real photographs.** mediapipe generally will not
 install in a sandbox, there is no Immich instance, and no credentials will be shared.

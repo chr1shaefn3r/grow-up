@@ -102,6 +102,14 @@ CREATE TABLE IF NOT EXISTS frames (
     warped_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS people (
+    person_id  TEXT PRIMARY KEY,
+    source     TEXT,                       -- the account this record came from
+    name       TEXT,
+    birth_date TEXT,                       -- YYYY-MM-DD, or NULL when Immich has none
+    fetched_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     person_id     TEXT PRIMARY KEY,
     watermark     TEXT NOT NULL,         -- UTC ISO-8601, passed to the API as updatedAfter
@@ -281,6 +289,33 @@ def adopt_unsourced(conn: sqlite3.Connection, source: str) -> int:
     cur = conn.execute(
         "UPDATE assets SET source = ? WHERE source IS NULL", (source,))
     return int(cur.rowcount or 0)
+
+
+def upsert_person(conn: sqlite3.Connection, person_id: str, source: str | None,
+                  name: str, birth_date: str | None) -> None:
+    conn.execute(
+        "INSERT INTO people (person_id, source, name, birth_date, fetched_at)"
+        " VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT (person_id) DO UPDATE SET"
+        "   source = excluded.source,"
+        "   name = excluded.name,"
+        "   birth_date = excluded.birth_date,"
+        "   fetched_at = excluded.fetched_at",
+        (person_id, source, name, birth_date, iso_z(now_utc())),
+    )
+
+
+def birth_date(conn: sqlite3.Connection) -> str | None:
+    """The subject's birth date, or None if no account has one.
+
+    Several sources mean several person records for the same human, so the first
+    non-null wins -- they describe one person, and typically only one of the two
+    accounts ever filled the field in.
+    """
+    row = conn.execute(
+        "SELECT birth_date FROM people WHERE birth_date IS NOT NULL"
+        " ORDER BY person_id LIMIT 1").fetchone()
+    return row["birth_date"] if row else None
 
 
 def count_assets(conn: sqlite3.Connection) -> int:

@@ -125,7 +125,7 @@ class TestStageEncode:
                                     {"filename": "trial-timelapse.mp4", "fps": 10},
                                     lambda _: None)
 
-        assert out.name == "trial-timelapse.mp4"
+        assert [v.name for v in out] == ["trial-timelapse.mp4"]
         assert seen["out"].name == "trial-timelapse.mp4"
         assert len(seen["frames"]) == 3
 
@@ -134,7 +134,18 @@ class TestStageEncode:
 
         self.captured(monkeypatch)
         out = pipeline.stage_encode(conn, tmp_path / "out", {}, lambda _: None)
-        assert out.name == "timelapse.mp4"
+        assert [v.name for v in out] == ["timelapse.mp4"]
+
+    def test_annotation_off_writes_exactly_one_video(self, conn, tmp_path, monkeypatch):
+        """The default has to stay a single render with no annotated leftovers."""
+        from grow_up import pipeline
+
+        self.captured(monkeypatch)
+        out = pipeline.stage_encode(conn, tmp_path / "out",
+                                    {"annotate": {"enabled": False}}, lambda _: None)
+
+        assert len(out) == 1
+        assert not (tmp_path / "frames" / "annotated").exists()
 
     def test_honours_manual_rejects(self, conn, tmp_path, monkeypatch):
         from grow_up import pipeline
@@ -163,6 +174,112 @@ class TestStageEncode:
         """cmd_trial catches FFmpegMissing before RuntimeError, so the order of
         those except clauses depends on this relationship."""
         assert issubclass(encode.FFmpegMissing, RuntimeError)
+
+
+class TestBothVideos:
+    """With a footer configured, the plain render is still produced.
+
+    A date format or a language is a preference, and getting one wrong should
+    never be able to cost you the clean video.
+    """
+
+    @pytest.fixture()
+    def conn(self, tmp_path):
+        pytest.importorskip("PIL.Image", reason="needs Pillow")
+        from PIL import Image
+
+        from grow_up import db
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        frames = tmp_path / "frames"
+        frames.mkdir()
+        for i in range(1, 4):
+            frame = frames / f"frame_{i:06d}.jpg"
+            Image.new("RGB", (200, 250), "white").save(frame)
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01", stamp))
+            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                         " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+        db.upsert_person(conn, "p1", "me", "Kid", "2020-03-14")
+        return conn
+
+    def captured(self, monkeypatch):
+        from grow_up import pipeline
+
+        seen = []
+        monkeypatch.setattr(pipeline, "encode",
+                            lambda frames, out, **kw: seen.append((list(frames), out)) or out)
+        return seen
+
+    def test_two_videos_are_written(self, conn, tmp_path, monkeypatch):
+        from grow_up import pipeline
+
+        seen = self.captured(monkeypatch)
+        out = pipeline.stage_encode(conn, tmp_path / "out",
+                                    {"annotate": {"enabled": True}}, lambda _: None)
+
+        assert [v.name for v in out] == ["timelapse.mp4", "timelapse-annotated.mp4"]
+        assert len(seen) == 2
+
+    def test_the_plain_video_uses_the_untouched_frames(self, conn, tmp_path, monkeypatch):
+        from grow_up import pipeline
+
+        seen = self.captured(monkeypatch)
+        pipeline.stage_encode(conn, tmp_path / "out",
+                              {"annotate": {"enabled": True}}, lambda _: None)
+
+        plain, annotated = (paths for paths, _ in seen)
+        assert all("annotated" not in str(p) for p in plain)
+        assert all(p.parent.name == "annotated" for p in annotated)
+        assert len(plain) == len(annotated) == 3
+
+    def test_the_annotated_frames_differ_from_the_originals(self, conn, tmp_path,
+                                                            monkeypatch):
+        from grow_up import pipeline
+
+        seen = self.captured(monkeypatch)
+        pipeline.stage_encode(conn, tmp_path / "out",
+                              {"annotate": {"enabled": True}}, lambda _: None)
+
+        (_, _), (annotated, _) = ((p, o) for p, o in seen)
+        assert annotated[0].read_bytes() != (tmp_path / "frames" / "frame_000001.jpg").read_bytes()
+
+    def test_a_missing_birth_date_warns_and_still_annotates(self, conn, tmp_path,
+                                                            monkeypatch):
+        from grow_up import pipeline
+
+        conn.execute("UPDATE people SET birth_date = NULL")
+        self.captured(monkeypatch)
+        said: list[str] = []
+        out = pipeline.stage_encode(conn, tmp_path / "out",
+                                    {"annotate": {"enabled": True}}, said.append)
+
+        assert len(out) == 2, "the annotated video is still produced"
+        assert any("birth date" in line for line in said)
+
+    def test_no_warning_when_the_age_is_switched_off(self, conn, tmp_path, monkeypatch):
+        from grow_up import pipeline
+
+        conn.execute("UPDATE people SET birth_date = NULL")
+        self.captured(monkeypatch)
+        said: list[str] = []
+        pipeline.stage_encode(conn, tmp_path / "out",
+                              {"annotate": {"enabled": True, "age": "off"}}, said.append)
+
+        assert not any("birth date" in line for line in said)
+
+    def test_manual_rejects_apply_to_both(self, conn, tmp_path, monkeypatch):
+        seen = self.captured(monkeypatch)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "rejects.json").write_text('{"rejected": ["a2"]}')
+
+        from grow_up import pipeline
+        pipeline.stage_encode(conn, out_dir, {"annotate": {"enabled": True}},
+                              lambda _: None)
+
+        assert [len(paths) for paths, _ in seen] == [2, 2]
 
 
 def test_missing_ffmpeg_says_how_to_install_it(monkeypatch):

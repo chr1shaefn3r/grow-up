@@ -218,6 +218,14 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool,
                 client, conn, person_id, watermark, page_size, log, source.name
             )
 
+            # Cached so `encode` can put an age on the footer without a
+            # network call, and refreshed here because a birth date filled in
+            # after the first run should reach the next video.
+            record = await client.person(person_id)
+            if record is not None:
+                db.upsert_person(conn, person_id, source.name, record.name,
+                                 record.birth_date)
+
             current_count = await client.person_asset_count(person_id)
             if current_count is None:
                 log("  note: person statistics unavailable, so drift detection is off "
@@ -379,8 +387,8 @@ def cmd_review(args: argparse.Namespace) -> None:
 
 def cmd_encode(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
-    out = pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log)
-    log(f"  encode: wrote {out}")
+    for out in pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log):
+        log(f"  encode: wrote {out}")
 
 
 def cmd_trial(args: argparse.Namespace) -> None:
@@ -494,11 +502,11 @@ def cmd_trial(args: argparse.Namespace) -> None:
         else:
             try:
                 with timing.stopwatch() as encode_elapsed:
-                    video = pipeline.stage_encode(conn, out_dir, encode_cfg, log)
+                    videos = pipeline.stage_encode(conn, out_dir, encode_cfg, log)
                 trial.stages.append(timing.StageTiming(
                     "encode", aligned, encode_elapsed(),
                     max(0, projected_frames - aligned),
-                    unit="frame", note=str(video)))
+                    unit="frame", note=", ".join(str(v) for v in videos)))
             except FFmpegMissing as exc:
                 log(f"  ! skipping encode: {exc}")
             except RuntimeError as exc:

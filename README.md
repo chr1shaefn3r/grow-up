@@ -358,6 +358,56 @@ the pipeline would be worse than no preview.
 Read this page **before** trusting the acceptances: if good photos appear under a
 rejection reason, that threshold is too tight.
 
+### Date and age on the video
+
+Off by default. Turned on, every frame gets a footer — capture date bottom left, age
+bottom right — and **both videos are written**: the plain `timelapse.mp4` and
+`timelapse-annotated.mp4`. A date format you end up disliking can never cost you the
+clean render.
+
+```toml
+[encode.annotate]
+enabled = true
+age = "year_months"         # days | months | year_months | off
+language = "de"             # en | de | fr | es | it
+date_format = "DD.MM.YYYY"
+```
+
+```
+27.08.2023                                          3 Jahre, 5 Monate
+```
+
+The age comes from the **birth date on the person in Immich** — the same field the web UI
+uses to show an age. It is read during `index` and cached, so `encode` never touches the
+network. If the age is switched on and Immich has no birth date, the run says so and
+draws the date alone rather than failing:
+
+```
+  ! encode.annotate.age is set but Immich has no birth date for this person;
+    annotating with the date only.
+```
+
+Fill it in under the person in Immich, then `grow-up index && grow-up encode`.
+
+Some details that are deliberate:
+
+- **The footer is readable over anything.** A translucent band darkens the bottom strip
+  and the text carries an outline, so white snow and a night shot both work. Nothing
+  above the band is touched.
+- **`year_months` reads the way a person speaks.** `3 years, 5 months`, dropping a zero
+  part — and under one month old it falls back to days, because `0 months` is wrong on
+  exactly the frames where a baby changes fastest.
+- **Translations are built in, not taken from the system locale**, which depends on which
+  locales a machine has generated. `mois` is invariable in French, `1 día` / `2 días` in
+  Spanish, `1.261` versus `1 261` for thousands — all from a table, so a Mac and a Linux
+  desktop render the same video.
+- **Date patterns are tokens** (`YYYY MM DD`, plus `MMMM` and `MMM` for month names), not
+  strftime. `D MMMM YYYY` gives `5 August 2026` or `5 août 2026` depending on `language`.
+
+`font` takes a path to a `.ttf` or `.otf`; left empty it picks a system face and falls
+back to the one bundled with Pillow. Set it if your language needs glyphs the default
+lacks.
+
 ### Manual review
 
 Landmarks cannot catch sunglasses, a hand over the face, or someone else mistagged as

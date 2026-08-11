@@ -17,7 +17,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-from . import align, analyze, config, db, images, review, select
+from . import align, analyze, annotate, config, db, images, review, select
 from .encode import encode
 from .immich import ImmichClient, pick_face
 from .progress import Progress
@@ -608,26 +608,94 @@ def _damp_flicker(results: list[tuple], log: Log, window: int = 9) -> None:
 
 
 def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
-                 log: Log) -> Path:
-    """Encode the aligned frames, honouring manual rejects from the contact sheet."""
+                 log: Log) -> list[Path]:
+    """Encode the aligned frames, honouring manual rejects from the contact sheet.
+
+    Returns every video written. With annotation on that is two: the plain
+    render and an annotated one. Both, deliberately -- a date format or a
+    language is a preference, and it should never cost you the clean video.
+    """
     rejects = review.load_manual_rejects(out_dir / "rejects.json")
-    rows = conn.execute("SELECT asset_id, path FROM frames ORDER BY seq ASC").fetchall()
-    frames = [Path(r["path"]) for r in rows if r["asset_id"] not in rejects]
+    rows = conn.execute(
+        "SELECT f.asset_id, f.path, a.local_datetime FROM frames f"
+        "  JOIN assets a ON a.id = f.asset_id ORDER BY f.seq ASC").fetchall()
+    kept = [r for r in rows if r["asset_id"] not in rejects]
+    frames = [Path(r["path"]) for r in kept]
 
     if rejects:
         log(f"  encode: honouring {len(rejects)} manual rejects from rejects.json")
     if not frames:
         raise RuntimeError("no frames left to encode")
 
-    out_path = out_dir / str(encode_cfg.get("filename", "timelapse.mp4"))
-    log(f"  encode: {len(frames)} frames at {encode_cfg.get('fps', 10)} fps")
-    return encode(
-        frames, out_path,
+    settings = dict(
         fps=float(encode_cfg.get("fps", 10)),
         codec=str(encode_cfg.get("codec", "libx264")),
         crf=int(encode_cfg.get("crf", 18)),
         interpolate=bool(encode_cfg.get("interpolate", False)),
     )
+    filename = str(encode_cfg.get("filename", "timelapse.mp4"))
+    log(f"  encode: {len(frames)} frames at {settings['fps']:g} fps")
+    written = [encode(frames, out_dir / filename, **settings)]
+
+    footer = annotate.Annotation.from_config(encode_cfg.get("annotate"))
+    if footer.enabled:
+        annotated = _annotated_frames(conn, kept, footer, log)
+        if annotated:
+            written.append(encode(annotated, out_dir / _annotated_name(filename),
+                                  **settings))
+    return written
+
+
+def _annotated_name(filename: str) -> str:
+    """`timelapse.mp4` -> `timelapse-annotated.mp4`."""
+    stem, dot, suffix = filename.rpartition(".")
+    return f"{stem}-annotated{dot}{suffix}" if dot else f"{filename}-annotated"
+
+
+def _annotated_frames(conn: sqlite3.Connection, rows: list, footer,
+                      log: Log) -> list[Path]:
+    """Redraw the selected frames with a footer, into a subdirectory.
+
+    Regenerated on every encode rather than cached: they are derived from frames
+    that already exist, cost about a second, and a stale set left behind after a
+    date format changed would be worse than the second.
+    """
+    from PIL import Image
+
+    birth = db.birth_date(conn)
+    if footer.wants_age and birth is None:
+        log("  ! encode.annotate.age is set but Immich has no birth date for this "
+            "person; annotating with the date only.")
+        log("    Add it under the person in Immich, then re-run "
+            "`grow-up index` and `grow-up encode`.")
+    born = _as_date(birth)
+
+    out_dir = Path(rows[0]["path"]).parent / "annotated"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for row in rows:
+        source = Path(row["path"])
+        when = _as_date(row["local_datetime"])
+        left, right = footer.texts(when, born) if when else ("", "")
+        with Image.open(source) as image:
+            drawn = annotate.draw_footer(image, left, right,
+                                         configured_font=footer.font)
+        target = out_dir / source.name
+        drawn.save(target, quality=95)
+        written.append(target)
+
+    log(f"  encode: {len(written)} annotated frames -> {out_dir}")
+    return written
+
+
+def _as_date(value: str | None) -> datetime.date | None:
+    """The date part of an Immich timestamp, or of a plain `YYYY-MM-DD`."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except ValueError:
+        return None
 
 
 def report_rejects(conn: sqlite3.Connection, log: Log) -> None:
