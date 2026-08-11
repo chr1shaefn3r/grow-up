@@ -175,3 +175,84 @@ def test_reject_summary_counts_by_reason(conn):
 
     summary = dict(select.reject_summary(conn))
     assert summary == {"accepted": 1, "head_turned": 1, "blurry": 1}
+
+
+class TestAManualRejectPromotesTheRunnerUp:
+    """Rejecting the week's winner must hand the week to the next best photo.
+
+    Before this, `rejects.json` was only applied at encode time, filtering the
+    already-selected frame list -- so rejecting a photo deleted its bucket
+    outright and the runner-up sitting in the manifest was never considered.
+    """
+
+    def week(self, conn) -> None:
+        # One ISO week, three candidates, sharpness deciding the order.
+        add(conn, "best", "2026-03-02T10:00:00", sharpness=400.0)
+        add(conn, "second", "2026-03-03T10:00:00", sharpness=200.0)
+        add(conn, "third", "2026-03-04T10:00:00", sharpness=100.0)
+
+    def chosen(self, conn, manual=frozenset(), per_bucket=1) -> list[str]:
+        select.apply_filters(conn, LIMITS, WEIGHTS, manual)
+        select.select_frames(conn, "week", per_bucket)
+        return [r["asset_id"] for r in conn.execute(
+            "SELECT asset_id FROM selection ORDER BY rank")]
+
+    def test_without_rejects_the_best_wins(self, conn):
+        self.week(conn)
+        assert self.chosen(conn) == ["best"]
+
+    def test_rejecting_the_best_promotes_the_second(self, conn):
+        self.week(conn)
+        assert self.chosen(conn, {"best"}) == ["second"]
+
+    def test_rejecting_two_promotes_the_third(self, conn):
+        self.week(conn)
+        assert self.chosen(conn, {"best", "second"}) == ["third"]
+
+    def test_rejecting_everything_leaves_the_bucket_empty(self, conn):
+        """Not a fallback to a rejected photo -- you said no to all of them."""
+        self.week(conn)
+        assert self.chosen(conn, {"best", "second", "third"}) == []
+
+    def test_per_bucket_two_takes_the_next_two_down(self, conn):
+        self.week(conn)
+        assert self.chosen(conn, {"best"}, per_bucket=2) == ["second", "third"]
+
+    def test_other_weeks_are_untouched(self, conn):
+        self.week(conn)
+        add(conn, "elsewhere", "2026-04-06T10:00:00", sharpness=50.0)
+        assert set(self.chosen(conn, {"best"})) == {"second", "elsewhere"}
+
+    def test_un_rejecting_brings_the_photo_back(self, conn):
+        """Removing an id from the file has to be enough; nothing is sticky."""
+        self.week(conn)
+        assert self.chosen(conn, {"best"}) == ["second"]
+        assert self.chosen(conn, frozenset()) == ["best"]
+
+
+class TestHowAManualRejectIsReported:
+    def test_it_shows_as_its_own_reason(self, conn):
+        add(conn, "a", "2026-03-02T10:00:00")
+        select.apply_filters(conn, LIMITS, WEIGHTS, {"a"})
+        assert dict(select.reject_summary(conn)) == {"manual": 1}
+
+    def test_a_hard_reason_wins_over_it(self, conn):
+        """Keeps the tuner's numbers honest: a blurry photo still reads blurry.
+
+        So the `manual` count means the useful thing -- photos dropped by hand
+        that the filters would have kept.
+        """
+        add(conn, "blurry", "2026-03-02T10:00:00", sharpness=1.0)
+        select.apply_filters(conn, LIMITS, WEIGHTS, {"blurry"})
+        assert dict(select.reject_summary(conn)) == {"blurry": 1}
+
+    def test_a_rejected_photo_is_not_counted_as_accepted(self, conn):
+        add(conn, "a", "2026-03-02T10:00:00")
+        add(conn, "b", "2026-03-03T10:00:00")
+        kept, scored = select.apply_filters(conn, LIMITS, WEIGHTS, {"a"})
+        assert (kept, scored) == (1, 2)
+
+    def test_it_carries_no_score(self, conn):
+        add(conn, "a", "2026-03-02T10:00:00")
+        select.apply_filters(conn, LIMITS, WEIGHTS, {"a"})
+        assert conn.execute("SELECT score FROM metrics").fetchone()["score"] is None

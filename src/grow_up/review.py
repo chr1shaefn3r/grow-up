@@ -116,7 +116,11 @@ figure.removed::after { content:"would be dropped"; position:absolute; top:8px; 
 # Viewer plus manual rejection. Uses event delegation throughout so it keeps
 # working over grids the tuner re-renders.
 _JS = """
-const rejected = new Set();
+// Seeded from rejects.json by the page writer. Without this the set would start
+// empty on every regeneration, and the next download -- which replaces the whole
+// file -- would silently un-reject everything decided before it.
+const seed = document.getElementById('rejected-seed');
+const rejected = new Set(seed ? JSON.parse(seed.textContent) : []);
 const viewer = document.getElementById('viewer');
 const viewerImg = document.getElementById('viewer-img');
 const viewerMeta = document.getElementById('viewer-meta');
@@ -386,9 +390,31 @@ def _rel(path: str | Path, start: Path) -> str:
     return html.escape(os.path.relpath(str(path), start).replace(os.sep, "/"))
 
 
-def write_contact_sheet(conn: sqlite3.Connection, out_path: Path) -> int:
-    """Accepted frames in date order, click to toggle rejection."""
+def _card(asset_id: str, path: str, when: str, label: str, base: Path,
+          rejected: bool = False) -> str:
+    state = ' class="rejected"' if rejected else ""
+    action = "keep" if rejected else "reject"
+    return (
+        f'<figure{state} data-id="{html.escape(asset_id)}" '
+        f'data-label="{html.escape(label)}">'
+        f'<img loading="lazy" src="{_rel(path, base)}" alt="">'
+        f'<figcaption><span>{html.escape(when)}</span>'
+        f'<button type="button">{action}</button>'
+        f'<span>{html.escape(label.split()[-1])}</span></figcaption></figure>'
+    )
+
+
+def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
+                        manual: frozenset[str] | set[str] = frozenset()) -> int:
+    """Accepted frames in date order, click to toggle rejection.
+
+    Anything already in rejects.json is seeded into the page and shown in its own
+    strip below. Without that, `select` dropping those photos would leave them
+    with no card, and the next download -- which replaces the whole file -- would
+    quietly un-reject every one of them.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    base = out_path.parent
     rows = conn.execute(
         "SELECT f.asset_id, f.path, f.seq, a.local_datetime, s.bucket"
         "  FROM frames f"
@@ -397,20 +423,40 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path) -> int:
         " ORDER BY f.seq ASC"
     ).fetchall()
 
-    cards = []
-    for row in rows:
-        when = (row["local_datetime"] or "")[:10]
-        label = f"{when}  #{row['seq']}"
-        cards.append(
-            f'<figure data-id="{html.escape(row["asset_id"])}" '
-            f'data-label="{html.escape(label)}">'
-            f'<img loading="lazy" src="{_rel(row["path"], out_path.parent)}" alt="">'
-            f'<figcaption><span>{html.escape(when)}</span>'
-            f'<button type="button">reject</button>'
-            f'<span>#{row["seq"]}</span></figcaption></figure>'
+    cards = [
+        _card(row["asset_id"], row["path"], (row["local_datetime"] or "")[:10],
+              f"{(row['local_datetime'] or '')[:10]}  #{row['seq']}", base)
+        for row in rows
+    ]
+
+    # No warped frame exists for a rejected photo -- select excluded it, so align
+    # never touched it -- so these show the cached original instead.
+    dropped = conn.execute(
+        "SELECT a.id AS asset_id, d.path, a.local_datetime FROM assets a"
+        "  JOIN downloads d ON d.asset_id = a.id"
+        " ORDER BY a.local_datetime ASC"
+    ).fetchall()
+    dropped = [r for r in dropped if r["asset_id"] in manual]
+    rejected_cards = [
+        _card(row["asset_id"], row["path"], (row["local_datetime"] or "")[:10],
+              f"{(row['local_datetime'] or '')[:10]}  dropped", base, rejected=True)
+        for row in dropped
+    ]
+
+    seed = (f'<script type="application/json" id="rejected-seed">'
+            f'{json.dumps(sorted(manual))}</script>\n')
+    aside = ""
+    if rejected_cards:
+        aside = (
+            '<h2 class="dropped">Rejected by hand</h2>\n'
+            '<p class="note">Their buckets fell through to the next best photo. '
+            'Click one to keep it again, download rejects.json, then re-run '
+            '<code>grow-up select &amp;&amp; grow-up align &amp;&amp; grow-up encode</code>.</p>\n'
+            f'<div class="grid">{"".join(rejected_cards)}</div>\n'
         )
 
     body = (
+        seed +
         '<div class="bar">'
         '<button id="save">Download rejects.json</button>'
         '<button id="clear">Clear</button>'
@@ -419,6 +465,7 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path) -> int:
         f"{_SIZE_CONTROLS}"
         "</div>\n"
         f'<div class="grid">{"".join(cards)}</div>\n'
+        f"{aside}"
         '<textarea id="out" readonly></textarea>\n'
         f"{_VIEWER_HTML}"
     )
@@ -426,8 +473,10 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path) -> int:
         "Click a frame to open it full size; the arrow keys step through the sequence "
         "without moving the image, which is how alignment jitter becomes visible. Press r "
         "(or the reject button) to drop a frame, then download rejects.json into this "
-        "directory and re-run encode. This catches what landmarks cannot: sunglasses, a "
-        "hand over the face, or someone else mistagged as the subject."
+        "directory and re-run `grow-up select && grow-up align && grow-up encode` -- the "
+        "bucket falls through to its next best photo rather than disappearing. This "
+        "catches what landmarks cannot: sunglasses, a hand over the face, or someone "
+        "else mistagged as the subject."
     )
     out_path.write_text(_page("grow-up — accepted frames", lede, body, _JS), encoding="utf-8")
     return len(rows)
@@ -479,17 +528,22 @@ def _collect(conn: sqlite3.Connection, out_dir: Path) -> list[dict]:
 
 def write_rejects_gallery(conn: sqlite3.Connection, out_path: Path,
                           limit_per_reason: int = MAX_REJECT_SAMPLES,
-                          limits: dict | None = None) -> int:
+                          limits: dict | None = None,
+                          manual: frozenset[str] | set[str] = frozenset()) -> int:
     """Threshold tuner: sliders over the live filter, with a before/after diff.
 
     A static list of rejects shows what was dropped but not what a different
     threshold would buy, which is the actual question. Every analyzed photo's
     metrics are embedded, and the page re-runs the real rule table against them
     as the sliders move.
+
+    Hand-rejected photos are left out entirely. The sliders are about thresholds,
+    and offering to add back a photo you deliberately dropped would be noise --
+    worse, it would read as the tuner disagreeing with the pipeline.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     limits = dict(limits or {})
-    assets = _collect(conn, out_path.parent)
+    assets = [a for a in _collect(conn, out_path.parent) if a["id"] not in manual]
 
     # Server-render the initial grouping so the page is meaningful before any
     # interaction, and identical to what the pipeline just did.

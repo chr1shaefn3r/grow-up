@@ -282,3 +282,52 @@ class TestSliderRange:
     def test_constant_data_still_yields_a_usable_track(self):
         spec = review._slider_range([3.0, 3.0], current=3.0, op="gt")
         assert spec["max"] > spec["min"] and spec["step"] > 0
+
+
+class TestTheSeedSurvivesIntoTheDownload:
+    """The contact sheet's download replaces the whole file, so anything already
+    rejected has to be in the set before the user touches anything.
+
+    Without the seed, `select` dropping a rejected photo would leave it with no
+    card, and the next download would silently un-reject it -- destroying
+    curation that only exists because someone looked at every frame.
+    """
+
+    def seeded_page_script(self, ids: list[str], toggle: str | None = None) -> str:
+        """The page's own reject bookkeeping, driven headlessly."""
+        return (
+            "globalThis.document = {\n"
+            f"  getElementById: (id) => id === 'rejected-seed'"
+            f" ? {{textContent: {json.dumps(json.dumps(ids))}}} : null,\n"
+            "  querySelectorAll: () => [],\n"
+            "  addEventListener: () => {},\n"
+            "};\n"
+            "const seed = document.getElementById('rejected-seed');\n"
+            "const rejected = new Set(seed ? JSON.parse(seed.textContent) : []);\n"
+            + (f"rejected.add({json.dumps(toggle)});\n" if toggle else "")
+            + "console.log(JSON.stringify({rejected: [...rejected]}));\n"
+        )
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_existing_rejects_are_in_the_payload_before_any_click(self, tmp_path):
+        script = tmp_path / "seed.mjs"
+        script.write_text(self.seeded_page_script(["a", "b"]), encoding="utf-8")
+        result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+        assert sorted(json.loads(result.stdout)["rejected"]) == ["a", "b"]
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_a_new_rejection_adds_to_them_rather_than_replacing_them(self, tmp_path):
+        script = tmp_path / "seed2.mjs"
+        script.write_text(self.seeded_page_script(["a", "b"], toggle="c"),
+                          encoding="utf-8")
+        result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+        assert sorted(json.loads(result.stdout)["rejected"]) == ["a", "b", "c"]
+
+    def test_the_page_really_reads_that_element(self):
+        """Ties the script above to the shipped JS, so it cannot drift away."""
+        assert "rejected-seed" in review._JS
+        assert "new Set(seed ? JSON.parse(seed.textContent) : [])" in review._JS

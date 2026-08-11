@@ -615,6 +615,10 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     render and an annotated one. Both, deliberately -- a date format or a
     language is a preference, and it should never cost you the clean video.
     """
+    # `select` already excludes these, which is what lets a bucket fall through
+    # to its runner-up. Kept here as well so `grow-up encode` on its own still
+    # honours a freshly edited file -- that path leaves a gap rather than
+    # promoting, because promotion needs `select` and `align` to run again.
     rejects = review.load_manual_rejects(out_dir / "rejects.json")
     rows = conn.execute(
         "SELECT f.asset_id, f.path, a.local_datetime FROM frames f"

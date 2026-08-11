@@ -190,3 +190,70 @@ class TestManualRejects:
         path = tmp_path / "rejects.json"
         path.write_text(json.dumps(["a", "b"]))
         assert review.load_manual_rejects(path) == {"a", "b"}
+
+
+class TestTheContactSheetKeepsYourRejections:
+    """Once `select` honours rejects.json, a rejected photo has no frame row and
+    would vanish from the sheet. The page has to carry it anyway, or the next
+    download -- which replaces the whole file -- silently un-rejects it."""
+
+    def page(self, conn, tmp_path, manual=frozenset()) -> str:
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out, manual)
+        return out.read_text()
+
+    def test_the_seed_carries_the_ids(self, conn, tmp_path):
+        page = self.page(conn, tmp_path, {"gone-1", "gone-2"})
+        assert '<script type="application/json" id="rejected-seed">' in page
+        assert '"gone-1"' in page and '"gone-2"' in page
+
+    def test_the_seed_is_empty_when_nothing_was_rejected(self, conn, tmp_path):
+        assert '"rejected-seed">[]</script>' in self.page(conn, tmp_path)
+
+    def test_a_rejected_photo_gets_a_card_from_its_cached_original(self, conn, tmp_path):
+        add_rejected(conn, "dropped", "manual", tmp_path)
+        page = self.page(conn, tmp_path, {"dropped"})
+
+        assert "Rejected by hand" in page
+        assert 'data-id="dropped"' in page
+        assert "dropped.jpg" in page          # the download, not a warped frame
+
+    def test_that_card_is_pre_marked_and_offers_to_keep_it(self, conn, tmp_path):
+        add_rejected(conn, "dropped", "manual", tmp_path)
+        page = self.page(conn, tmp_path, {"dropped"})
+
+        assert '<figure class="rejected" data-id="dropped"' in page
+        assert ">keep</button>" in page
+
+    def test_no_section_appears_when_nothing_was_rejected(self, conn, tmp_path):
+        add_rejected(conn, "dropped", "blurry", tmp_path)
+        assert "Rejected by hand" not in self.page(conn, tmp_path)
+
+    def test_the_accepted_frames_are_still_listed(self, conn, tmp_path):
+        add_rejected(conn, "dropped", "manual", tmp_path)
+        page = self.page(conn, tmp_path, {"dropped"})
+        assert page.count('data-id="asset-') == 3
+
+    def test_the_return_count_is_still_the_accepted_frames(self, conn, tmp_path):
+        add_rejected(conn, "dropped", "manual", tmp_path)
+        out = tmp_path / "out" / "contact-sheet.html"
+        assert review.write_contact_sheet(conn, out, {"dropped"}) == 3
+
+
+class TestTheTunerIgnoresHandRejections:
+    def test_a_hand_rejected_photo_is_not_offered_back(self, conn, tmp_path):
+        """The sliders are about thresholds. Proposing to add a photo you
+        deliberately dropped would read as the tuner disagreeing with the
+        pipeline, which is the one thing it must never do."""
+        add_rejected(conn, "dropped", "blurry", tmp_path)
+        out = tmp_path / "out" / "rejects.html"
+
+        review.write_rejects_gallery(conn, out, manual={"dropped"})
+        assert 'data-id="dropped"' not in out.read_text()
+
+    def test_it_still_appears_when_not_hand_rejected(self, conn, tmp_path):
+        add_rejected(conn, "dropped", "blurry", tmp_path)
+        out = tmp_path / "out" / "rejects.html"
+
+        review.write_rejects_gallery(conn, out)
+        assert "dropped" in out.read_text()

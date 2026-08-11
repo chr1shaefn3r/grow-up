@@ -343,6 +343,19 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     cmd_select(args)
 
 
+def _manual_rejects(cfg: config.Config) -> set[str]:
+    """What the contact sheet dropped by hand, if the config says where to look.
+
+    A config without `paths.out` never needed one before `select` started
+    reading this file, and must not begin failing there now.
+    """
+    try:
+        out_dir = cfg.path("out")
+    except KeyError:
+        return set()
+    return review.load_manual_rejects(out_dir / "rejects.json")
+
+
 def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tuple[int, int, int]:
     """Apply thresholds, pick frames, and report the filter outcome.
 
@@ -352,8 +365,13 @@ def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tupl
 
     Returns (kept, scored, frames).
     """
-    kept, scored = select.apply_filters(conn, cfg.section("filter"), cfg.section("score"))
+    manual = _manual_rejects(cfg)
+    kept, scored = select.apply_filters(conn, cfg.section("filter"), cfg.section("score"),
+                                        manual)
     log(f"  select: {kept}/{scored} pass the hard filters")
+    if manual:
+        log(f"  select: {len(manual)} rejected by hand in rejects.json; "
+            "buckets fall through to the next best")
 
     cadence = cadence or str(cfg.get("select", "cadence", "week"))
     per_bucket = int(cfg.get("select", "per_bucket", 1))
@@ -378,9 +396,10 @@ def cmd_align(args: argparse.Namespace) -> None:
 def cmd_review(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
     out_dir = cfg.path("out")
-    accepted = review.write_contact_sheet(conn, out_dir / "contact-sheet.html")
+    manual = _manual_rejects(cfg)
+    accepted = review.write_contact_sheet(conn, out_dir / "contact-sheet.html", manual)
     rejected = review.write_rejects_gallery(conn, out_dir / "rejects.html",
-                                            limits=cfg.section("filter"))
+                                            limits=cfg.section("filter"), manual=manual)
     log(f"  contact sheet: {accepted} frames -> {out_dir / 'contact-sheet.html'}")
     log(f"  rejects gallery: {rejected} samples -> {out_dir / 'rejects.html'}")
 

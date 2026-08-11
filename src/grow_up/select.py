@@ -45,11 +45,25 @@ def bucket_key(when: datetime | date, cadence: str) -> str:
     raise ValueError(f"unknown cadence {cadence!r}; expected one of {CADENCES}")
 
 
-def apply_filters(conn: sqlite3.Connection, limits: dict, weights: dict) -> tuple[int, int]:
+MANUAL = "manual"
+
+
+def apply_filters(conn: sqlite3.Connection, limits: dict, weights: dict,
+                  manual: frozenset[str] | set[str] = frozenset()) -> tuple[int, int]:
     """Re-evaluate hard filters and scores from stored metrics.
 
     Runs entirely off the manifest -- no image decoding, no inference -- so
     threshold tuning is a sub-second loop rather than a re-analysis.
+
+    `manual` is what the contact sheet dropped by hand. Applying it here rather
+    than at encode time is what lets the runner-up take the bucket: `select_frames`
+    picks the best photo that still has no reject reason, so removing one simply
+    hands the week to the next best instead of deleting the week.
+
+    A hard reason wins over `manual`, so a blurry photo you also rejected still
+    counts as blurry. That keeps the tuner's numbers meaning what they say, and
+    leaves `manual` counting the useful quantity: photos you dropped that the
+    filters would have kept.
     """
     from .metrics import FaceMetrics, composite_score, hard_reject
 
@@ -62,6 +76,8 @@ def apply_filters(conn: sqlite3.Connection, limits: dict, weights: dict) -> tupl
                 if k in FaceMetrics.__dataclass_fields__}
         m = FaceMetrics(**data)
         m.reject_reason = hard_reject(m, limits)
+        if m.reject_reason is None and row["asset_id"] in manual:
+            m.reject_reason = MANUAL
         m.score = None if m.reject_reason else composite_score(m, limits, weights)
         kept += int(m.reject_reason is None)
         updates.append((m.reject_reason, m.score, stamp, row["asset_id"]))

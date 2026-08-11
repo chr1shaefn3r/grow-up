@@ -97,6 +97,7 @@ because every metric is stored per asset:
 | What you changed | What to re-run | Cost |
 |---|---|---|
 | `[filter]` thresholds, `[score]` weights, `[select]` cadence | `grow-up select` | sub-second |
+| a rejection in `rejects.json` | `grow-up select && grow-up align && grow-up encode` | a warp pass |
 | `[align]` framing, `[output]` size | `grow-up align && grow-up encode` | a warp pass |
 | `analyze.effort` | `grow-up analyze --reanalyze` | a full re-analysis |
 
@@ -411,8 +412,26 @@ lacks.
 ### Manual review
 
 Landmarks cannot catch sunglasses, a hand over the face, or someone else mistagged as
-the subject. `out/contact-sheet.html` shows the aligned frames in order; click to reject, save
-`rejects.json` next to it, and re-run `grow-up encode`.
+the subject. `out/contact-sheet.html` shows the aligned frames in order; click to reject,
+save `rejects.json` next to it, then:
+
+```bash
+grow-up select && grow-up align && grow-up encode
+```
+
+**A rejection hands the bucket to its runner-up rather than deleting it.** Reject the
+photo that won a week and the second-best photo of that week takes its place, so the
+timeline keeps its shape. That is why `select` has to run and not just `encode` — only
+`select` can reconsider the bucket. Reject *every* candidate and the bucket does
+disappear, which is presumably what you meant.
+
+The page opens with your existing rejections already marked, and shows them in a strip
+below the accepted frames; click one to keep it again. That seeding matters: the download
+replaces the whole file, so without it a second visit would quietly discard everything
+you decided on the first.
+
+`rejects.json` is the one thing in `out/` that cannot be regenerated — it exists only
+because you looked at every frame. Worth keeping if you ever clear that directory.
 
 ## How it works
 
@@ -534,7 +553,8 @@ suppressed by default. `-v/--verbose` (or `analyze.verbose` in `config.toml`) br
 back when the model itself is what needs diagnosing.
 
 Budget disk for the cache: a few thousand originals at ~4 MB each runs to several GB.
-Of the directories in `[paths]`, only the database is irreplaceable — `frames` is
+Of the directories in `[paths]`, the database is irreplaceable and so is
+`out/rejects.json` if you have curated one — everything else is derived. `frames` is
 rewritten by every `align`, and `cache` costs only re-downloading.
 
 ## Notes on the output
