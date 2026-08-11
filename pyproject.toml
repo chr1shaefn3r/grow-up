@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grow-up"
-version = "1.1.0"
+version = "1.2.0"
 description = "Build an eye-aligned face timelapse from photos of one person in an Immich library"
 requires-python = ">=3.11"
 dependencies = [
