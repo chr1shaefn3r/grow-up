@@ -13,7 +13,7 @@ import json
 import httpx
 import pytest
 
-from grow_up import pipeline
+from grow_up import cli, pipeline
 from grow_up.config import Credentials
 from grow_up.immich import (
     ANY,
@@ -166,6 +166,77 @@ class TestPermissionPreflight:
                                              "permissions": ["all"]})
 
         assert run(client_with(handler).my_permissions()) == {"all"}
+
+
+def key_with(*permissions: str):
+    """A transport where ping succeeds and the key holds exactly these scopes."""
+    def handler(request):
+        if request.url.path.endswith("/server/ping"):
+            return httpx.Response(200, json={"res": "pong"})
+        return httpx.Response(200, json={"id": "x", "name": "k",
+                                         "permissions": list(permissions)})
+    return handler
+
+
+class TestWhatPreflightSays:
+    """A healthy preflight must stay silent, and an unhealthy one must name the key.
+
+    Both were found by a real two-account run: `preflight_all` printed a heading
+    per source for output that, on good keys, never came -- and the message for a
+    missing required permission said "this Immich API key" without saying which.
+    """
+
+    @pytest.fixture()
+    def said(self, monkeypatch):
+        lines: list[str] = []
+        monkeypatch.setattr(cli, "log", lines.append)
+        return lines
+
+    def test_a_healthy_key_says_nothing_at_all(self, said):
+        """The root of the empty-heading bug: there is nothing to head."""
+        run(cli.preflight(client_with(key_with("all"))))
+        assert said == []
+
+    def test_a_healthy_key_says_nothing_when_named_either(self, said):
+        run(cli.preflight(client_with(key_with("all")), " for source 'her'"))
+        assert said == []
+
+    def test_a_missing_optional_permission_is_a_note(self, said):
+        run(cli.preflight(client_with(key_with(*REQUIRED_PERMISSIONS))))
+        assert len(said) == 1
+        assert "person.statistics" in said[0]
+
+    def test_that_note_names_the_account(self, said):
+        run(cli.preflight(client_with(key_with(*REQUIRED_PERMISSIONS)),
+                          " for source 'her'"))
+        assert "'her'" in said[0]
+
+    def test_a_missing_required_permission_names_the_account(self):
+        granted = set(REQUIRED_PERMISSIONS) - {"asset.download"}
+        with pytest.raises(RuntimeError, match="for source 'her'"):
+            run(cli.preflight(client_with(key_with(*granted)), " for source 'her'"))
+
+    def test_an_unreadable_key_names_the_account(self, said):
+        def handler(request):
+            if request.url.path.endswith("/server/ping"):
+                return httpx.Response(200, json={"res": "pong"})
+            return httpx.Response(403, json={"message": "nope"})
+
+        assert run(cli.preflight(client_with(handler), " for source 'her'")) == set()
+        assert "'her'" in said[0] and "403" in said[0]
+
+    def test_one_account_keeps_the_wording_it_always_had(self, said):
+        """Pinned: a single-account run's strings must not drift."""
+        granted = set(REQUIRED_PERMISSIONS) - {"asset.download"}
+        with pytest.raises(RuntimeError) as caught:
+            run(cli.preflight(client_with(key_with(*granted))))
+        assert str(caught.value).startswith(
+            "this Immich API key is missing required permission(s):")
+
+        # Only the wording up to the reason: the reason itself lives in
+        # OPTIONAL_PERMISSIONS and duplicating it here would pin the wrong thing.
+        run(cli.preflight(client_with(key_with(*REQUIRED_PERMISSIONS))))
+        assert said[0].startswith("  note: the key lacks 'person.statistics', so ")
 
 
 class TestProbe:

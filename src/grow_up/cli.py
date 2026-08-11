@@ -93,39 +93,47 @@ async def preflight_all(cfg: config.Config, sources: list[config.Source]) -> Non
     account download a gigabyte before a typo in the second key surfaced. One
     failure aborts the run, because a video quietly missing one account's photos
     looks entirely fine.
+
+    Prints nothing of its own. A healthy preflight has always been silent, so a
+    per-source heading here labelled output that never arrived.
     """
     for source in sources:
-        if len(sources) > 1:
-            log(f"  source {source.name}:")
+        whose = f" for source {source.name!r}" if len(sources) > 1 else ""
         async with _client(cfg, source) as client:
-            await preflight(client)
+            await preflight(client, whose)
 
 
-async def preflight(client: ImmichClient) -> set[str]:
+async def preflight(client: ImmichClient, whose: str = "") -> set[str]:
     """Check connectivity and the key's scopes before doing any real work.
 
     `/api-keys/me` needs no permission, so this answers "is it the key?"
     definitively in one request rather than after hundreds of failures.
+
+    `whose` names the account in every message this can emit. With two keys
+    configured, "the key lacks person.statistics" does not say which one to go
+    and fix -- worst of all on the raising path, where being sent to the wrong
+    account costs the most.
     """
     await client.ping()
     try:
         granted = await client.my_permissions()
     except ImmichHTTPError as exc:
-        log(f"  ! could not read the key's permissions ({exc.status}); continuing")
+        log(f"  ! could not read the permissions of the key{whose} "
+            f"({exc.status}); continuing")
         return set()
 
     missing = missing_permissions(granted, REQUIRED_PERMISSIONS)
     if missing:
         detail = "\n".join(f"    {name}  ({REQUIRED_PERMISSIONS[name]})" for name in missing)
         raise RuntimeError(
-            "this Immich API key is missing required permission(s):\n"
+            f"this Immich API key{whose} is missing required permission(s):\n"
             f"{detail}\n"
             "  Add them in Immich under Account Settings -> API Keys."
         )
 
     for name, why in OPTIONAL_PERMISSIONS.items():
         if "all" not in granted and name not in granted:
-            log(f"  note: key lacks {name!r}, so grow-up cannot {why}")
+            log(f"  note: the key{whose} lacks {name!r}, so grow-up cannot {why}")
     return granted
 
 
