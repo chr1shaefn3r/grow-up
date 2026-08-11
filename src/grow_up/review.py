@@ -97,6 +97,19 @@ figure.removed::after { content:"would be dropped"; position:absolute; top:8px; 
   background:var(--bad); color:#fff; font-size:10px; padding:2px 6px; border-radius:4px; }
 .empty { color:var(--muted); font-style:italic; padding:6px 0; }
 
+/* Runner-ups for a bucket. Shown small: they exist to answer "what takes over if
+   I drop this one", which a thumbnail settles, and the card promotes one to full
+   size the moment you reject the pick. */
+.alts { display:flex; gap:6px; padding:0 9px 9px; flex-wrap:wrap; }
+.alt { padding:0; border-radius:6px; overflow:hidden; width:64px; line-height:0;
+       border:1px solid var(--line); background:none; cursor:pointer; }
+.alt img { width:100%; height:auto; cursor:pointer; }
+.alt.gone { opacity:.3; border-color:var(--bad); }
+.alt.now { border-color:var(--good); border-width:2px; }
+figure .rank { font-variant-numeric:tabular-nums; }
+figure.exhausted { outline:2px solid var(--bad); }
+figure.exhausted img { opacity:.35; }
+
 /* Full-size viewer. Every frame is the same size, so stepping through with the
    arrow keys holds the image still and turns the sequence into a flipbook --
    which is the only practical way to see alignment jitter. */
@@ -129,20 +142,62 @@ let current = -1;
 
 function allFigures() { return [...document.querySelectorAll('figure[data-id]')]; }
 
-function toggle(fig) {
-  const id = fig.dataset.id;
+function toggleId(id) {
   if (rejected.has(id)) { rejected.delete(id); } else { rejected.add(id); }
   syncRejected();
   if (current >= 0) { paintViewer(); }
   render();
 }
 
+function toggle(fig) { toggleId(fig.dataset.id); }
+
+// Each bucket's candidates, best first. Rejecting the current pick shows the
+// next one immediately, so the grid always reflects the video the pipeline would
+// produce -- otherwise judging a replacement costs a full re-run per rejection.
+const bucketsEl = document.getElementById('buckets');
+const BUCKETS = bucketsEl ? JSON.parse(bucketsEl.textContent) : [];
+const byBucket = new Map(BUCKETS.map(b => [b.bucket, b.candidates]));
+
+function promoteBuckets() {
+  document.querySelectorAll('figure[data-bucket]').forEach(fig => {
+    const candidates = byBucket.get(fig.dataset.bucket) || [];
+    const index = candidates.findIndex(c => !rejected.has(c.id));
+    const pick = index < 0 ? candidates[0] : candidates[index];
+    if (!pick) { return; }
+
+    fig.dataset.id = pick.id;
+    fig.dataset.label = pick.date + '  #' + pick.seq;
+    const img = fig.querySelector('img');
+    if (img.getAttribute('src') !== pick.src) { img.setAttribute('src', pick.src); }
+    const when = fig.querySelector('.when');
+    if (when) { when.textContent = pick.date; }
+
+    const rank = fig.querySelector('.rank');
+    if (rank) {
+      rank.textContent = index < 0 ? 'bucket empty'
+        : index > 0 ? 'promoted #' + (index + 1) : '#' + pick.seq;
+    }
+    fig.classList.toggle('exhausted', index < 0);
+
+    // Dim an alternate that is itself rejected, so the tray shows what is left.
+    fig.querySelectorAll('.alt').forEach(alt => {
+      alt.classList.toggle('gone', rejected.has(alt.dataset.alt));
+      alt.classList.toggle('now', alt.dataset.alt === pick.id);
+    });
+  });
+}
+
 function syncRejected() {
+  promoteBuckets();
   allFigures().forEach(fig => {
-    const on = rejected.has(fig.dataset.id);
+    // A bucket card shows whichever candidate survives, so it is only "rejected"
+    // when every one of them is.
+    const candidates = byBucket.get(fig.dataset.bucket);
+    const on = candidates ? candidates.every(c => rejected.has(c.id))
+                          : rejected.has(fig.dataset.id);
     fig.classList.toggle('rejected', on);
     const btn = fig.querySelector('figcaption button');
-    if (btn) { btn.textContent = on ? 'keep' : 'reject'; }
+    if (btn) { btn.textContent = rejected.has(fig.dataset.id) ? 'keep' : 'reject'; }
   });
 }
 
@@ -172,6 +227,11 @@ function openAt(index) {
 function closeViewer() { viewer.hidden = true; current = -1; }
 
 document.addEventListener('click', ev => {
+  // A thumbnail in the tray toggles that candidate, not the card's current pick,
+  // so a runner-up you can already see is bad can be dropped in the same pass.
+  const alt = ev.target.closest && ev.target.closest('.alt');
+  if (alt) { ev.stopPropagation(); toggleId(alt.dataset.alt); return; }
+
   const fig = ev.target.closest && ev.target.closest('figure[data-id]');
   if (!fig) { return; }
   if (ev.target.tagName === 'BUTTON') { ev.stopPropagation(); toggle(fig); return; }
@@ -404,6 +464,35 @@ def _card(asset_id: str, path: str, when: str, label: str, base: Path,
     )
 
 
+def _bucket_card(bucket: str, candidates: list[dict]) -> str:
+    """One bucket: its current pick, with the runner-ups beneath it.
+
+    Everything mutable is left to the page. The server renders the top candidate
+    so the sheet is meaningful before any interaction, and the JS repaints from
+    the same list as rejections come and go.
+    """
+    top = candidates[0]
+    label = f"{top['date']}  #{top['seq']}"
+    spares = "".join(
+        f'<button type="button" class="alt" data-alt="{html.escape(spare["id"])}" '
+        f'title="{html.escape(spare["date"])}">'
+        f'<img loading="lazy" src="{spare["src"]}" alt="">'
+        f'</button>'
+        for spare in candidates[1:]
+    )
+    tray = f'<div class="alts" data-count="{len(candidates) - 1}">{spares}</div>' if spares else ""
+    return (
+        f'<figure data-bucket="{html.escape(bucket)}" '
+        f'data-id="{html.escape(top["id"])}" '
+        f'data-label="{html.escape(label)}">'
+        f'<img loading="lazy" src="{top["src"]}" alt="">'
+        f'<figcaption><span class="when">{html.escape(top["date"])}</span>'
+        f'<button type="button">reject</button>'
+        f'<span class="rank"></span></figcaption>'
+        f"{tray}</figure>"
+    )
+
+
 def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
                         manual: frozenset[str] | set[str] = frozenset()) -> int:
     """Accepted frames in date order, click to toggle rejection.
@@ -416,18 +505,34 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
     out_path.parent.mkdir(parents=True, exist_ok=True)
     base = out_path.parent
     rows = conn.execute(
-        "SELECT f.asset_id, f.path, f.seq, a.local_datetime, s.bucket"
+        "SELECT f.asset_id, f.path, f.seq, a.local_datetime, s.bucket, s.rank,"
+        "       s.alternate"
         "  FROM frames f"
         "  JOIN assets a ON a.id = f.asset_id"
         "  JOIN selection s ON s.asset_id = f.asset_id"
         " ORDER BY f.seq ASC"
     ).fetchall()
 
-    cards = [
-        _card(row["asset_id"], row["path"], (row["local_datetime"] or "")[:10],
-              f"{(row['local_datetime'] or '')[:10]}  #{row['seq']}", base)
-        for row in rows
-    ]
+    # One entry per bucket, its candidates best first. The page walks this list
+    # when you reject, so the grid always shows the video as it would be -- which
+    # is the whole point: judging a replacement used to cost a full re-run.
+    order: list[str] = []
+    buckets: dict[str, list[dict]] = {}
+    for row in sorted(rows, key=lambda r: (r["bucket"], r["rank"])):
+        if row["bucket"] not in buckets:
+            buckets[row["bucket"]] = []
+            order.append(row["bucket"])
+        buckets[row["bucket"]].append({
+            "id": row["asset_id"],
+            "src": _rel(row["path"], base),
+            "date": (row["local_datetime"] or "")[:10],
+            "seq": row["seq"],
+            "rank": row["rank"],
+        })
+    order.sort(key=lambda b: buckets[b][0]["seq"])
+
+    cards = [_bucket_card(bucket, buckets[bucket]) for bucket in order]
+    picks = [c[0] for c in buckets.values()]
 
     # No warped frame exists for a rejected photo -- select excluded it, so align
     # never touched it -- so these show the cached original instead.
@@ -444,7 +549,10 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
     ]
 
     seed = (f'<script type="application/json" id="rejected-seed">'
-            f'{json.dumps(sorted(manual))}</script>\n')
+            f'{json.dumps(sorted(manual))}</script>\n'
+            f'<script type="application/json" id="buckets">'
+            f'{json.dumps([{"bucket": b, "candidates": buckets[b]} for b in order])}'
+            f'</script>\n')
     aside = ""
     if rejected_cards:
         aside = (
@@ -479,7 +587,7 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
         "else mistagged as the subject."
     )
     out_path.write_text(_page("grow-up — accepted frames", lede, body, _JS), encoding="utf-8")
-    return len(rows)
+    return len(picks)
 
 
 def _slider_range(values: list[float], current: float, op: str) -> dict:

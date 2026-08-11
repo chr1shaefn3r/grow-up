@@ -331,3 +331,67 @@ class TestTheSeedSurvivesIntoTheDownload:
         """Ties the script above to the shipped JS, so it cannot drift away."""
         assert "rejected-seed" in review._JS
         assert "new Set(seed ? JSON.parse(seed.textContent) : [])" in review._JS
+
+
+class TestThePagePromotesTheRunnerUp:
+    """The whole point: reject a pick and see its replacement without a re-run.
+
+    Driven under node against the shipped logic, because "the grid stops matching
+    what the pipeline would produce" is a silent failure -- the page would look
+    fine and simply be lying about the video.
+    """
+
+    CANDIDATES = [
+        {"id": "best", "src": "a.jpg", "date": "2026-03-02", "seq": 1, "rank": 0},
+        {"id": "second", "src": "b.jpg", "date": "2026-03-03", "seq": 2, "rank": 1},
+        {"id": "third", "src": "c.jpg", "date": "2026-03-04", "seq": 3, "rank": 2},
+    ]
+
+    def promote_under_node(self, tmp_path, rejected: list[str]) -> dict:
+        """Runs the page's own promotion rule and reports what the card shows."""
+        script = tmp_path / "promote.mjs"
+        script.write_text(
+            f"const candidates = {json.dumps(self.CANDIDATES)};\n"
+            f"const rejected = new Set({json.dumps(rejected)});\n"
+            # The rule as written in review._JS.
+            "const index = candidates.findIndex(c => !rejected.has(c.id));\n"
+            "const pick = index < 0 ? candidates[0] : candidates[index];\n"
+            "const rank = index < 0 ? 'bucket empty'\n"
+            "  : index > 0 ? 'promoted #' + (index + 1) : '#' + pick.seq;\n"
+            "console.log(JSON.stringify({shown: pick.id, label: rank,"
+            " exhausted: index < 0}));\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_nothing_rejected_shows_the_best(self, tmp_path):
+        assert self.promote_under_node(tmp_path, [])["shown"] == "best"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_rejecting_the_pick_shows_the_second(self, tmp_path):
+        result = self.promote_under_node(tmp_path, ["best"])
+        assert result["shown"] == "second"
+        assert result["label"] == "promoted #2"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_rejecting_two_shows_the_third(self, tmp_path):
+        assert self.promote_under_node(tmp_path, ["best", "second"])["shown"] == "third"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_rejecting_all_of_them_says_the_bucket_is_empty(self, tmp_path):
+        result = self.promote_under_node(tmp_path, ["best", "second", "third"])
+        assert result["exhausted"] is True
+        assert result["label"] == "bucket empty"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_rejecting_out_of_order_still_picks_the_best_survivor(self, tmp_path):
+        """Dropping a runner-up you can see is bad must not disturb the pick."""
+        assert self.promote_under_node(tmp_path, ["second"])["shown"] == "best"
+
+    def test_the_shipped_page_uses_this_rule(self):
+        """Ties the script above to review._JS, so the two cannot drift apart."""
+        assert "candidates.findIndex(c => !rejected.has(c.id))" in review._JS
+        assert "'promoted #' + (index + 1)" in review._JS

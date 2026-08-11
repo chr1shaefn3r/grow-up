@@ -89,8 +89,16 @@ def apply_filters(conn: sqlite3.Connection, limits: dict, weights: dict,
     return kept, len(rows)
 
 
-def select_frames(conn: sqlite3.Connection, cadence: str, per_bucket: int) -> int:
-    """Pick the top-scoring frames per time bucket into the `selection` table."""
+def select_frames(conn: sqlite3.Connection, cadence: str, per_bucket: int,
+                  alternates: int = 0) -> int:
+    """Pick the top-scoring frames per time bucket into the `selection` table.
+
+    Returns how many will be *encoded*. Beyond those, `alternates` runner-ups per
+    bucket are recorded with `alternate = 1`: they get warped so the contact
+    sheet can show what would take over if you reject the pick, and they are
+    excluded from the video. Judging a replacement means seeing it aligned, and
+    the alternative is a re-run per rejection.
+    """
     if cadence not in CADENCES:
         raise ValueError(f"unknown cadence {cadence!r}; expected one of {CADENCES}")
 
@@ -101,8 +109,9 @@ def select_frames(conn: sqlite3.Connection, cadence: str, per_bucket: int) -> in
         " ORDER BY m.score DESC"
     ).fetchall()
 
+    depth = per_bucket + max(0, alternates)
     buckets: dict[str, int] = {}
-    chosen: list[tuple[str, str, int, str]] = []
+    chosen: list[tuple[str, str, int, int, str]] = []
     stamp = iso_z(now_utc())
     for row in rows:
         when = parse_when(row["local_datetime"])
@@ -110,25 +119,26 @@ def select_frames(conn: sqlite3.Connection, cadence: str, per_bucket: int) -> in
             continue
         key = bucket_key(when, cadence)
         rank = buckets.get(key, 0)
-        if rank >= per_bucket:
+        if rank >= depth:
             continue
         buckets[key] = rank + 1
-        chosen.append((row["asset_id"], key, rank, stamp))
+        chosen.append((row["asset_id"], key, rank, int(rank >= per_bucket), stamp))
 
     with conn:
         conn.execute("BEGIN")
         conn.execute("DELETE FROM selection")
         conn.executemany(
-            "INSERT INTO selection (asset_id, bucket, rank, selected_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO selection (asset_id, bucket, rank, alternate, selected_at)"
+            " VALUES (?, ?, ?, ?, ?)",
             chosen,
         )
-    return len(chosen)
+    return sum(1 for row in chosen if not row[3])
 
 
 def selected_in_order(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Selected frames in chronological order -- the order they appear in the video."""
     return conn.execute(
-        "SELECT s.asset_id, s.bucket, a.local_datetime, d.path,"
+        "SELECT s.asset_id, s.bucket, s.rank, s.alternate, a.local_datetime, d.path,"
         "       m.left_eye_x, m.left_eye_y, m.right_eye_x, m.right_eye_y, m.score,"
         "       m.span_w, m.span_up, m.span_down"
         "  FROM selection s"

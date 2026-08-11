@@ -256,3 +256,59 @@ class TestHowAManualRejectIsReported:
         add(conn, "a", "2026-03-02T10:00:00")
         select.apply_filters(conn, LIMITS, WEIGHTS, {"a"})
         assert conn.execute("SELECT score FROM metrics").fetchone()["score"] is None
+
+
+class TestAlternatesAreKeptButNotEncoded:
+    """Runner-ups are warped so the contact sheet can show what a rejection
+    would promote. They are candidates, not frames: one reaching the video would
+    duplicate a week without ever looking wrong."""
+
+    def bucket(self, conn) -> None:
+        add(conn, "best", "2026-03-02T10:00:00", sharpness=400.0)
+        add(conn, "second", "2026-03-03T10:00:00", sharpness=200.0)
+        add(conn, "third", "2026-03-04T10:00:00", sharpness=100.0)
+        add(conn, "fourth", "2026-03-05T10:00:00", sharpness=50.0)
+        select.apply_filters(conn, LIMITS, WEIGHTS)
+
+    def rows(self, conn):
+        return conn.execute(
+            "SELECT asset_id, rank, alternate FROM selection ORDER BY rank").fetchall()
+
+    def test_none_are_kept_by_default(self, conn):
+        """A config that never heard of alternates behaves as it always did."""
+        self.bucket(conn)
+        select.select_frames(conn, "week", 1)
+        assert [r["asset_id"] for r in self.rows(conn)] == ["best"]
+
+    def test_they_are_stored_in_score_order(self, conn):
+        self.bucket(conn)
+        select.select_frames(conn, "week", 1, alternates=2)
+        assert [(r["asset_id"], r["alternate"]) for r in self.rows(conn)] == [
+            ("best", 0), ("second", 1), ("third", 1)]
+
+    def test_the_return_value_counts_only_what_gets_encoded(self, conn):
+        """It feeds the trial's projection, which must not count runner-ups."""
+        self.bucket(conn)
+        assert select.select_frames(conn, "week", 1, alternates=2) == 1
+
+    def test_per_bucket_decides_which_are_spare(self, conn):
+        self.bucket(conn)
+        select.select_frames(conn, "week", 2, alternates=1)
+        assert [(r["asset_id"], r["alternate"]) for r in self.rows(conn)] == [
+            ("best", 0), ("second", 0), ("third", 1)]
+
+    def test_asking_for_more_than_exist_is_not_an_error(self, conn):
+        self.bucket(conn)
+        assert select.select_frames(conn, "week", 1, alternates=99) == 1
+        assert len(self.rows(conn)) == 4
+
+    def test_a_rejected_pick_promotes_an_alternate_into_the_video(self, conn):
+        """The two features meeting: the runner-up was already warped, so this
+        costs no second pass."""
+        self.bucket(conn)
+        select.apply_filters(conn, LIMITS, WEIGHTS, {"best"})
+        select.select_frames(conn, "week", 1, alternates=2)
+
+        rows = self.rows(conn)
+        assert [(r["asset_id"], r["alternate"]) for r in rows] == [
+            ("second", 0), ("third", 1), ("fourth", 1)]

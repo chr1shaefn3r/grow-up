@@ -419,11 +419,21 @@ save `rejects.json` next to it, then:
 grow-up select && grow-up align && grow-up encode
 ```
 
-**A rejection hands the bucket to its runner-up rather than deleting it.** Reject the
-photo that won a week and the second-best photo of that week takes its place, so the
-timeline keeps its shape. That is why `select` has to run and not just `encode` — only
-`select` can reconsider the bucket. Reject *every* candidate and the bucket does
-disappear, which is presumably what you meant.
+**A rejection hands the bucket to its runner-up rather than deleting it, and the page
+shows you that happening.** Each card carries its bucket's next two candidates as
+thumbnails; reject the pick and the card immediately promotes the next one, labelled
+`promoted #2`. So the grid always shows the video as it would be, and you can settle a
+whole pass of rejections before downloading anything — rather than re-running to find out
+the replacement was no good either. Reject *every* candidate and the card says
+`bucket empty`, which is presumably what you meant.
+
+Clicking a thumbnail rejects that runner-up directly, so a bad alternate you can already
+see goes in the same pass.
+
+`[select] alternates` sets how many are prepared (default 2, `0` to switch it off). They
+are warped so you can judge them aligned, which is the only way to judge them — the cost
+is roughly proportional in `align` time and in the frames directory. They never enter the
+video.
 
 The page opens with your existing rejections already marked, and shows them in a strip
 below the accepted frames; click one to keep it again. That seeding matters: the download

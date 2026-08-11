@@ -149,6 +149,12 @@ cadence = "week"
 # busier weeks, which is usually not what a timelapse wants -- widen the cadence
 # instead if the result is too short.
 per_bucket = 1
+# Runner-ups per bucket to warp alongside the pick. They never enter the video;
+# they let out/contact-sheet.html show what would take over if you reject the
+# pick, so a rejection is decided in the page instead of costing a re-run to see
+# the replacement. Costs align time and frames-directory space roughly in
+# proportion -- 2 means three warps per bucket. Set 0 to turn it off.
+alternates = 2
 
 [output]
 # Frame size in pixels, and therefore the video resolution. The ratio matters as

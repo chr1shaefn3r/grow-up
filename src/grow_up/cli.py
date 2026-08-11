@@ -375,8 +375,14 @@ def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tupl
 
     cadence = cadence or str(cfg.get("select", "cadence", "week"))
     per_bucket = int(cfg.get("select", "per_bucket", 1))
-    frames = select.select_frames(conn, cadence, per_bucket)
+    alternates = int(cfg.get("select", "alternates", 2))
+    frames = select.select_frames(conn, cadence, per_bucket, alternates)
     log(f"  select: {frames} frames (cadence={cadence}, {per_bucket} per bucket)")
+    if alternates:
+        spare = conn.execute(
+            "SELECT count(*) FROM selection WHERE alternate = 1").fetchone()[0]
+        log(f"  select: {spare} runner-ups warped alongside them, so the contact "
+            "sheet can show what a rejection would promote")
     pipeline.report_rejects(conn, log)
     return kept, scored, frames
 

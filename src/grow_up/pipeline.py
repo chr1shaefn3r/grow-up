@@ -620,9 +620,14 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     # honours a freshly edited file -- that path leaves a gap rather than
     # promoting, because promotion needs `select` and `align` to run again.
     rejects = review.load_manual_rejects(out_dir / "rejects.json")
+    # `align` warps the runner-ups too, so the contact sheet can show what a
+    # rejection would promote. They have frames rows like any other, and the
+    # join to selection is the only thing keeping them out of the video.
     rows = conn.execute(
         "SELECT f.asset_id, f.path, a.local_datetime FROM frames f"
-        "  JOIN assets a ON a.id = f.asset_id ORDER BY f.seq ASC").fetchall()
+        "  JOIN assets a ON a.id = f.asset_id"
+        "  JOIN selection s ON s.asset_id = f.asset_id"
+        " WHERE s.alternate = 0 ORDER BY f.seq ASC").fetchall()
     kept = [r for r in rows if r["asset_id"] not in rejects]
     frames = [Path(r["path"]) for r in kept]
 

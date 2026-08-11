@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS selection (
     asset_id    TEXT PRIMARY KEY REFERENCES assets (id) ON DELETE CASCADE,
     bucket      TEXT NOT NULL,
     rank        INTEGER NOT NULL,
+    alternate   INTEGER NOT NULL DEFAULT 0,  -- a runner-up: warped so the contact
+                                             -- sheet can show it, never encoded
     selected_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS selection_bucket ON selection (bucket);
@@ -176,6 +178,7 @@ ADDED_COLUMNS = {
     "metrics": (("span_w", "REAL"), ("span_up", "REAL"), ("span_down", "REAL"),
                 ("filtered_at", "TEXT")),
     "assets": (("source", "TEXT"),),
+    "selection": (("alternate", "INTEGER NOT NULL DEFAULT 0"),),
 }
 
 

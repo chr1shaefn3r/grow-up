@@ -23,6 +23,17 @@ def conn(tmp_path):
     return conn
 
 
+def add_alternate(conn, bucket: str, asset_id: str, rank: int, tmp_path) -> None:
+    """A warped runner-up: a frames row like any other, flagged in selection."""
+    stamp = "2026-01-01T00:00:00.000Z"
+    conn.execute("INSERT INTO assets (id, local_datetime, indexed_at) VALUES (?, ?, ?)",
+                 (asset_id, f"{bucket}-15T10:00:00.000Z", stamp))
+    conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate, selected_at)"
+                 " VALUES (?, ?, ?, 1, ?)", (asset_id, bucket, rank, stamp))
+    conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at) VALUES (?, ?, ?, ?)",
+                 (asset_id, str(tmp_path / "frames" / f"{asset_id}.jpg"), 90 + rank, stamp))
+
+
 def add_rejected(conn, asset_id: str, reason: str, tmp_path) -> None:
     stamp = "2026-01-01T00:00:00.000Z"
     conn.execute("INSERT INTO assets (id, local_datetime, indexed_at) VALUES (?, ?, ?)",
@@ -257,3 +268,47 @@ class TestTheTunerIgnoresHandRejections:
 
         review.write_rejects_gallery(conn, out)
         assert "dropped" in out.read_text()
+
+
+class TestTheSheetCarriesTheRunnerUps:
+    """Rejecting a pick used to mean a full re-run just to see its replacement.
+
+    The alternates are already warped, so the page can show what would take over
+    and the whole decision happens in one pass.
+    """
+
+    def page(self, conn, tmp_path, manual=frozenset()) -> str:
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out, manual)
+        return out.read_text()
+
+    def test_the_candidate_list_is_embedded_best_first(self, conn, tmp_path):
+        add_alternate(conn, "2026-01", "spare-a", 1, tmp_path)
+        add_alternate(conn, "2026-01", "spare-b", 2, tmp_path)
+        page = self.page(conn, tmp_path)
+
+        data = json.loads(page.split('id="buckets">')[1].split("</script>")[0])
+        january = next(b for b in data if b["bucket"] == "2026-01")
+        assert [c["id"] for c in january["candidates"]] == ["asset-1", "spare-a", "spare-b"]
+
+    def test_one_card_per_bucket_not_per_candidate(self, conn, tmp_path):
+        add_alternate(conn, "2026-01", "spare-a", 1, tmp_path)
+        page = self.page(conn, tmp_path)
+
+        assert page.count("<figure data-bucket=") == 3
+        assert 'data-id="spare-a"' not in page      # a thumbnail, not a card
+
+    def test_the_runner_ups_render_as_thumbnails(self, conn, tmp_path):
+        add_alternate(conn, "2026-01", "spare-a", 1, tmp_path)
+        page = self.page(conn, tmp_path)
+
+        assert 'data-alt="spare-a"' in page
+        assert 'class="alts" data-count="1"' in page
+
+    def test_a_bucket_without_alternates_has_no_tray(self, conn, tmp_path):
+        assert 'class="alts"' not in self.page(conn, tmp_path)
+
+    def test_the_count_is_still_what_gets_encoded(self, conn, tmp_path):
+        add_alternate(conn, "2026-01", "spare-a", 1, tmp_path)
+        out = tmp_path / "out" / "contact-sheet.html"
+        assert review.write_contact_sheet(conn, out) == 3

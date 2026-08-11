@@ -101,6 +101,11 @@ class TestStageEncode:
                          " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01", stamp))
             conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
                          " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+            # Every warped frame has a selection row in a real run; the join to
+            # it is what keeps runner-ups out of the video.
+            conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                         " selected_at) VALUES (?, ?, 0, 0, ?)",
+                         (f"a{i}", f"2026-0{i}", stamp))
         return conn
 
     def captured(self, monkeypatch):
@@ -201,6 +206,9 @@ class TestBothVideos:
                          " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01", stamp))
             conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
                          " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+            conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                         " selected_at) VALUES (?, ?, 0, 0, ?)",
+                         (f"a{i}", f"2026-0{i}", stamp))
         db.upsert_person(conn, "p1", "me", "Kid", "2020-03-14")
         return conn
 
@@ -286,3 +294,39 @@ def test_missing_ffmpeg_says_how_to_install_it(monkeypatch):
     monkeypatch.setattr(encode.shutil, "which", lambda _: None)
     with pytest.raises(encode.FFmpegMissing, match="(?i)install it"):
         encode.ffmpeg_binary()
+
+
+class TestAlternatesNeverReachTheVideo:
+    """align warps runner-ups so the contact sheet can show them, which means
+    they have frames rows like anything else. The join to selection is the only
+    thing keeping them out of the render -- a silent duplicate week otherwise."""
+
+    @pytest.fixture()
+    def conn(self, tmp_path):
+        from grow_up import db
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        for i, (asset, alternate) in enumerate(
+                [("pick", 0), ("spare", 1), ("spare2", 1)], start=1):
+            frame = tmp_path / f"frame_{i:06d}.jpg"
+            frame.write_bytes(b"\xff\xd8\xff")
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, '2026-03-02', ?)", (asset, stamp))
+            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                         " VALUES (?, ?, ?, ?)", (asset, str(frame), i, stamp))
+            conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                         " selected_at) VALUES (?, '2026-W10', ?, ?, ?)",
+                         (asset, i - 1, alternate, stamp))
+        return conn
+
+    def test_only_the_pick_is_encoded(self, conn, tmp_path, monkeypatch):
+        from grow_up import pipeline
+
+        seen = {}
+        monkeypatch.setattr(pipeline, "encode",
+                            lambda frames, out, **kw: seen.update(frames=list(frames)) or out)
+        pipeline.stage_encode(conn, tmp_path / "out", {}, lambda _: None)
+
+        assert len(seen["frames"]) == 1
+        assert "frame_000001" in str(seen["frames"][0])
