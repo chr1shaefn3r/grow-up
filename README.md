@@ -651,6 +651,12 @@ differently — a crossfade straddles the boundary between two photographs, whil
 holds and *then* melts into the next, because its hold is made by repeating the frame and
 a repeat can only hold from the start of a slot.
 
+`morph` is also the slow one to render, and it is bound to a single core: ffmpeg's
+motion interpolation is single-threaded, so no amount of `-threads` helps it. With the
+footer enabled the two videos are rendered at the same time, which halves the wait, but
+the cost still scales with how many photographs there are — a weekly cadence is roughly
+eight times the work of a monthly one. `grow-up encode` reports what each render took.
+
 Note the trade. A shorter transition is a *faster* one, and morph is warping pixels along
 estimated motion — half a second of warp between photographs a month apart is more
 violent than a full second of it. If more stillness makes the movement uglier, that is

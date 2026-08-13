@@ -9,6 +9,14 @@ between two photographs.
 Everything that decides a filter string is plain arithmetic in
 `transition_filters`, so it stays testable in an environment with no ffmpeg --
 which is every environment the test suite runs in.
+
+One render uses one core, and no flag changes that. `minterpolate` does not
+declare slice threading in libavfilter, so `-threads`, `-filter_threads` and
+`-filter_complex_threads` have nothing to distribute -- they only spread work
+across filters that opted in. x264 underneath is threaded but spends a morph
+starved, waiting on a filter that emits one frame at a time. More cores
+therefore means more ffmpeg processes, which is why `pipeline` runs the plain
+and annotated videos at once rather than one after the other.
 """
 
 from __future__ import annotations

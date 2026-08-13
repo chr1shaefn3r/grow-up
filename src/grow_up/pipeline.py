@@ -608,7 +608,7 @@ def _damp_flicker(results: list[tuple], log: Log, window: int = 9) -> None:
 
 
 def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
-                 log: Log) -> list[Path]:
+                 log: Log, workers: int = 0) -> list[Path]:
     """Encode the aligned frames, honouring manual rejects from the contact sheet.
 
     Returns every video written. With annotation on that is two: the plain
@@ -654,27 +654,67 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     log(f"  encode: {len(frames)} frames at {settings['fps']:g} fps")
     _log_transition(settings, len(frames), log)
 
+    # Both renders are prepared before either starts. The annotated one consumes
+    # the footer layers, so they cannot still be drawing when it begins.
+    renders = [(frames, out_dir / filename, {})]
+    footer = annotate.Annotation.from_config(encode_cfg.get("annotate"))
+    if footer.enabled:
+        # A transition keeps the footer off the frames and hands it to ffmpeg
+        # as a separate layer, so the pictures dissolve and the text does not.
+        moving = _resolved_transition(settings) != "none"
+        annotated = _annotated_frames(conn, kept, footer, log, as_layers=moving)
+        if annotated:
+            renders.append((frames if moving else annotated,
+                            out_dir / _annotated_name(filename),
+                            {"overlays": annotated if moving else None}))
+
     with timing.stopwatch() as stage_elapsed:
-        written = [_timed_encode(log, frames, out_dir / filename, **settings)]
+        results = _run_renders(renders, settings, workers, log)
 
-        footer = annotate.Annotation.from_config(encode_cfg.get("annotate"))
-        if footer.enabled:
-            # A transition keeps the footer off the frames and hands it to ffmpeg
-            # as a separate layer, so the pictures dissolve and the text does not.
-            moving = _resolved_transition(settings) != "none"
-            annotated = _annotated_frames(conn, kept, footer, log, as_layers=moving)
-            if annotated:
-                written.append(_timed_encode(
-                    log, frames if moving else annotated,
-                    out_dir / _annotated_name(filename),
-                    overlays=annotated if moving else None, **settings))
-
+    for path, elapsed in results:
+        log(f"  encode: {path.name} in {timing.format_duration(elapsed)}")
     # Only worth saying when it is not the previous line over again. The gap
     # between this and the renders above is the footer drawing, which has its
     # own line already.
-    if len(written) > 1:
+    if len(results) > 1:
         log(f"  encode: stage took {timing.format_duration(stage_elapsed())}")
-    return written
+    return [path for path, _ in results]
+
+
+def _run_renders(renders: list[tuple], settings: dict, workers: int,
+                 log: Log) -> list[tuple[Path, float]]:
+    """Render the videos, together where the machine has room for it.
+
+    ffmpeg cannot spread one of these across cores: `minterpolate` is
+    single-threaded, so a morph pins one core and leaves the rest idle no matter
+    what `-threads` is set to. The two videos are independent, though -- same
+    photographs, one with the footer overlaid -- so running them at once turns
+    the stage's wall time from the sum of the renders into the longer of them.
+
+    Threads rather than processes because `subprocess.run` releases the GIL for
+    the whole of ffmpeg's run; there is nothing here for a second interpreter to
+    do. Results come back in submission order, so the plain video stays first
+    whichever finishes first.
+    """
+    if len(renders) > 1 and (workers or analyze.physical_cores()) > 1:
+        log(f"  encode: rendering {len(renders)} videos in parallel")
+        with ThreadPoolExecutor(max_workers=len(renders)) as pool:
+            futures = [pool.submit(_render, f, out, **{**settings, **extra})
+                       for f, out, extra in renders]
+            return [future.result() for future in futures]
+    return [_render(f, out, **{**settings, **extra}) for f, out, extra in renders]
+
+
+def _render(frames: list[Path], out_path: Path, **settings) -> tuple[Path, float]:
+    """One video, and what it cost. Measures only -- logging is the caller's.
+
+    Two workers writing to the terminal can interleave mid-line, and which of
+    them finishes first is a race, so the lines are formatted in the parent
+    where the order is still the order they were started in.
+    """
+    with timing.stopwatch() as elapsed:
+        written = encode(frames, out_path, **settings)
+    return written, elapsed()
 
 
 def _warn_about_unpromoted(rows: list, kept: list, log: Log) -> None:
@@ -699,23 +739,6 @@ def _warn_about_unpromoted(rows: list, kept: list, log: Log) -> None:
     log(f"  ! encode: {subject} not been through select, so {bucket} will be "
         "left empty instead of falling through to the runner-up.")
     log("    Run: grow-up select && grow-up align && grow-up encode")
-
-
-def _timed_encode(log: Log, frames: list[Path], out_path: Path, **settings) -> Path:
-    """Run one render, reporting what it cost.
-
-    `encode` is comfortably the slowest stage now that a transition synthesises
-    frames -- a morph puts every one of them through motion compensation -- and
-    with a footer enabled it runs twice. Reporting each render separately is
-    what shows that the annotated one costs as much again as the plain one,
-    which is not otherwise apparent and decides whether the footer is worth
-    leaving on while experimenting.
-    """
-    with timing.stopwatch() as elapsed:
-        written = encode(frames, out_path, **settings)
-    # The name alone: the `wrote` line that follows carries the full path.
-    log(f"  encode: {out_path.name} in {timing.format_duration(elapsed())}")
-    return written
 
 
 def _resolved_transition(settings: dict) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -836,7 +837,7 @@ class TestTheStageReportsWhatItCost:
                          (f"a{i}", f"2026-0{i}", stamp))
         return conn
 
-    def lines_for(self, conn, tmp_path, monkeypatch, cfg, clock=None):
+    def lines_for(self, conn, tmp_path, monkeypatch, cfg, clock=None, workers=0):
         from grow_up import pipeline, timing
 
         monkeypatch.setattr(pipeline, "encode", lambda frames, out, **kw: out)
@@ -844,11 +845,11 @@ class TestTheStageReportsWhatItCost:
             ticks = iter(clock)
             monkeypatch.setattr(timing.time, "perf_counter", lambda: next(ticks))
         lines = []
-        pipeline.stage_encode(conn, tmp_path / "out", cfg, lines.append)
+        pipeline.stage_encode(conn, tmp_path / "out", cfg, lines.append, workers)
         return lines
 
     def timing_lines(self, lines):
-        return [line for line in lines if " in " in line or "stage took" in line]
+        return [line for line in lines if ".mp4 in " in line or "stage took" in line]
 
     def test_a_render_reports_its_own_time(self, conn, tmp_path, monkeypatch):
         lines = self.lines_for(conn, tmp_path, monkeypatch, {})
@@ -887,11 +888,14 @@ class TestTheStageReportsWhatItCost:
     def test_durations_are_formatted_not_raw_seconds(self, conn, tmp_path, monkeypatch):
         """A bare 128.42131 in the output is the regression this guards."""
         pytest.importorskip("PIL.Image", reason="needs Pillow")
-        # stage start, render 1 in/out, render 2 in/out, stage end.
+        # Serial, so the clock is consumed in a fixed order: stage start,
+        # render 1 in/out, render 2 in/out, stage end. Two concurrent
+        # stopwatches would interleave these calls unpredictably.
         clock = [0.0, 0.0, 126.0, 126.0, 257.0, 259.0]
         timed = self.timing_lines(self.lines_for(
             conn, tmp_path, monkeypatch,
-            {"annotate": {"enabled": True, "age": "year_months"}}, clock=clock))
+            {"annotate": {"enabled": True, "age": "year_months"}},
+            clock=clock, workers=1))
 
         assert timed[0].endswith("timelapse.mp4 in 2m 06s")
         assert timed[1].endswith("timelapse-annotated.mp4 in 2m 11s")
@@ -899,7 +903,8 @@ class TestTheStageReportsWhatItCost:
 
     def test_a_quick_render_reads_in_milliseconds(self, conn, tmp_path, monkeypatch):
         timed = self.timing_lines(self.lines_for(
-            conn, tmp_path, monkeypatch, {}, clock=[0.0, 0.0, 0.012, 0.02]))
+            conn, tmp_path, monkeypatch, {}, clock=[0.0, 0.0, 0.012, 0.02],
+            workers=1))
         assert timed[0].endswith("in 12ms")
 
 
@@ -990,3 +995,132 @@ class TestAStaleRejectIsNotSilent:
 
         assert len(seen["f"]) == 2
         assert all("000002" not in str(f) for f in seen["f"])
+
+
+class TestTheTwoVideosRenderTogether:
+    """ffmpeg cannot spread one render across cores -- minterpolate is
+    single-threaded -- so the only parallelism available is the second video.
+
+    Asserting both files exist would pass on the serial code too, so these
+    assert the overlap itself.
+    """
+
+    @pytest.fixture()
+    def conn(self, tmp_path):
+        from grow_up import db
+
+        pytest.importorskip("PIL.Image", reason="needs Pillow")
+        from PIL import Image
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        db.upsert_person(conn, "p1", "me", "Kid", "2020-03-14")
+        for i in range(1, 3):
+            frame = tmp_path / f"frame_{i:06d}.jpg"
+            Image.new("RGB", (80, 100), (90, 90, 90)).save(frame)
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01", stamp))
+            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                         " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+            conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                         " selected_at) VALUES (?, ?, 0, 0, ?)",
+                         (f"a{i}", f"2026-0{i}", stamp))
+        return conn
+
+    ANNOTATED = {"annotate": {"enabled": True, "age": "year_months"}}
+
+    def trace(self, conn, tmp_path, monkeypatch, workers=0, cfg=None, hold=0.05):
+        """Record when each render entered and left, plus what it could see."""
+        import threading
+        from grow_up import pipeline
+
+        events, lock = [], threading.Lock()
+        started = threading.Event()
+
+        def fake_encode(frames, out_path, **kw):
+            with lock:
+                events.append(("enter", out_path.name, sorted(
+                    p.name for p in (kw.get("overlays") or []))))
+            started.set()
+            time.sleep(hold)
+            with lock:
+                events.append(("exit", out_path.name, []))
+            return out_path
+
+        monkeypatch.setattr(pipeline, "encode", fake_encode)
+        lines = []
+        written = pipeline.stage_encode(conn, tmp_path / "out",
+                                        cfg if cfg is not None else self.ANNOTATED,
+                                        lines.append, workers)
+        return events, lines, written
+
+    def test_the_second_render_starts_before_the_first_finishes(self, conn, tmp_path,
+                                                                 monkeypatch):
+        events, _, _ = self.trace(conn, tmp_path, monkeypatch)
+        kinds = [kind for kind, _, _ in events]
+        assert kinds == ["enter", "enter", "exit", "exit"], (
+            f"renders did not overlap: {events}")
+
+    def test_one_worker_keeps_them_serial(self, conn, tmp_path, monkeypatch):
+        """analyze.workers = 1 is the existing escape hatch, not a new setting."""
+        events, lines, _ = self.trace(conn, tmp_path, monkeypatch, workers=1)
+        kinds = [kind for kind, _, _ in events]
+        assert kinds == ["enter", "exit", "enter", "exit"]
+        assert not any("parallel" in line for line in lines)
+
+    def test_a_single_core_machine_stays_serial(self, conn, tmp_path, monkeypatch):
+        from grow_up import analyze
+
+        monkeypatch.setattr(analyze, "physical_cores", lambda: 1)
+        events, _, _ = self.trace(conn, tmp_path, monkeypatch)
+        assert [k for k, _, _ in events] == ["enter", "exit", "enter", "exit"]
+
+    def test_one_video_is_never_announced_as_parallel(self, conn, tmp_path, monkeypatch):
+        _, lines, written = self.trace(conn, tmp_path, monkeypatch,
+                                       cfg={"annotate": {"enabled": False}})
+        assert len(written) == 1
+        assert not any("parallel" in line for line in lines)
+
+    def test_the_footer_layers_exist_before_any_render_begins(self, conn, tmp_path,
+                                                              monkeypatch):
+        """The annotated render consumes them, so they cannot still be drawing.
+
+        Needs a transition: without one the footer is baked into the frames
+        instead of handed over as a separate layer.
+        """
+        events, _, _ = self.trace(conn, tmp_path, monkeypatch, cfg={
+            "fps": 0.5, "transition": "crossfade", **self.ANNOTATED})
+        overlays = [seen for kind, _, seen in events if kind == "enter" and seen]
+
+        assert overlays, "the annotated render got no overlay layers"
+        assert all(len(seen) == 2 for seen in overlays), "a layer was still being drawn"
+
+    def test_the_plain_video_stays_first_whichever_finishes_first(self, conn, tmp_path,
+                                                                   monkeypatch):
+        """cmd_encode prints `wrote` lines straight from this order."""
+        import threading
+        from grow_up import pipeline
+
+        def fake_encode(frames, out_path, **kw):
+            # Make the plain render the slow one, so completion order inverts.
+            time.sleep(0.10 if "annotated" not in out_path.name else 0.01)
+            return out_path
+
+        monkeypatch.setattr(pipeline, "encode", fake_encode)
+        lines = []
+        written = pipeline.stage_encode(conn, tmp_path / "out", self.ANNOTATED,
+                                        lines.append)
+
+        assert [p.name for p in written] == ["timelapse.mp4", "timelapse-annotated.mp4"]
+        timed = [line for line in lines if ".mp4 in " in line]
+        assert "timelapse.mp4 in" in timed[0] and "annotated" not in timed[0]
+
+    def test_the_stage_total_reflects_the_overlap(self, conn, tmp_path, monkeypatch):
+        """The whole point: wall time becomes the longer render, not the sum."""
+        from grow_up import pipeline
+
+        monkeypatch.setattr(pipeline, "encode",
+                            lambda frames, out, **kw: time.sleep(0.10) or out)
+        start = time.perf_counter()
+        pipeline.stage_encode(conn, tmp_path / "out", self.ANNOTATED, lambda _: None)
+        assert time.perf_counter() - start < 0.19, "the renders ran one after the other"

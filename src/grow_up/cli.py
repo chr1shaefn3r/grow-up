@@ -412,7 +412,10 @@ def cmd_review(args: argparse.Namespace) -> None:
 
 def cmd_encode(args: argparse.Namespace) -> None:
     cfg, conn = _open(args)
-    for out in pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log):
+    # The same worker count `align` uses: with a footer enabled there are two
+    # independent renders, and ffmpeg cannot spread either across cores itself.
+    for out in pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log,
+                                     int(cfg.get("analyze", "workers", 0))):
         log(f"  encode: wrote {out}")
 
 
@@ -527,7 +530,9 @@ def cmd_trial(args: argparse.Namespace) -> None:
         else:
             try:
                 with timing.stopwatch() as encode_elapsed:
-                    videos = pipeline.stage_encode(conn, out_dir, encode_cfg, log)
+                    videos = pipeline.stage_encode(
+                        conn, out_dir, encode_cfg, log,
+                        int(cfg.get("analyze", "workers", 0)))
                 trial.stages.append(timing.StageTiming(
                     "encode", aligned, encode_elapsed(),
                     max(0, projected_frames - aligned),
