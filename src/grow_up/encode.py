@@ -34,9 +34,66 @@ def ffmpeg_binary() -> str:
     return path
 
 
+def moving_seconds(hold_fps: float, transition_seconds: float) -> float:
+    """How much of one photo's slot is spent in motion, clamped to the slot.
+
+    A transition longer than the photo it leads out of cannot be placed at all;
+    clamping yields a picture permanently in motion, which is a real look rather
+    than an error.
+    """
+    hold = 1.0 / float(hold_fps)
+    return max(0.0, min(float(transition_seconds), hold))
+
+
+def concat_entries(frames: list[Path], hold_fps: float, transition: str,
+                   transition_seconds: float) -> list[tuple[Path, float]]:
+    """The (file, duration) pairs an ffconcat list should contain.
+
+    `crossfade` and `none` get one entry per photograph: the dissolve is carved
+    out of the gap by `framerate`'s interp window, so the input needs no help.
+
+    `morph` gets two, the same picture twice -- held for the still part of the
+    slot, then again for the moving part. `minterpolate` has no notion of a
+    hold; it spreads synthesised frames evenly across every gap between input
+    frames, so left alone the picture never stands still. Feeding it a
+    duplicated frame gives it a gap with no motion in it to find, and confines
+    the morph to the gap that follows.
+    """
+    hold = 1.0 / float(hold_fps)
+    if transition != "morph":
+        return [(frame, hold) for frame in frames]
+
+    moving = moving_seconds(hold_fps, transition_seconds)
+    still = hold - moving
+    if still <= 0:
+        # Nothing to hold: the morph fills the slot, which is what it did before
+        # it had a hold at all. Emitting a zero-length entry instead would put a
+        # `duration 0.000000` in front of ffmpeg for no reason.
+        return [(frame, hold) for frame in frames]
+    return [pair for frame in frames for pair in ((frame, still), (frame, moving))]
+
+
+def write_entries(entries: list[tuple[Path, float]], list_path: Path) -> Path:
+    """Write prepared (file, duration) pairs as an ffconcat list."""
+    if not entries:
+        raise ValueError("no frames to encode")
+
+    lines = ["ffconcat version 1.0"]
+    for frame, held in entries:
+        lines.append(f"file '{frame.resolve().as_posix()}'")
+        lines.append(f"duration {held:.6f}")
+    # ffmpeg drops the final entry's duration unless the file is repeated, which
+    # otherwise makes the last frame flash past in a single tick.
+    lines.append(f"file '{entries[-1][0].resolve().as_posix()}'")
+
+    list_path.parent.mkdir(parents=True, exist_ok=True)
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return list_path
+
+
 def write_concat_list(frames: list[Path], fps: float, list_path: Path,
                       first_duration: float | None = None) -> Path:
-    """Write an ffconcat list.
+    """Write an ffconcat list holding every frame for the same duration.
 
     The concat demuxer is used rather than a `frame_%06d.png` glob so that
     manually rejected frames can simply be omitted -- no renumbering of files on
@@ -50,18 +107,10 @@ def write_concat_list(frames: list[Path], fps: float, list_path: Path,
         raise ValueError("no frames to encode")
 
     duration = 1.0 / float(fps)
-    lines = ["ffconcat version 1.0"]
-    for index, frame in enumerate(frames):
-        lines.append(f"file '{frame.resolve().as_posix()}'")
-        held = duration if index or first_duration is None else float(first_duration)
-        lines.append(f"duration {held:.6f}")
-    # ffmpeg drops the final entry's duration unless the file is repeated, which
-    # otherwise makes the last frame flash past in a single tick.
-    lines.append(f"file '{frames[-1].resolve().as_posix()}'")
-
-    list_path.parent.mkdir(parents=True, exist_ok=True)
-    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return list_path
+    entries = [(frame, duration if index or first_duration is None
+                else float(first_duration))
+               for index, frame in enumerate(frames)]
+    return write_entries(entries, list_path)
 
 
 def dissolve_bounds(fraction: float) -> tuple[int, int]:
@@ -76,20 +125,29 @@ def dissolve_bounds(fraction: float) -> tuple[int, int]:
     return round(127.5 - span), round(127.5 + span)
 
 
-def footer_concat_offset(hold_fps: float) -> float:
-    """How long the *first* footer should hold, so switches land mid-dissolve.
+def footer_concat_offset(hold_fps: float, transition: str = "crossfade",
+                         transition_seconds: float = 0.0) -> float:
+    """How long the *first* footer holds, so switches land mid-transition.
 
     Photographs carry their own timestamps, which fall at the *end* of the
-    dissolve leading into them -- a footer following them directly would leave
+    transition leading into them -- a footer following them directly would leave
     the next photo on screen already, still labelled with the previous date.
-    Opening half a hold short moves every switch back to the midpoint, where the
-    picture stops being mostly one photograph and starts being mostly the next.
+    Opening short moves every switch back to the moment the picture stops being
+    mostly one photograph and starts being mostly the next.
+
+    Where that moment falls depends on the transition. A crossfade straddles the
+    boundary, so it is the middle of the slot. A morph sits at the *end* of the
+    slot -- a duplicated frame can only hold from the start of one -- so its
+    midpoint is half a morph before the boundary instead.
     """
-    return 0.5 / float(hold_fps)
+    hold = 1.0 / float(hold_fps)
+    if transition == "morph":
+        return hold - moving_seconds(hold_fps, transition_seconds) / 2
+    return hold / 2
 
 
 def transition_filters(transition: str, hold_fps: float, playback_fps: float,
-                       crossfade_seconds: float) -> tuple[list[str], float]:
+                       transition_seconds: float) -> tuple[list[str], float]:
     """The filters for a transition, and the frame rate the output must carry.
 
     Returning the rate is not decoration. `minterpolate` and `framerate` both
@@ -104,12 +162,19 @@ def transition_filters(transition: str, hold_fps: float, playback_fps: float,
         return [], float(hold_fps)
 
     if transition == "morph":
+        # scd=none for the same reason as scene=100 below. minterpolate carries
+        # its own scene-change detector, on by default, and when it fires it
+        # stops interpolating and duplicates frames -- so a timelapse, where
+        # every consecutive pair is a huge difference, pays for motion
+        # compensation and gets hard cuts back. The morph's timing is not here:
+        # minterpolate has no hold, so it is built into the input by
+        # `concat_entries`.
         return ([f"minterpolate=fps={playback_fps:g}:mi_mode=mci:mc_mode=aobmc"
-                 ":me_mode=bidir:vsbmc=1"], float(playback_fps))
+                 ":me_mode=bidir:vsbmc=1:scd=none"], float(playback_fps))
 
     # A dissolve longer than the hold cannot be centred on anything; clamping
     # yields a continuous blend, which is a real look rather than an error.
-    start, end = dissolve_bounds(float(crossfade_seconds) * float(hold_fps))
+    start, end = dissolve_bounds(float(transition_seconds) * float(hold_fps))
     # scene=100 disables scene-change detection. Its default of 8.2 treats
     # consecutive photographs months apart as a cut and declines to blend them,
     # which is every pair in a timelapse -- the filter would run, cost its time,
@@ -171,7 +236,7 @@ def build_command(list_path: Path, out_path: Path, fps: float, codec: str,
 def encode(frames: list[Path], out_path: Path, fps: float = 10.0,
            codec: str = "libx264", crf: int = 18,
            interpolate: bool = False, transition: str = "none",
-           playback_fps: float = 30.0, crossfade_seconds: float = 1.0,
+           playback_fps: float = 30.0, transition_seconds: float = 1.0,
            overlays: list[Path] | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # `interpolate` predates `transition` and named the same idea, so it still
@@ -180,15 +245,19 @@ def encode(frames: list[Path], out_path: Path, fps: float = 10.0,
     if interpolate and transition == "none":
         transition = "morph"
 
-    filters, rate = transition_filters(transition, fps, playback_fps, crossfade_seconds)
+    filters, rate = transition_filters(transition, fps, playback_fps, transition_seconds)
 
     stem = out_path.stem
-    list_path = write_concat_list(frames, fps, out_path.parent / f"{stem}.ffconcat")
+    list_path = write_entries(
+        concat_entries(frames, fps, transition, transition_seconds),
+        out_path.parent / f"{stem}.ffconcat")
     overlay_list = None
     if overlays and transition != "none":
+        # The footer is never doubled: it holds and switches, so one entry each
+        # is right whatever the picture underneath is doing.
         overlay_list = write_concat_list(
             overlays, fps, out_path.parent / f"{stem}-footer.ffconcat",
-            first_duration=footer_concat_offset(fps))
+            first_duration=footer_concat_offset(fps, transition, transition_seconds))
 
     cmd = build_command(list_path, out_path, fps, codec, crf, filters,
                         output_fps=rate, overlay_list=overlay_list)

@@ -519,10 +519,10 @@ class TestTheTransitionReachesTheStage:
     def test_the_settings_are_passed_through(self, conn, tmp_path, monkeypatch):
         seen, _ = self.run_with(conn, tmp_path, monkeypatch, {
             "fps": 0.5, "transition": "crossfade", "playback_fps": 30,
-            "crossfade_seconds": 1.0})
+            "transition_seconds": 1.0})
         assert seen["transition"] == "crossfade"
         assert seen["playback_fps"] == 30.0
-        assert seen["crossfade_seconds"] == 1.0
+        assert seen["transition_seconds"] == 1.0
 
     def test_the_default_is_no_transition(self, conn, tmp_path, monkeypatch):
         seen, _ = self.run_with(conn, tmp_path, monkeypatch, {})
@@ -531,13 +531,13 @@ class TestTheTransitionReachesTheStage:
     def test_the_run_reports_what_it_resolved(self, conn, tmp_path, monkeypatch):
         """A config edit has no other feedback until the video appears."""
         _, lines = self.run_with(conn, tmp_path, monkeypatch, {
-            "fps": 0.5, "transition": "crossfade", "crossfade_seconds": 1.0})
+            "fps": 0.5, "transition": "crossfade", "transition_seconds": 1.0})
         assert any("crossfade at 30 fps" in line for line in lines)
-        assert any("1s dissolving of 2s per photo" in line for line in lines)
+        assert any("1s moving and 1s still per 2s photo" in line for line in lines)
 
     def test_a_clamped_dissolve_says_so(self, conn, tmp_path, monkeypatch):
         _, lines = self.run_with(conn, tmp_path, monkeypatch, {
-            "fps": 0.5, "transition": "crossfade", "crossfade_seconds": 9.0})
+            "fps": 0.5, "transition": "crossfade", "transition_seconds": 9.0})
         assert any("clamped" in line for line in lines)
 
     def test_a_transition_free_run_stays_quiet(self, conn, tmp_path, monkeypatch):
@@ -656,3 +656,154 @@ class TestTheLastFooterSurvivesTheTail:
         held = [float(line.split()[1]) for line in listing.read_text().splitlines()
                 if line.startswith("duration")]
         assert sum(held) == len(frames) * 2.0 - 1.0
+
+
+class TestTheTransitionLengthReachesBothBranches:
+    """The defect that shipped: `morph` took the timing argument and dropped it.
+
+    Every morph test passed 1.0 and asserted only that `minterpolate` appeared,
+    so deleting the parameter outright would have left the suite green. These
+    assert the value changes the output, which is the only thing that could have
+    caught it.
+    """
+
+    def entries(self, transition, seconds, frames):
+        return encode.concat_entries(frames, 0.5, transition, seconds)
+
+    def test_morph_timing_changes_the_entries(self, frames):
+        half = self.entries("morph", 0.5, frames)
+        full = self.entries("morph", 1.0, frames)
+        assert half != full, "transition_seconds is being ignored on the morph path"
+
+    def test_morph_holds_then_moves(self, frames):
+        """1.5s still and 0.5s morphing, out of a 2s slot."""
+        held = [duration for _, duration in self.entries("morph", 0.5, frames)]
+        assert held[:2] == [1.5, 0.5]
+
+    def test_each_photo_keeps_its_whole_slot(self, frames):
+        entries = self.entries("morph", 0.5, frames)
+        assert sum(d for _, d in entries) == len(frames) * 2.0
+
+    def test_a_photo_appears_twice_under_morph(self, frames):
+        """The still half and the moving half are the same picture; motion
+        estimation finds nothing between them, which is what makes it hold."""
+        paths = [path for path, _ in self.entries("morph", 0.5, frames)]
+        assert paths[0] == paths[1] and paths[2] == paths[3]
+
+    def test_morph_timing_is_clamped_to_the_hold(self, frames):
+        """Nothing left to hold, so the morph fills the slot and the doubling
+        goes away -- a `duration 0.000000` entry would be handed to ffmpeg for
+        no reason."""
+        entries = self.entries("morph", 99.0, frames)
+        assert len(entries) == len(frames)
+        assert all(d == 2.0 for _, d in entries)
+
+    def test_the_default_timing_leaves_a_fast_run_continuous(self, frames):
+        """At fps = 10 a photo is up for 0.1s, so the 1.0s default clamps and
+        morph behaves exactly as it did before it had a hold."""
+        entries = encode.concat_entries(frames, 10.0, "morph", 1.0)
+        assert len(entries) == len(frames)
+
+    def test_crossfade_is_not_doubled(self, frames):
+        """Its hold comes from interp_start/interp_end, not from the input."""
+        entries = self.entries("crossfade", 0.5, frames)
+        assert len(entries) == len(frames)
+        assert all(d == 2.0 for _, d in entries)
+
+    def test_no_transition_is_not_doubled_either(self, frames):
+        entries = self.entries("none", 0.5, frames)
+        assert len(entries) == len(frames)
+
+
+class TestMorphSceneDetection:
+    """minterpolate has its own scene-change detection, and it defaults on.
+
+    When it fires it stops interpolating and duplicates frames instead, so a
+    timelapse -- where every consecutive pair is a huge difference -- gets hard
+    cuts at full motion-compensation cost. Exactly the trap `scene=100` guards
+    on the crossfade path, missed on this one.
+    """
+
+    def test_scene_detection_is_switched_off(self):
+        filters, _ = encode.transition_filters("morph", 0.5, 30.0, 1.0)
+        assert "scd=none" in filters[0]
+
+    def test_both_transitions_disable_their_own_detector(self):
+        crossfade, _ = encode.transition_filters("crossfade", 0.5, 30.0, 1.0)
+        morph, _ = encode.transition_filters("morph", 0.5, 30.0, 1.0)
+        assert "scene=100" in crossfade[0] and "scd=none" in morph[0]
+
+
+class TestTheFooterFollowsTheTransition:
+    """Half a hold is right only while the transition straddles the boundary.
+
+    Morph's sits at the end of each photo's slot, because a duplicated frame can
+    only hold from the start of one. A footer still switching at the midpoint of
+    the slot would change the date before the morph had begun.
+    """
+
+    def test_crossfade_switches_at_the_middle_of_the_slot(self):
+        assert encode.footer_concat_offset(0.5, "crossfade", 1.0) == 1.0
+
+    def test_morph_switches_in_the_middle_of_the_morph(self):
+        """2s slot, 0.5s morphing at the end -> midpoint at 1.75s."""
+        assert encode.footer_concat_offset(0.5, "morph", 0.5) == 1.75
+
+    def test_a_longer_morph_moves_the_switch_earlier(self):
+        assert encode.footer_concat_offset(0.5, "morph", 1.0) == 1.5
+
+
+class TestTheOlderSpellingKeepsWorking:
+    """`crossfade_seconds` named the setting while it only governed a crossfade.
+
+    It governs the morph's hold too now, so the general name is the honest one --
+    but the old one is in live config files and must not start being ignored,
+    which is the very failure this change exists to fix.
+    """
+
+    @pytest.fixture()
+    def conn(self, tmp_path):
+        from grow_up import db
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        frame = tmp_path / "frame_000001.jpg"
+        frame.write_bytes(b"\xff\xd8\xff")
+        conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                     " VALUES ('a1', '2026-01-01', ?)", (stamp,))
+        conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                     " VALUES ('a1', ?, 1, ?)", (str(frame), stamp))
+        conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                     " selected_at) VALUES ('a1', '2026-01', 0, 0, ?)", (stamp,))
+        return conn
+
+    def seconds_for(self, conn, tmp_path, monkeypatch, cfg):
+        from grow_up import pipeline
+
+        seen = {}
+        monkeypatch.setattr(pipeline, "encode",
+                            lambda frames, out, **kw: seen.update(kw) or out)
+        pipeline.stage_encode(conn, tmp_path / "out",
+                              {"fps": 0.5, "transition": "morph", **cfg}, lambda _: None)
+        return seen["transition_seconds"]
+
+    def test_the_old_name_is_still_read(self, conn, tmp_path, monkeypatch):
+        assert self.seconds_for(conn, tmp_path, monkeypatch,
+                                {"crossfade_seconds": 0.5}) == 0.5
+
+    def test_the_new_name_wins_where_both_appear(self, conn, tmp_path, monkeypatch):
+        assert self.seconds_for(conn, tmp_path, monkeypatch,
+                                {"crossfade_seconds": 0.5,
+                                 "transition_seconds": 1.5}) == 1.5
+
+    def test_morph_reports_its_split(self, conn, tmp_path, monkeypatch):
+        """The report that was missing: a morph printed no timing at all, so a
+        value being silently dropped looked exactly like one being honoured."""
+        from grow_up import pipeline
+
+        monkeypatch.setattr(pipeline, "encode", lambda frames, out, **kw: out)
+        lines = []
+        pipeline.stage_encode(conn, tmp_path / "out",
+                              {"fps": 0.5, "transition": "morph",
+                               "transition_seconds": 0.5}, lines.append)
+        assert any("0.5s moving and 1.5s still per 2s photo" in line for line in lines)

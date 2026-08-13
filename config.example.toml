@@ -213,11 +213,16 @@ transition = "none"
 # lives in the frames between two photographs, so this is what makes room for
 # it. 24 is filmic, 30 or 60 smoother.
 playback_fps = 30
-# How long a crossfade lasts, in seconds. With fps = 0.5 a photo is up for two
-# seconds, so 1.0 means one second dissolving and one second still. Clamped to
-# the hold: longer than that is a continuous blend that never settles, and the
-# run says so.
-crossfade_seconds = 1.0
+# How long the transition lasts, in seconds -- for both crossfade and morph.
+# With fps = 0.5 a photo is up for two seconds, so 1.0 means one second moving
+# and one second still; lower it to hold the picture longer. Clamped to the
+# hold: longer than that never settles, and the run says so.
+#
+# Where it sits differs. A crossfade straddles the boundary between two photos.
+# A morph runs at the *end* of each photo's time -- it holds, then melts into
+# the next -- because the hold is made by repeating the frame, and a repeat can
+# only hold from the start.
+transition_seconds = 1.0
 # Superseded by transition = "morph", which does the same thing. Kept because it
 # shipped in 1.0.0; if both are set, transition wins.
 interpolate = false

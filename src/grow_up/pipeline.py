@@ -18,7 +18,7 @@ from typing import Callable, Iterable
 import numpy as np
 
 from . import align, analyze, annotate, config, db, images, review, select
-from .encode import encode
+from .encode import encode, moving_seconds
 from .immich import ImmichClient, pick_face
 from .progress import Progress
 
@@ -643,7 +643,11 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
         interpolate=bool(encode_cfg.get("interpolate", False)),
         transition=str(encode_cfg.get("transition", "none")),
         playback_fps=float(encode_cfg.get("playback_fps", 30)),
-        crossfade_seconds=float(encode_cfg.get("crossfade_seconds", 1.0)),
+        # `crossfade_seconds` was the name while the setting only governed a
+        # crossfade. It governs the morph's hold too now, so the honest name is
+        # the general one; the old spelling still works.
+        transition_seconds=float(encode_cfg.get(
+            "transition_seconds", encode_cfg.get("crossfade_seconds", 1.0))),
     )
     filename = str(encode_cfg.get("filename", "timelapse.mp4"))
     log(f"  encode: {len(frames)} frames at {settings['fps']:g} fps")
@@ -686,12 +690,13 @@ def _log_transition(settings: dict, frames: int, log: Log) -> None:
 
     hold = 1.0 / settings["fps"]
     rate = settings["playback_fps"]
-    detail = ""
-    if transition == "crossfade":
-        dissolve = min(settings["crossfade_seconds"], hold)
-        detail = f", {dissolve:g}s dissolving of {hold:g}s per photo"
-        if dissolve < settings["crossfade_seconds"]:
-            detail += " (clamped: a dissolve cannot outlast the photo)"
+    asked = settings["transition_seconds"]
+    # Reported for both transitions. Printing it for only one is how a setting
+    # that was being silently discarded went unnoticed through a whole release.
+    moving = moving_seconds(settings["fps"], asked)
+    detail = f", {moving:g}s moving and {hold - moving:g}s still per {hold:g}s photo"
+    if moving < asked:
+        detail += " (clamped: a transition cannot outlast the photo)"
     log(f"  encode: {transition} at {rate:g} fps{detail}")
     log(f"  encode: ffmpeg will write about {round(frames * hold * rate)} frames "
         f"from {frames} photos")

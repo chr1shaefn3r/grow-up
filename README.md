@@ -635,7 +635,7 @@ photographs.
 fps = 0.5                    # two seconds per photo
 transition = "crossfade"     # none | crossfade | morph
 playback_fps = 30
-crossfade_seconds = 1.0      # one second dissolving, one second still
+transition_seconds = 1.0     # one second moving, one second still
 ```
 
 **`crossfade`** is the one to reach for. Every frame it invents is a weighted average of
@@ -644,6 +644,17 @@ motion-compensated interpolation: on eye-aligned faces it can genuinely look lik
 face becoming another, but photos a month apart differ in clothing, light and background,
 and motion estimation cannot tell that from movement. Expect smearing, worst in the
 background, and a render measured in minutes.
+
+`transition_seconds` governs both. Lower it to hold the picture longer: at `fps = 0.5`,
+`0.5` gives a second and a half still and half a second moving. The two place it
+differently — a crossfade straddles the boundary between two photographs, while a morph
+holds and *then* melts into the next, because its hold is made by repeating the frame and
+a repeat can only hold from the start of a slot.
+
+Note the trade. A shorter transition is a *faster* one, and morph is warping pixels along
+estimated motion — half a second of warp between photographs a month apart is more
+violent than a full second of it. If more stillness makes the movement uglier, that is
+the mechanism, and `crossfade` is the way out: it invents nothing, so it cannot smear.
 
 **The date and age footer does not dissolve.** It is composited after the transition, on
 its own layer, and switches cleanly at the midpoint of each dissolve — where the picture
