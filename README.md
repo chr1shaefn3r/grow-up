@@ -668,7 +668,7 @@ stops being mostly one photograph and starts being mostly the next. Ghosting the
 between two dates looks like a fault even when the pictures melting looks lovely.
 
 Pacing is cheap to try: `encode` re-runs from the frames already on disk, so changing
-`fps`, `transition` or `crossfade_seconds` costs one render and no re-warp. Changing
+`fps`, `transition` or `transition_seconds` costs one render and no re-warp. Changing
 `[select] cadence` does not — that needs `select`, `align` and `encode`.
 
 Worth doing the arithmetic before dropping to a monthly cadence. Over three years:

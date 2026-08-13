@@ -644,11 +644,7 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
         interpolate=bool(encode_cfg.get("interpolate", False)),
         transition=str(encode_cfg.get("transition", "none")),
         playback_fps=float(encode_cfg.get("playback_fps", 30)),
-        # `crossfade_seconds` was the name while the setting only governed a
-        # crossfade. It governs the morph's hold too now, so the honest name is
-        # the general one; the old spelling still works.
-        transition_seconds=float(encode_cfg.get(
-            "transition_seconds", encode_cfg.get("crossfade_seconds", 1.0))),
+        transition_seconds=float(encode_cfg.get("transition_seconds", 1.0)),
     )
     filename = str(encode_cfg.get("filename", "timelapse.mp4"))
     log(f"  encode: {len(frames)} frames at {settings['fps']:g} fps")

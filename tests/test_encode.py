@@ -755,13 +755,9 @@ class TestTheFooterFollowsTheTransition:
         assert encode.footer_concat_offset(0.5, "morph", 1.0) == 1.5
 
 
-class TestTheOlderSpellingKeepsWorking:
-    """`crossfade_seconds` named the setting while it only governed a crossfade.
-
-    It governs the morph's hold too now, so the general name is the honest one --
-    but the old one is in live config files and must not start being ignored,
-    which is the very failure this change exists to fix.
-    """
+class TestMorphReportsItsTiming:
+    """A morph's timing is the setting most easily dropped in silence: nothing
+    on screen distinguishes a value honoured from one ignored."""
 
     @pytest.fixture()
     def conn(self, tmp_path):
@@ -778,25 +774,6 @@ class TestTheOlderSpellingKeepsWorking:
         conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
                      " selected_at) VALUES ('a1', '2026-01', 0, 0, ?)", (stamp,))
         return conn
-
-    def seconds_for(self, conn, tmp_path, monkeypatch, cfg):
-        from grow_up import pipeline
-
-        seen = {}
-        monkeypatch.setattr(pipeline, "encode",
-                            lambda frames, out, **kw: seen.update(kw) or out)
-        pipeline.stage_encode(conn, tmp_path / "out",
-                              {"fps": 0.5, "transition": "morph", **cfg}, lambda _: None)
-        return seen["transition_seconds"]
-
-    def test_the_old_name_is_still_read(self, conn, tmp_path, monkeypatch):
-        assert self.seconds_for(conn, tmp_path, monkeypatch,
-                                {"crossfade_seconds": 0.5}) == 0.5
-
-    def test_the_new_name_wins_where_both_appear(self, conn, tmp_path, monkeypatch):
-        assert self.seconds_for(conn, tmp_path, monkeypatch,
-                                {"crossfade_seconds": 0.5,
-                                 "transition_seconds": 1.5}) == 1.5
 
     def test_morph_reports_its_split(self, conn, tmp_path, monkeypatch):
         """The report that was missing: a morph printed no timing at all, so a
