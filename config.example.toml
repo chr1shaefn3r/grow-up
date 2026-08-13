@@ -190,15 +190,37 @@ fit_margin = 1.5
 # Written into paths.out. `grow-up trial` prefixes "trial-" so a trial can never
 # overwrite the real video.
 filename = "timelapse.mp4"
-# Playback rate. Together with select.cadence it sets the pace: one frame per
-# week at 10 fps covers about a year in five seconds.
+# How fast *photographs* advance, not the video's own frame rate -- 0.5 holds
+# each one for two seconds. Together with select.cadence it sets the pace: one
+# frame per week at 10 fps covers about a year in five seconds.
 fps = 10
 codec = "libx264"          # "hevc_videotoolbox" is much faster on Apple Silicon
 # Quality for the software x264/x265 encoders, roughly 0 (lossless) to 51. Lower
 # is better and bigger; 18 is visually near-transparent. Hardware encoders like
 # hevc_videotoolbox ignore it -- they take a bitrate instead.
 crf = 18
-interpolate = false        # ffmpeg minterpolate; smoother but very slow
+
+# What happens between two photographs.
+#   none       a hard cut, and the video runs at `fps` -- unchanged behaviour
+#   crossfade  each photo dissolves into the next; every frame in between is a
+#              blend of two real photographs, so nothing can look invented
+#   morph      motion-compensated interpolation. On eye-aligned faces it can
+#              look like one face becoming another, but a month apart the
+#              clothes, light and background change too, and motion estimation
+#              cannot tell that from movement. Expect smearing. Very slow.
+transition = "none"
+# The video's own frame rate, used only when a transition is on. A dissolve
+# lives in the frames between two photographs, so this is what makes room for
+# it. 24 is filmic, 30 or 60 smoother.
+playback_fps = 30
+# How long a crossfade lasts, in seconds. With fps = 0.5 a photo is up for two
+# seconds, so 1.0 means one second dissolving and one second still. Clamped to
+# the hold: longer than that is a continuous blend that never settles, and the
+# run says so.
+crossfade_seconds = 1.0
+# Superseded by transition = "morph", which does the same thing. Kept because it
+# shipped in 1.0.0; if both are set, transition wins.
+interpolate = false
 
 # Burn a footer into the video: capture date bottom left, age bottom right. The
 # age comes from the birth date on the person in Immich; without one, only the

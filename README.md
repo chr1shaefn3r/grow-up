@@ -625,6 +625,53 @@ a photo-heavy holiday dominates the video while quiet months flash past. Togethe
 `encode.fps` it sets the pace: one frame per week at 10 fps covers about a year in five
 seconds.
 
+Two rates, not one. `encode.fps` is how fast *photographs* advance — `0.5` holds each one
+for two seconds. `encode.playback_fps` is the video's own frame rate, and only matters
+once you ask for a transition, because a dissolve lives in the frames between two
+photographs.
+
+```toml
+[encode]
+fps = 0.5                    # two seconds per photo
+transition = "crossfade"     # none | crossfade | morph
+playback_fps = 30
+crossfade_seconds = 1.0      # one second dissolving, one second still
+```
+
+**`crossfade`** is the one to reach for. Every frame it invents is a weighted average of
+two real photographs, so there is nothing in it that can look wrong. **`morph`** is
+motion-compensated interpolation: on eye-aligned faces it can genuinely look like one
+face becoming another, but photos a month apart differ in clothing, light and background,
+and motion estimation cannot tell that from movement. Expect smearing, worst in the
+background, and a render measured in minutes.
+
+**The date and age footer does not dissolve.** It is composited after the transition, on
+its own layer, and switches cleanly at the midpoint of each dissolve — where the picture
+stops being mostly one photograph and starts being mostly the next. Ghosting the text
+between two dates looks like a fault even when the pictures melting looks lovely.
+
+Pacing is cheap to try: `encode` re-runs from the frames already on disk, so changing
+`fps`, `transition` or `crossfade_seconds` costs one render and no re-warp. Changing
+`[select] cadence` does not — that needs `select`, `align` and `encode`.
+
+Worth doing the arithmetic before dropping to a monthly cadence. Over three years:
+
+| Cadence | `fps` | Photos | Length |
+|---|---|---|---|
+| week | 4 | ~156 | 39s |
+| week | 1 | ~156 | 2m 36s |
+| month | 0.5 | ~36 | 1m 12s |
+| month, `per_bucket = 2` | 0.5 | ~72 | 2m 24s |
+
+Monthly at 0.5 fps is slower *and* shows a quarter of the photographs. If the complaint
+is pace rather than density, lowering `fps` on the weekly cadence gets there without
+throwing any away — and a dissolve is what makes a slow video feel deliberate rather than
+merely long.
+
+One knock-on: a dissolve puts two differently-lit photos on screen at once, so exposure
+differences show far more than across a cut. `[output] flicker_match` already damps this
+and defaults to `true`.
+
 ## Tests
 
 ```bash

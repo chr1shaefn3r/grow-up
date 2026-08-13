@@ -299,3 +299,42 @@ class TestDrawing:
         with pytest.raises(RuntimeError, match="encode.annotate.font"):
             annotate.draw_footer(self.frame(Image, "black"), "x",
                                  configured_font=str(tmp_path / "nope.ttf"))
+
+
+class TestTheFooterAsItsOwnLayer:
+    """For the overlay path, where ffmpeg composites the footer after a
+    transition -- so the picture dissolves and the text does not."""
+
+    def layer(self, left="2026-08-05", right="3 years"):
+        pytest.importorskip("PIL.Image", reason="needs Pillow")
+        return annotate.footer_layer((400, 500), left, right)
+
+    def test_it_is_rgba(self):
+        assert self.layer().mode == "RGBA"
+
+    def test_everything_above_the_band_is_transparent(self):
+        """Anything else would paint over the photograph it is laid on."""
+        layer = self.layer()
+        assert layer.getpixel((200, 10))[3] == 0
+        assert layer.getpixel((0, 0))[3] == 0
+
+    def test_the_band_is_drawn_but_translucent(self):
+        alpha = self.layer().getpixel((200, 495))[3]
+        assert 0 < alpha < 255, "an opaque band would hide the picture entirely"
+
+    def test_the_text_is_there(self):
+        """Opaque pixels along the baseline that the empty layer does not have."""
+        drawn = self.layer()
+        blank = self.layer(left="", right="")
+        row = 500 - annotate._footer_metrics((400, 500))[1] // 2
+        opaque = lambda img: sum(img.getpixel((x, row))[3] == 255 for x in range(400))
+        assert opaque(drawn) > opaque(blank)
+
+    def test_it_matches_the_baked_footer_geometry(self):
+        """One table of metrics, so the two paths cannot drift in appearance."""
+        assert annotate._footer_metrics((400, 500)) == annotate._footer_metrics((400, 500))
+        size, band, margin, stroke = annotate._footer_metrics((400, 500))
+        assert size == max(10, round(500 * annotate.FONT_SCALE))
+        assert band == round(size * annotate.BAND_SCALE)
+        assert margin == round(400 * annotate.MARGIN_SCALE)
+        assert stroke == max(1, size // 14)

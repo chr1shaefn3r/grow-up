@@ -264,6 +264,50 @@ def resolve_font(configured: str, size: int):
         ) from None
 
 
+def _footer_metrics(size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Type size, band height, side margin and stroke width for a frame size.
+
+    Shared by the two ways the footer reaches a video -- composited here, or
+    handed to ffmpeg as its own layer -- so the two cannot drift apart in
+    appearance.
+    """
+    width, height = size
+    type_size = max(10, round(height * FONT_SCALE))
+    return (type_size, round(type_size * BAND_SCALE), round(width * MARGIN_SCALE),
+            max(1, type_size // 14))
+
+
+def footer_layer(size: tuple[int, int], left: str = "", right: str = "", *,
+                 font=None, configured_font: str = ""):
+    """The footer alone on transparent pixels, as an RGBA image.
+
+    For the overlay path, where ffmpeg composites the footer *after* a
+    transition has run. Baking it into the frames instead would put the date and
+    age through the same dissolve as the photographs, so they would ghost
+    between values -- and through `morph`, where motion estimation would warp
+    the glyphs outright.
+    """
+    from PIL import Image, ImageDraw
+
+    width, height = size
+    type_size, band, margin, stroke = _footer_metrics(size)
+    font = font or resolve_font(configured_font, type_size)
+
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    draw.rectangle([(0, height - band), (width, height)], fill=(0, 0, 0, SCRIM_ALPHA))
+    middle = height - band // 2
+    if left:
+        draw.text((margin, middle), left, font=font, anchor="lm",
+                  fill=(255, 255, 255, 255), stroke_width=stroke,
+                  stroke_fill=(0, 0, 0, 255))
+    if right:
+        draw.text((width - margin, middle), right, font=font, anchor="rm",
+                  fill=(255, 255, 255, 255), stroke_width=stroke,
+                  stroke_fill=(0, 0, 0, 255))
+    return layer
+
+
 def draw_footer(image, left: str = "", right: str = "", *, font=None,
                 configured_font: str = ""):
     """Return a copy of `image` with a footer band and its two labels.
@@ -271,13 +315,16 @@ def draw_footer(image, left: str = "", right: str = "", *, font=None,
     The band is what makes this readable over anything: a photo can be white
     snow or a night shot, and outlined text alone is a gamble on both. The band
     darkens rather than replaces, so the picture still shows through it.
+
+    Deliberately not expressed as `alpha_composite(image, footer_layer(...))`,
+    tidy as that would be: the text is drawn straight onto the darkened photo
+    here, so its antialiased edges blend against the picture. Against
+    transparency they blend differently, and this is a shipped render.
     """
     from PIL import Image, ImageDraw
 
     width, height = image.size
-    size = max(10, round(height * FONT_SCALE))
-    band = round(size * BAND_SCALE)
-    margin = round(width * MARGIN_SCALE)
+    size, band, margin, stroke = _footer_metrics(image.size)
     font = font or resolve_font(configured_font, size)
 
     scrim = Image.new("RGBA", image.size, (0, 0, 0, 0))
@@ -287,7 +334,6 @@ def draw_footer(image, left: str = "", right: str = "", *, font=None,
 
     draw = ImageDraw.Draw(out)
     middle = height - band // 2
-    stroke = max(1, size // 14)
     if left:
         draw.text((margin, middle), left, font=font, anchor="lm",
                   fill=(255, 255, 255), stroke_width=stroke, stroke_fill=(0, 0, 0))

@@ -641,18 +641,60 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
         codec=str(encode_cfg.get("codec", "libx264")),
         crf=int(encode_cfg.get("crf", 18)),
         interpolate=bool(encode_cfg.get("interpolate", False)),
+        transition=str(encode_cfg.get("transition", "none")),
+        playback_fps=float(encode_cfg.get("playback_fps", 30)),
+        crossfade_seconds=float(encode_cfg.get("crossfade_seconds", 1.0)),
     )
     filename = str(encode_cfg.get("filename", "timelapse.mp4"))
     log(f"  encode: {len(frames)} frames at {settings['fps']:g} fps")
+    _log_transition(settings, len(frames), log)
     written = [encode(frames, out_dir / filename, **settings)]
 
     footer = annotate.Annotation.from_config(encode_cfg.get("annotate"))
     if footer.enabled:
-        annotated = _annotated_frames(conn, kept, footer, log)
+        # A transition keeps the footer off the frames and hands it to ffmpeg as
+        # a separate layer, so the pictures dissolve and the text does not.
+        moving = _resolved_transition(settings) != "none"
+        annotated = _annotated_frames(conn, kept, footer, log, as_layers=moving)
         if annotated:
-            written.append(encode(annotated, out_dir / _annotated_name(filename),
-                                  **settings))
+            written.append(encode(
+                frames if moving else annotated,
+                out_dir / _annotated_name(filename),
+                overlays=annotated if moving else None, **settings))
     return written
+
+
+def _resolved_transition(settings: dict) -> str:
+    """What `encode` will actually do, including the legacy `interpolate` name."""
+    if settings["transition"] == "none" and settings["interpolate"]:
+        return "morph"
+    return settings["transition"]
+
+
+def _log_transition(settings: dict, frames: int, log: Log) -> None:
+    """Report what the transition settings resolved to, and what they will cost.
+
+    There are no command-line overrides for any of this, so a config edit's only
+    feedback is the video itself -- minutes away, and easy to misread. The
+    effective dissolve matters most: it is clamped to the hold, so a value
+    longer than a photo stays on screen becomes a continuous blend rather than
+    an error.
+    """
+    transition = _resolved_transition(settings)
+    if transition == "none":
+        return
+
+    hold = 1.0 / settings["fps"]
+    rate = settings["playback_fps"]
+    detail = ""
+    if transition == "crossfade":
+        dissolve = min(settings["crossfade_seconds"], hold)
+        detail = f", {dissolve:g}s dissolving of {hold:g}s per photo"
+        if dissolve < settings["crossfade_seconds"]:
+            detail += " (clamped: a dissolve cannot outlast the photo)"
+    log(f"  encode: {transition} at {rate:g} fps{detail}")
+    log(f"  encode: ffmpeg will write about {round(frames * hold * rate)} frames "
+        f"from {frames} photos")
 
 
 def _annotated_name(filename: str) -> str:
@@ -662,12 +704,17 @@ def _annotated_name(filename: str) -> str:
 
 
 def _annotated_frames(conn: sqlite3.Connection, rows: list, footer,
-                      log: Log) -> list[Path]:
+                      log: Log, as_layers: bool = False) -> list[Path]:
     """Redraw the selected frames with a footer, into a subdirectory.
 
     Regenerated on every encode rather than cached: they are derived from frames
     that already exist, cost about a second, and a stale set left behind after a
     date format changed would be worse than the second.
+
+    With `as_layers`, writes the footer alone on transparent pixels instead of
+    over the picture. That is what a transition needs: ffmpeg composites these
+    after the photographs have dissolved, so the date and age switch cleanly
+    instead of ghosting from one value to the next.
     """
     from PIL import Image
 
@@ -679,18 +726,27 @@ def _annotated_frames(conn: sqlite3.Connection, rows: list, footer,
             "`grow-up index` and `grow-up encode`.")
     born = _as_date(birth)
 
-    out_dir = Path(rows[0]["path"]).parent / "annotated"
+    out_dir = Path(rows[0]["path"]).parent / ("footers" if as_layers else "annotated")
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for row in rows:
         source = Path(row["path"])
         when = _as_date(row["local_datetime"])
         left, right = footer.texts(when, born) if when else ("", "")
-        with Image.open(source) as image:
-            drawn = annotate.draw_footer(image, left, right,
-                                         configured_font=footer.font)
-        target = out_dir / source.name
-        drawn.save(target, quality=95)
+        if as_layers:
+            with Image.open(source) as image:
+                size = image.size
+            drawn = annotate.footer_layer(size, left, right,
+                                          configured_font=footer.font)
+            # PNG, and never JPEG: the alpha channel is the entire point.
+            target = out_dir / f"{source.stem}.png"
+            drawn.save(target)
+        else:
+            with Image.open(source) as image:
+                drawn = annotate.draw_footer(image, left, right,
+                                             configured_font=footer.font)
+            target = out_dir / source.name
+            drawn.save(target, quality=95)
         written.append(target)
 
     log(f"  encode: {len(written)} annotated frames -> {out_dir}")

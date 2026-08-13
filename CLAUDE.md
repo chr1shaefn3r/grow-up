@@ -71,6 +71,9 @@ specifically to avoid. They all look like improvements.
 | Log `type(exc).__name__` for a failed request | Discarding the HTTP status cost an entire debugging round on a real library. `ImmichHTTPError` carries status, path and body. | `test_keeps_the_status_code` (`tests/test_client_errors.py`) |
 | Clear a progress line by padding with spaces | Leaves trailing whitespace in the terminal buffer. Use the ANSI erase-to-end-of-line already in `progress.py`. | `test_summary_line_has_no_trailing_whitespace` (`tests/test_progress.py`) |
 | Ask one Immich account about another's asset | Face lookups and downloads must go to the account that owns the asset — a key that cannot see an id gets 404, so this fails on exactly the other account's half of the library. `assets.source` records the owner. | `TestStagesStayInTheirOwnAccount` (`tests/test_sources.py`) |
+| Set the output `-r` from `encode.fps` when a transition is on | `-r` runs after the filter chain, so a rate left at the hold rate drops every frame the interpolation just synthesised. This shipped: `interpolate = true` paid for mci motion compensation for three releases and handed back the un-smoothed video. `transition_filters` returns the rate the output must carry for exactly this reason. | `TestTheOutputRateMatchesTheFilter` (`tests/test_encode.py`) |
+| Leave `framerate`'s `scene` at its default | It defaults to 8.2 and declines to blend across what it reads as a cut — which is nearly every pair of photographs months apart. The filter runs, costs its time, and produces the hard cuts it was added to remove. `scene=100` disables it. | `test_scene_detection_is_switched_off` (`tests/test_encode.py`) |
+| Bake the footer into the frames when a transition is on | Whatever filter dissolves the picture dissolves the text with it, so the date ghosts between two values and `morph` warps the glyphs. It goes on as a second input, resampled with `fps` (repeats) and never `framerate` (blends). Its list also opens with a half-length entry: photo timestamps fall at the *end* of the dissolve leading into them, so an unshifted footer leaves the next photo on screen still carrying the previous date. | `TestTheFooterDoesNotDissolve`, `TestTheFooterSwitchesMidDissolve` (`tests/test_encode.py`) |
 | Let an alternate reach the video | `select` keeps `alternates` runner-ups per bucket and `align` warps them, so they have `frames` rows like anything else. The join to `selection` on `alternate = 0` in `stage_encode` is the only thing keeping them out — without it a week appears three times, and the video looks plausible. | `TestAlternatesNeverReachTheVideo` (`tests/test_encode.py`) |
 | Apply `rejects.json` only at `encode` | It filters the already-selected frame list, so rejecting the photo that won a week deletes the week instead of promoting the runner-up. `select.apply_filters` takes the set; `select_frames` then does the promotion for free. And the contact sheet must be *seeded* from the file — its download replaces the whole thing, so an unseeded page silently discards every earlier decision. | `TestAManualRejectPromotesTheRunnerUp` (`tests/test_select.py`), `TestTheSeedSurvivesIntoTheDownload` (`tests/test_tuner.py`) |
 | Take month names or number grouping from the stdlib `locale` module | It depends on which locales the host has generated, so the same config renders a different video on a Mac and on a Linux desktop. `annotate.LANGUAGES` is a table for that reason, and because `mois` is invariable in French — a rule with an `s` on the end is wrong. | `TestLanguages` (`tests/test_annotate.py`) |
@@ -96,7 +99,7 @@ coordinates; decoding elsewhere without the same rule silently crops the wrong r
 | `select.py` | Apply the filters, score the survivors, bucket them by cadence. |
 | `review.py` | The two static HTML pages. No CDN — they open over `file://`. The rejects page is a threshold tuner driven by the serialized `RULES`. |
 | `annotate.py` | The date/age footer. Age arithmetic, date tokens and the five language tables are plain Python; Pillow is imported lazily, only to draw. |
-| `encode.py` | The ffmpeg invocation. |
+| `encode.py` | The ffmpeg invocation, and the transition maths. Hold rate and playback rate are separate; the filter strings are pure arithmetic so they stay testable with no ffmpeg. |
 | `progress.py` | The progress bar. Repaints on a terminal, degrades to plain lines when piped. |
 | `timing.py` | Stage timing and the full-run projection behind `grow-up trial`. |
 
@@ -111,13 +114,22 @@ pip install pillow                   # unlocks the footer-drawing tests
 # node on PATH                       # unlocks the Python/JavaScript filter parity tests
 ```
 
-With none of them, 34 tests skip and the rest still assert everything that matters.
+With none of them, 42 tests skip and the rest still assert everything that matters.
 
 **You cannot verify anything that needs real photographs.** mediapipe generally will not
 install in a sandbox, there is no Immich instance, and no credentials will be shared.
 This means no change to landmarking, framing or filtering has ever been seen working on
 an actual face by the agent that wrote it. Say so plainly rather than describing such a
 change as verified.
+
+**ffmpeg is not installed either, and the tests are built so it never needs to be.** You
+can assert the exact command string and every number in it; you cannot run it or see one
+frame of the result. So anything about how a *filter behaves* — `framerate`'s blending,
+`scene` suppressing it, `overlay`'s alpha handling, what `minterpolate` does to a face —
+is read from the documentation, not observed. Write it down as such. The way to keep this
+honest is the one already used: put the arithmetic in a pure function
+(`encode.transition_filters`) and test that, rather than reaching for a render you cannot
+watch.
 
 Hand these to the human running a real library:
 
@@ -131,6 +143,10 @@ Hand these to the human running a real library:
    *unchanged*.
 5. Tag the person in an old photo and re-run — drift detection fires and re-indexes in
    full.
+6. `transition = "crossfade"`, then `grow-up encode`. Pictures dissolve; the footer
+   switches cleanly mid-dissolve. Hard cuts throughout means `scene` suppressed the
+   blend; a black band behind the text means the overlay lost its alpha; a ghosted date
+   means the footer went through the filter instead of over it.
 
 ## Conventions
 
