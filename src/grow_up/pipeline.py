@@ -17,7 +17,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-from . import align, analyze, annotate, config, db, images, review, select
+from . import align, analyze, annotate, config, db, images, review, select, timing
 from .encode import encode, moving_seconds
 from .immich import ImmichClient, pick_face
 from .progress import Progress
@@ -652,19 +652,44 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     filename = str(encode_cfg.get("filename", "timelapse.mp4"))
     log(f"  encode: {len(frames)} frames at {settings['fps']:g} fps")
     _log_transition(settings, len(frames), log)
-    written = [encode(frames, out_dir / filename, **settings)]
 
-    footer = annotate.Annotation.from_config(encode_cfg.get("annotate"))
-    if footer.enabled:
-        # A transition keeps the footer off the frames and hands it to ffmpeg as
-        # a separate layer, so the pictures dissolve and the text does not.
-        moving = _resolved_transition(settings) != "none"
-        annotated = _annotated_frames(conn, kept, footer, log, as_layers=moving)
-        if annotated:
-            written.append(encode(
-                frames if moving else annotated,
-                out_dir / _annotated_name(filename),
-                overlays=annotated if moving else None, **settings))
+    with timing.stopwatch() as stage_elapsed:
+        written = [_timed_encode(log, frames, out_dir / filename, **settings)]
+
+        footer = annotate.Annotation.from_config(encode_cfg.get("annotate"))
+        if footer.enabled:
+            # A transition keeps the footer off the frames and hands it to ffmpeg
+            # as a separate layer, so the pictures dissolve and the text does not.
+            moving = _resolved_transition(settings) != "none"
+            annotated = _annotated_frames(conn, kept, footer, log, as_layers=moving)
+            if annotated:
+                written.append(_timed_encode(
+                    log, frames if moving else annotated,
+                    out_dir / _annotated_name(filename),
+                    overlays=annotated if moving else None, **settings))
+
+    # Only worth saying when it is not the previous line over again. The gap
+    # between this and the renders above is the footer drawing, which has its
+    # own line already.
+    if len(written) > 1:
+        log(f"  encode: stage took {timing.format_duration(stage_elapsed())}")
+    return written
+
+
+def _timed_encode(log: Log, frames: list[Path], out_path: Path, **settings) -> Path:
+    """Run one render, reporting what it cost.
+
+    `encode` is comfortably the slowest stage now that a transition synthesises
+    frames -- a morph puts every one of them through motion compensation -- and
+    with a footer enabled it runs twice. Reporting each render separately is
+    what shows that the annotated one costs as much again as the plain one,
+    which is not otherwise apparent and decides whether the footer is worth
+    leaving on while experimenting.
+    """
+    with timing.stopwatch() as elapsed:
+        written = encode(frames, out_path, **settings)
+    # The name alone: the `wrote` line that follows carries the full path.
+    log(f"  encode: {out_path.name} in {timing.format_duration(elapsed())}")
     return written
 
 

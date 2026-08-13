@@ -807,3 +807,96 @@ class TestTheOlderSpellingKeepsWorking:
                               {"fps": 0.5, "transition": "morph",
                                "transition_seconds": 0.5}, lines.append)
         assert any("0.5s moving and 1.5s still per 2s photo" in line for line in lines)
+
+
+class TestTheStageReportsWhatItCost:
+    """encode is the slowest stage once a transition synthesises frames, and it
+    used to go silent between announcing the work and the files appearing."""
+
+    @pytest.fixture()
+    def conn(self, tmp_path):
+        from grow_up import db
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        db.upsert_person(conn, "p1", "me", "Kid", "2020-03-14")
+        # Real images: the annotated path opens them with Pillow, and the
+        # timing is measured around a monkeypatched encode either way.
+        Image = pytest.importorskip("PIL.Image", reason="needs Pillow")
+        for i in range(1, 3):
+            frame = tmp_path / f"frame_{i:06d}.jpg"
+            Image.new("RGB", (80, 100), (90, 90, 90)).save(frame)
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01", stamp))
+            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                         " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+            conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                         " selected_at) VALUES (?, ?, 0, 0, ?)",
+                         (f"a{i}", f"2026-0{i}", stamp))
+        return conn
+
+    def lines_for(self, conn, tmp_path, monkeypatch, cfg, clock=None):
+        from grow_up import pipeline, timing
+
+        monkeypatch.setattr(pipeline, "encode", lambda frames, out, **kw: out)
+        if clock is not None:
+            ticks = iter(clock)
+            monkeypatch.setattr(timing.time, "perf_counter", lambda: next(ticks))
+        lines = []
+        pipeline.stage_encode(conn, tmp_path / "out", cfg, lines.append)
+        return lines
+
+    def timing_lines(self, lines):
+        return [line for line in lines if " in " in line or "stage took" in line]
+
+    def test_a_render_reports_its_own_time(self, conn, tmp_path, monkeypatch):
+        lines = self.lines_for(conn, tmp_path, monkeypatch, {})
+        assert any("timelapse.mp4 in " in line for line in lines)
+
+    def test_the_path_is_left_to_the_wrote_line(self, conn, tmp_path, monkeypatch):
+        """cli prints the full path right below; repeating it here is noise."""
+        lines = self.timing_lines(self.lines_for(conn, tmp_path, monkeypatch, {}))
+        assert not any(str(tmp_path) in line for line in lines)
+
+    def test_one_render_gets_no_total(self, conn, tmp_path, monkeypatch):
+        """It would restate the line above it, which teaches you to skip both."""
+        lines = self.lines_for(conn, tmp_path, monkeypatch, {})
+        assert not any("stage took" in line for line in lines)
+        assert len(self.timing_lines(lines)) == 1
+
+    def test_both_renders_report_and_a_total_follows(self, conn, tmp_path, monkeypatch):
+        pytest.importorskip("PIL.Image", reason="needs Pillow")
+        lines = self.lines_for(conn, tmp_path, monkeypatch, {
+            "annotate": {"enabled": True, "age": "year_months"}})
+        timed = self.timing_lines(lines)
+
+        assert len(timed) == 3
+        assert "timelapse.mp4 in " in timed[0]
+        assert "timelapse-annotated.mp4 in " in timed[1]
+        assert "stage took" in timed[2]
+
+    def test_the_annotated_render_is_shown_costing_its_own_time(self, conn, tmp_path,
+                                                                monkeypatch):
+        """The point of reporting both: with a footer on, ffmpeg runs twice."""
+        pytest.importorskip("PIL.Image", reason="needs Pillow")
+        lines = self.lines_for(conn, tmp_path, monkeypatch, {
+            "annotate": {"enabled": True, "age": "year_months"}})
+        assert sum(1 for line in lines if ".mp4 in " in line) == 2
+
+    def test_durations_are_formatted_not_raw_seconds(self, conn, tmp_path, monkeypatch):
+        """A bare 128.42131 in the output is the regression this guards."""
+        pytest.importorskip("PIL.Image", reason="needs Pillow")
+        # stage start, render 1 in/out, render 2 in/out, stage end.
+        clock = [0.0, 0.0, 126.0, 126.0, 257.0, 259.0]
+        timed = self.timing_lines(self.lines_for(
+            conn, tmp_path, monkeypatch,
+            {"annotate": {"enabled": True, "age": "year_months"}}, clock=clock))
+
+        assert timed[0].endswith("timelapse.mp4 in 2m 06s")
+        assert timed[1].endswith("timelapse-annotated.mp4 in 2m 11s")
+        assert timed[2].endswith("stage took 4m 19s")
+
+    def test_a_quick_render_reads_in_milliseconds(self, conn, tmp_path, monkeypatch):
+        timed = self.timing_lines(self.lines_for(
+            conn, tmp_path, monkeypatch, {}, clock=[0.0, 0.0, 0.012, 0.02]))
+        assert timed[0].endswith("in 12ms")
