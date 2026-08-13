@@ -108,3 +108,40 @@ class TestTheDocCheckItself:
     def test_both_code_spans_and_fenced_blocks_are(self):
         text = "Run `grow-up status` first.\n\n```bash\ngrow-up encode   # then this\n```\n"
         assert invocations(text) == [(1, "grow-up status"), (4, "grow-up encode")]
+
+
+class TestTheRunTellsYouHowToApplyRejects:
+    """The closing line of every run, which is where most people learn the
+    workflow.
+
+    It said `grow-up encode` alone for three releases. That reaches only the
+    encode stage's own filter, which drops a frame but cannot reconsider a
+    bucket -- so following it left a week missing and said nothing. The README
+    table, the contact sheet and the rejects page all had it right; this one
+    string drifted, and nothing was watching it.
+    """
+
+    def advice(self) -> str:
+        import inspect
+
+        source = inspect.getsource(cli.cmd_run)
+        return source[source.index("Review out/contact-sheet.html"):]
+
+    def test_it_names_select_align_and_encode(self):
+        for stage in ("grow-up select", "grow-up align", "grow-up encode"):
+            assert stage in self.advice(), f"{stage} missing from the run's advice"
+
+    def test_it_does_not_tell_you_encode_alone_is_enough(self):
+        text = " ".join(self.advice().split())
+        assert "re-run\\n`grow-up encode`" not in text
+        assert "`grow-up encode` to apply" not in text
+
+    def test_it_says_why_select_is_needed(self):
+        """Without the reason, three commands read as fussiness and the next
+        person to tidy the string drops two of them."""
+        assert "promotes" in self.advice()
+
+    def test_it_matches_what_the_readme_prescribes(self):
+        """Four places tell you this; they drifted once already."""
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        assert "grow-up select && grow-up align && grow-up encode" in readme

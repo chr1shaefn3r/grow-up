@@ -619,6 +619,8 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     # to its runner-up. Kept here as well so `grow-up encode` on its own still
     # honours a freshly edited file -- that path leaves a gap rather than
     # promoting, because promotion needs `select` and `align` to run again.
+    # Anything this filter actually removes is therefore a rejection `select`
+    # has not seen, which `_warn_about_unpromoted` reports.
     rejects = review.load_manual_rejects(out_dir / "rejects.json")
     # `align` warps the runner-ups too, so the contact sheet can show what a
     # rejection would promote. They have frames rows like any other, and the
@@ -631,8 +633,7 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     kept = [r for r in rows if r["asset_id"] not in rejects]
     frames = [Path(r["path"]) for r in kept]
 
-    if rejects:
-        log(f"  encode: honouring {len(rejects)} manual rejects from rejects.json")
+    _warn_about_unpromoted(rows, kept, log)
     if not frames:
         raise RuntimeError("no frames left to encode")
 
@@ -674,6 +675,30 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     if len(written) > 1:
         log(f"  encode: stage took {timing.format_duration(stage_elapsed())}")
     return written
+
+
+def _warn_about_unpromoted(rows: list, kept: list, log: Log) -> None:
+    """Say so when a rejection is about to leave a hole rather than promote.
+
+    A rejection that has been through `select` is gone from `selection`
+    entirely, so it never reaches the rows here and this stage's filter removes
+    nothing. Anything it *does* remove is a rejection `select` has not seen --
+    which means the bucket will simply be empty, and the video will be short a
+    week while looking entirely plausible.
+
+    Silence in the healthy case is the point. Announcing the rejects on every
+    run made the broken path look exactly like the working one, and `select`
+    already reports them where the work actually happens.
+    """
+    missing = len(rows) - len(kept)
+    if not missing:
+        return
+    subject = ("1 rejection has" if missing == 1
+               else f"{missing} rejections have")
+    bucket = "its bucket" if missing == 1 else "their buckets"
+    log(f"  ! encode: {subject} not been through select, so {bucket} will be "
+        "left empty instead of falling through to the runner-up.")
+    log("    Run: grow-up select && grow-up align && grow-up encode")
 
 
 def _timed_encode(log: Log, frames: list[Path], out_path: Path, **settings) -> Path:

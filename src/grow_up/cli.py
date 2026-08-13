@@ -772,8 +772,13 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     log("== encode ==")
     cmd_encode(args)
-    log("\nReview out/contact-sheet.html, drop rejects.json beside it, "
-        "then re-run `grow-up encode` to apply them.")
+    # Naming all three matters, and so does saying why. `grow-up encode` alone
+    # reaches only this stage's own filter, which can drop a frame but cannot
+    # reconsider a bucket -- so it leaves the week empty instead of handing it
+    # to the runner-up, and says nothing about having done so.
+    log("\nReview out/contact-sheet.html, drop rejects.json beside it, then re-run\n"
+        "`grow-up select && grow-up align && grow-up encode` to apply them --\n"
+        "select is what promotes each rejected photo's bucket to its runner-up.")
 
 
 def build_parser() -> argparse.ArgumentParser:

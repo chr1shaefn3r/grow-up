@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -900,3 +901,92 @@ class TestTheStageReportsWhatItCost:
         timed = self.timing_lines(self.lines_for(
             conn, tmp_path, monkeypatch, {}, clock=[0.0, 0.0, 0.012, 0.02]))
         assert timed[0].endswith("in 12ms")
+
+
+class TestAStaleRejectIsNotSilent:
+    """`grow-up encode` alone can drop a frame but cannot reconsider a bucket.
+
+    Following that advice used to leave a week missing and print
+    `honouring 11 manual rejects`, which reads like success. The video looks
+    entirely plausible; only the calendar is wrong.
+    """
+
+    @pytest.fixture()
+    def conn(self, tmp_path):
+        from grow_up import db
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        for i in range(1, 4):
+            frame = tmp_path / f"frame_{i:06d}.jpg"
+            frame.write_bytes(b"\xff\xd8\xff")
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01", stamp))
+            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                         " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+            conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                         " selected_at) VALUES (?, ?, 0, 0, ?)",
+                         (f"a{i}", f"2026-0{i}", stamp))
+        return conn
+
+    def run_with(self, conn, tmp_path, monkeypatch, rejected):
+        from grow_up import pipeline
+
+        monkeypatch.setattr(pipeline, "encode", lambda frames, out, **kw: out)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir(exist_ok=True)
+        (out_dir / "rejects.json").write_text(json.dumps({"rejected": rejected}))
+        lines = []
+        pipeline.stage_encode(conn, out_dir, {}, lines.append)
+        return lines
+
+    def test_a_rejection_select_has_not_seen_is_reported(self, conn, tmp_path,
+                                                          monkeypatch):
+        lines = self.run_with(conn, tmp_path, monkeypatch, ["a2"])
+        assert any("not been through select" in line for line in lines)
+
+    def test_the_warning_names_all_three_stages(self, conn, tmp_path, monkeypatch):
+        """One command is what caused this; the fix has to spell out three."""
+        lines = self.run_with(conn, tmp_path, monkeypatch, ["a2"])
+        advice = next(line for line in lines if "Run:" in line)
+        assert "grow-up select && grow-up align && grow-up encode" == advice.split("Run: ")[1]
+
+    def test_it_counts_only_what_this_stage_dropped(self, conn, tmp_path, monkeypatch):
+        """Ids already gone from selection are select's work, not a warning."""
+        conn.execute("DELETE FROM selection WHERE asset_id = 'a3'")
+        lines = self.run_with(conn, tmp_path, monkeypatch, ["a2", "a3"])
+        assert any("1 rejection has not been" in line for line in lines)
+
+    def test_the_plural_agrees(self, conn, tmp_path, monkeypatch):
+        lines = self.run_with(conn, tmp_path, monkeypatch, ["a1", "a2"])
+        assert any("2 rejections have not been" in line for line in lines)
+
+    def test_a_rejection_select_applied_says_nothing(self, conn, tmp_path, monkeypatch):
+        """After select the id is gone from selection, so this stage drops
+        nothing and has nothing to report -- select already did."""
+        conn.execute("DELETE FROM selection WHERE asset_id = 'a2'")
+        lines = self.run_with(conn, tmp_path, monkeypatch, ["a2"])
+
+        assert not any("not been through select" in line for line in lines)
+        assert not any("honouring" in line for line in lines)
+
+    def test_a_clean_run_never_mentions_rejects(self, conn, tmp_path, monkeypatch):
+        lines = self.run_with(conn, tmp_path, monkeypatch, [])
+        assert not any("reject" in line for line in lines)
+
+    def test_the_frame_is_still_dropped(self, conn, tmp_path, monkeypatch):
+        """The warning explains the gap; it does not avert it. Encoding alone
+        must keep honouring the file, which is what makes a quick re-render
+        possible when nothing needs promoting."""
+        from grow_up import pipeline
+
+        seen = {}
+        monkeypatch.setattr(pipeline, "encode",
+                            lambda frames, out, **kw: seen.update(f=list(frames)) or out)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir(exist_ok=True)
+        (out_dir / "rejects.json").write_text('{"rejected": ["a2"]}')
+        pipeline.stage_encode(conn, out_dir, {}, lambda _: None)
+
+        assert len(seen["f"]) == 2
+        assert all("000002" not in str(f) for f in seen["f"])
