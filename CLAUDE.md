@@ -158,9 +158,10 @@ about it, and they are the ones an agent forgets.
 
 1. **Bump the version in both files** — `pyproject.toml` and `src/grow_up/__init__.py`.
    They are the only two that carry it.
-2. **A `Release X.Y.Z` commit, then an annotated tag** `vX.Y.Z` with the message
-   `grow-up X.Y.Z`. The commit body says what changed and why it matters, then why it is
-   a minor rather than a major, then the test count.
+2. **A `Release X.Y.Z` commit, then an annotated tag** `vX.Y.Z`, whose message is the
+   project name followed by the version — read an existing one rather than guessing
+   (`git tag -l --format='%(contents)' v1.4.0`). The commit body says what changed and
+   why it matters, then why it is a minor rather than a major, then the test count.
 3. **A GitHub release body**, in Markdown, in the shape the previous ones use: the
    problem, the fix, what could have gone wrong, what does not break for an existing
    setup, the test counts, and a closing note on authorship and on what was *not*
