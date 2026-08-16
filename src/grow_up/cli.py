@@ -365,6 +365,10 @@ def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tupl
 
     Returns (kept, scored, frames).
     """
+    # Before the filter pass, so an unusable cadence is the first thing said
+    # rather than a footnote under a line of progress.
+    _check_cadence(cfg, conn, cadence)
+
     manual = _manual_rejects(cfg)
     kept, scored = select.apply_filters(conn, cfg.section("filter"), cfg.section("score"),
                                         manual)
@@ -373,7 +377,7 @@ def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tupl
         log(f"  select: {len(manual)} rejected by hand in rejects.json; "
             "buckets fall through to the next best")
 
-    cadence = cadence or str(cfg.get("select", "cadence", "week"))
+    cadence = _cadence(cfg, cadence)
     per_bucket = int(cfg.get("select", "per_bucket", 1))
     alternates = int(cfg.get("select", "alternates", 2))
     frames = select.select_frames(conn, cadence, per_bucket, alternates)
@@ -385,6 +389,17 @@ def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tupl
             "sheet can show what a rejection would promote")
     pipeline.report_rejects(conn, log)
     return kept, scored, frames
+
+
+def _cadence(cfg: config.Config, override: str | None) -> str:
+    """The cadence a run will actually use: the flag if given, else the config."""
+    return override or str(cfg.get("select", "cadence", "week"))
+
+
+def _check_cadence(cfg: config.Config, conn, override: str | None) -> None:
+    """Fail on an impossible cadence while it is still cheap to say so."""
+    if _cadence(cfg, override) == select.BIRTHDAY_MONTHS:
+        select.require_birth_date(conn)
 
 
 def cmd_select(args: argparse.Namespace) -> None:
@@ -761,6 +776,12 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     log("== index ==")
     asyncio.run(network_stages())
+
+    # `select` runs at the end of analyze, so a cadence that cannot bucket would
+    # otherwise surface an hour of landmarking later. Checked here rather than
+    # before the run because `index` is what fetches the birth date in the first
+    # place, and on a first run there is nothing to check until it has.
+    _check_cadence(cfg, conn, getattr(args, "cadence", None))
 
     log("== analyze ==")
     cmd_analyze(args)

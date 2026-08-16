@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+import calendar
 import sqlite3
 from datetime import date, datetime
 
-from .db import iso_z, now_utc
+# The day-of-month correction lives in one place. Re-deriving it here would give
+# the footer and the bucketing two different opinions about when someone born on
+# the 31st turns a month older, and the video would disagree with its own caption.
+from .annotate import months_between
+from .db import birth_date, iso_z, now_utc
 
-CADENCES = ("day", "week", "month", "all")
+BIRTHDAY_MONTHS = "birthday-months"
+
+CADENCES = ("day", "week", "month", BIRTHDAY_MONTHS, "all")
+
+
+class BirthDateRequired(RuntimeError):
+    """`birthday-months` was asked for and Immich has no birth date.
+
+    A RuntimeError because `cli.app` catches that and prints it without a
+    traceback: this is a thing for the user to go and fix in Immich, not a bug
+    for them to report.
+    """
 
 
 def parse_when(value: str | None) -> datetime | None:
@@ -26,12 +42,66 @@ def parse_when(value: str | None) -> datetime | None:
     return None
 
 
-def bucket_key(when: datetime | date, cadence: str) -> str:
+def require_birth_date(conn: sqlite3.Connection) -> date:
+    """The subject's birth date, or a message saying how to get one.
+
+    Written once and raised from both `select_frames` and the early check in
+    `run`, so the two cannot drift into giving different advice.
+    """
+    born = _as_date(birth_date(conn))
+    if born is None:
+        raise BirthDateRequired(
+            f'cadence "{BIRTHDAY_MONTHS}" needs the subject\'s birth date, and '
+            "Immich has none for this person.\n"
+            "  Set it under the person in Immich, then re-run `grow-up index` "
+            "to store it.\n"
+            "  Or pick a cadence that does not need one: "
+            f"{', '.join(c for c in CADENCES if c != BIRTHDAY_MONTHS)}."
+        )
+    return born
+
+
+def _as_date(value: str | None) -> date | None:
+    """Immich stores the birth date as `YYYY-MM-DD`, but tolerate a timestamp."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def birthday_month_start(birth: date, index: int) -> date:
+    """The first date that falls in the `index`-th month of someone's life.
+
+    Exactly the inverse of `months_between`, and it has to be: the bucket a photo
+    lands in is decided there, and this only names it. A label computed by some
+    other rule would drift from the grouping it claims to describe, which shows
+    up as two buckets sharing a name -- one week of the timelapse silently
+    swallowing another.
+
+    The awkward case is a birthday on a day the target month does not have. Born
+    on 31 January, no February date is on or past the birthday, so the month does
+    not begin until March does. `months_between` already says so by treating all
+    of February as still belonging to the previous month; this follows it rather
+    than inventing a clamp of its own.
+    """
+    total = birth.year * 12 + (birth.month - 1) + index
+    year, month = divmod(total, 12)
+    if birth.day <= calendar.monthrange(year, month + 1)[1]:
+        return date(year, month + 1, birth.day)
+    year, month = divmod(total + 1, 12)
+    return date(year, month + 1, 1)
+
+
+def bucket_key(when: datetime | date, cadence: str, birth: date | None = None) -> str:
     """Temporal bucket label.
 
     Bucketing is what makes the video read as growing up rather than as a diary
     of when the camera happened to come out: without it a photo-heavy holiday
     dominates the timeline and quiet months flash past in a second.
+
+    `birth` is required by `birthday-months` and ignored by everything else.
     """
     if cadence == "day":
         return when.strftime("%Y-%m-%d")
@@ -40,6 +110,16 @@ def bucket_key(when: datetime | date, cadence: str) -> str:
         return f"{year:04d}-W{week:02d}"
     if cadence == "month":
         return when.strftime("%Y-%m")
+    if cadence == BIRTHDAY_MONTHS:
+        if birth is None:
+            raise BirthDateRequired(
+                f'cadence "{BIRTHDAY_MONTHS}" needs a birth date to bucket against'
+            )
+        # Labelled by the date the month opens, so every label carries the
+        # birthday's own day and a glance at the contact sheet says whether the
+        # alignment is doing what was asked.
+        as_date = when.date() if isinstance(when, datetime) else when
+        return birthday_month_start(birth, months_between(birth, as_date)).isoformat()
     if cadence == "all":
         return when.strftime("%Y-%m-%dT%H:%M:%S")
     raise ValueError(f"unknown cadence {cadence!r}; expected one of {CADENCES}")
@@ -101,6 +181,10 @@ def select_frames(conn: sqlite3.Connection, cadence: str, per_bucket: int,
     """
     if cadence not in CADENCES:
         raise ValueError(f"unknown cadence {cadence!r}; expected one of {CADENCES}")
+    # Resolved before the read and well before the DELETE below: a run that
+    # cannot bucket must leave the previous selection intact rather than empty
+    # the table and then fail.
+    born = require_birth_date(conn) if cadence == BIRTHDAY_MONTHS else None
 
     rows = conn.execute(
         "SELECT m.asset_id, m.score, a.local_datetime"
@@ -117,7 +201,7 @@ def select_frames(conn: sqlite3.Connection, cadence: str, per_bucket: int,
         when = parse_when(row["local_datetime"])
         if when is None:
             continue
-        key = bucket_key(when, cadence)
+        key = bucket_key(when, cadence, born)
         rank = buckets.get(key, 0)
         if rank >= depth:
             continue

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
 from grow_up import db, select
+from grow_up.annotate import months_between
 
 LIMITS = {
     "max_yaw": 20.0, "max_pitch": 18.0, "max_roll": 25.0, "max_gaze": 0.35,
@@ -368,3 +369,129 @@ class TestADatabaseFromTheLastReleaseUpgrades:
             "SELECT f.asset_id FROM frames f JOIN selection s ON s.asset_id = f.asset_id"
             " WHERE s.alternate = 0").fetchall()
         assert [r["asset_id"] for r in kept] == ["a"]
+
+
+class TestBirthdayMonths:
+    """Buckets that turn over on the birthday rather than on the 1st.
+
+    A calendar month splits a life at an arbitrary point: the photo that opens
+    "2023-08" may be a day either side of turning three and a half. Aligning to
+    the birthday makes each frame one month of the subject's own age.
+    """
+
+    BIRTH = date(2020, 3, 14)
+
+    def bucket(self, when, birth=None):
+        return select.bucket_key(when, select.BIRTHDAY_MONTHS, birth or self.BIRTH)
+
+    def test_the_month_turns_over_on_the_birthday_not_the_first(self):
+        assert self.bucket(date(2023, 8, 13)) == "2023-07-14"
+        assert self.bucket(date(2023, 8, 14)) == "2023-08-14"
+
+    def test_a_calendar_month_boundary_does_not_split_a_bucket(self):
+        """The whole point: these two straddle 1 September and belong together."""
+        assert self.bucket(date(2023, 8, 31)) == self.bucket(date(2023, 9, 1))
+
+    def test_every_label_carries_the_birthday(self):
+        labels = [self.bucket(date(2023, m, 20)) for m in range(1, 13)]
+        assert all(label.endswith("-14") for label in labels), labels
+
+    def test_a_datetime_buckets_the_same_as_its_date(self):
+        assert self.bucket(datetime(2023, 8, 14, 23, 59)) == self.bucket(date(2023, 8, 14))
+
+    @pytest.mark.parametrize("birth", [date(2020, 3, 14), date(2020, 1, 31),
+                                       date(2020, 2, 29), date(2019, 12, 30)])
+    def test_the_label_is_the_exact_inverse_of_the_grouping(self, birth):
+        """`months_between` decides the bucket and this only names it.
+
+        A label computed by a different rule drifts from the grouping it claims
+        to describe, and two buckets sharing a name silently swallow one another.
+        """
+        for index in range(-24, 400):
+            start = select.birthday_month_start(birth, index)
+            assert months_between(birth, start) == index
+            assert months_between(birth, start - timedelta(days=1)) == index - 1
+
+    def test_a_birthday_on_the_31st_waits_for_a_month_that_has_one(self):
+        """February contains no date on or past the 31st, so the month opens
+        when March does -- which is what `months_between` already says."""
+        starts = [select.birthday_month_start(date(2020, 1, 31), i) for i in range(4)]
+        assert [d.isoformat() for d in starts] == [
+            "2020-01-31", "2020-03-01", "2020-03-31", "2020-05-01"]
+
+    def test_a_photo_older_than_the_birth_date_still_buckets(self):
+        """A wrong birth date, or a scan from before it, must not crash the run.
+
+        Age runs negative and the months keep counting backwards, so the photo
+        lands in a bucket of its own rather than being dropped or lumped in with
+        the first month of life.
+        """
+        assert self.bucket(date(2020, 1, 5)) == "2019-12-14"
+        assert self.bucket(date(2020, 1, 5)) != self.bucket(date(2020, 3, 20))
+
+    def test_it_is_offered_as_a_cadence(self):
+        assert select.BIRTHDAY_MONTHS in select.CADENCES
+
+    def test_a_missing_birth_date_is_refused_rather_than_guessed(self):
+        with pytest.raises(select.BirthDateRequired):
+            select.bucket_key(date(2023, 8, 14), select.BIRTHDAY_MONTHS)
+
+
+class TestTheCadenceThatNeedsABirthDate:
+    """Without one the cadence cannot mean anything, so the run stops and says
+    where to go and fix it."""
+
+    def conn_with(self, tmp_path, birth):
+        from grow_up import db
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        db.upsert_person(conn, "p1", "me", "Kid", birth)
+        stamp = "2026-01-01T00:00:00.000Z"
+        for i, when in enumerate(["2023-08-13", "2023-08-14", "2023-09-20"], start=1):
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (f"a{i}", when, stamp))
+            conn.execute("INSERT INTO metrics (asset_id, detected, reject_reason,"
+                         " score, analyzed_at, filtered_at)"
+                         " VALUES (?, 1, NULL, ?, ?, ?)",
+                         (f"a{i}", 1.0 - i / 10, stamp, stamp))
+        return conn
+
+    def test_it_buckets_by_age_when_the_birth_date_is_there(self, tmp_path):
+        conn = self.conn_with(tmp_path, "2020-03-14")
+        select.select_frames(conn, select.BIRTHDAY_MONTHS, 1, 0)
+
+        buckets = [r[0] for r in conn.execute(
+            "SELECT bucket FROM selection ORDER BY bucket")]
+        assert buckets == ["2023-07-14", "2023-08-14", "2023-09-14"], (
+            "13 and 14 August are different months of this child's life")
+
+    def test_a_missing_birth_date_names_the_cadence_and_the_fix(self, tmp_path):
+        conn = self.conn_with(tmp_path, None)
+        with pytest.raises(select.BirthDateRequired) as caught:
+            select.select_frames(conn, select.BIRTHDAY_MONTHS, 1, 0)
+
+        message = str(caught.value)
+        assert select.BIRTHDAY_MONTHS in message
+        assert "grow-up index" in message, "must say how to get the birth date stored"
+        assert "week" in message, "must offer a cadence that works instead"
+
+    def test_the_error_is_catchable_by_the_cli(self):
+        """`cli.app` prints RuntimeError without a traceback; a bare Exception
+        would reach the user as a crash report for a config mistake."""
+        assert issubclass(select.BirthDateRequired, RuntimeError)
+
+    def test_the_previous_selection_survives_the_refusal(self, tmp_path):
+        """The check runs before the DELETE. Emptying the table and then failing
+        would turn a fixable mistake into a re-run of select, align and encode."""
+        conn = self.conn_with(tmp_path, None)
+        select.select_frames(conn, "month", 1, 0)
+        before = conn.execute("SELECT count(*) FROM selection").fetchone()[0]
+        assert before > 0
+
+        with pytest.raises(select.BirthDateRequired):
+            select.select_frames(conn, select.BIRTHDAY_MONTHS, 1, 0)
+        assert conn.execute("SELECT count(*) FROM selection").fetchone()[0] == before
+
+    def test_other_cadences_do_not_need_one(self, tmp_path):
+        conn = self.conn_with(tmp_path, None)
+        assert select.select_frames(conn, "month", 1, 0) > 0

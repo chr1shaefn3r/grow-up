@@ -142,8 +142,12 @@ w_size = 0.5       # eye-to-eye distance, saturating at 4x min_interocular_px
 limit = 100
 
 [select]
-# day | week | month | all -- bucket the timeline and keep the best per bucket,
-# so a photo-heavy holiday cannot dominate the video.
+# day | week | month | birthday-months | all -- bucket the timeline and keep the
+# best per bucket, so a photo-heavy holiday cannot dominate the video.
+# "birthday-months" is a month that turns over on the subject's birthday rather
+# than on the 1st, so each frame is one month of their age instead of one page of
+# the calendar. It needs a birth date set on the person in Immich, and the run
+# stops and says so if there is none.
 cadence = "week"
 # Frames kept per bucket, best-scoring first. Above 1 the video lingers on the
 # busier weeks, which is usually not what a timelapse wants -- widen the cadence

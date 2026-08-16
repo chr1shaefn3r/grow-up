@@ -625,6 +625,23 @@ a photo-heavy holiday dominates the video while quiet months flash past. Togethe
 `encode.fps` it sets the pace: one frame per week at 10 fps covers about a year in five
 seconds.
 
+**`birthday-months` counts from the birthday instead of the 1st.** A calendar month cuts
+a life at an arbitrary point — the frame that opens `2023-08` may be a day either side of
+turning three and a half. With this cadence the buckets turn over on the subject's own
+birthday, so each frame is one month of their age:
+
+```toml
+[select]
+cadence = "birthday-months"    # born on the 14th → 14 Aug to 13 Sep is one bucket
+```
+
+It pairs with the `[encode.annotate]` footer, which counts age the same way, so the
+captions advance one clean step per frame rather than drifting within the month. It needs
+a birth date on the person in Immich; without one the run stops and says where to set it,
+rather than quietly falling back to calendar months. A birthday on the 31st is handled the
+way the age footer already handles it — February belongs to the previous month, since no
+date in it is on or past the 31st.
+
 Two rates, not one. `encode.fps` is how fast *photographs* advance — `0.5` holds each one
 for two seconds. `encode.playback_fps` is the video's own frame rate, and only matters
 once you ask for a transition, because a dissolve lives in the frames between two
