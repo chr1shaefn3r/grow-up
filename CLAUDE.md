@@ -151,6 +151,25 @@ Hand these to the human running a real library:
    blend; a black band behind the text means the overlay lost its alpha; a ghosted date
    means the footer went through the filter instead of over it.
 
+## Releasing
+
+Four things, every time. The first two are the release; the last two are how anyone hears
+about it, and they are the ones an agent forgets.
+
+1. **Bump the version in both files** — `pyproject.toml` and `src/grow_up/__init__.py`.
+   They are the only two that carry it.
+2. **A `Release X.Y.Z` commit, then an annotated tag** `vX.Y.Z` with the message
+   `grow-up X.Y.Z`. The commit body says what changed and why it matters, then why it is
+   a minor rather than a major, then the test count.
+3. **A GitHub release body**, in Markdown, in the shape the previous ones use: the
+   problem, the fix, what could have gone wrong, what does not break for an existing
+   setup, the test counts, and a closing note on authorship and on what was *not*
+   verified. Hand it over to paste — the releases are authored by the owner.
+4. **A short summary for the Reddit thread**, one bullet appended to the EDIT list in the
+   original post. Match the bullets already there: `X.Y.Z — <capability>. <why it
+   mattered>.` in 35–55 words of plain prose, no config syntax, no backticks, no error
+   handling. They lead with what you can now do, not with the changelog.
+
 ## Conventions
 
 Comments say *why*, never what the line already says; several in this codebase exist
