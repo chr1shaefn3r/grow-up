@@ -82,10 +82,17 @@ DEFAULT_URL_ENV = "IMMICH_URL"
 DEFAULT_KEY_ENV = "IMMICH_API_KEY"
 
 
+def _missing_env(url_env: str, key_env: str) -> list[str]:
+    """Which of the two variables are unset, in the order they are documented."""
+    url = os.environ.get(url_env, "").rstrip("/")
+    api_key = os.environ.get(key_env, "")
+    return [n for n, v in ((url_env, url), (key_env, api_key)) if not v]
+
+
 def _credentials_from(url_env: str, key_env: str, whose: str = "") -> Credentials:
     url = os.environ.get(url_env, "").rstrip("/")
     api_key = os.environ.get(key_env, "")
-    missing = [n for n, v in ((url_env, url), (key_env, api_key)) if not v]
+    missing = _missing_env(url_env, key_env)
     if missing:
         raise RuntimeError(
             f"missing environment variable(s){whose}: {', '.join(missing)}"
@@ -130,6 +137,40 @@ class Source:
 
     def credentials(self) -> Credentials:
         return _credentials_from(self.url_env, self.key_env, f" for source {self.name!r}")
+
+    def missing_env(self) -> list[str]:
+        """The variables this account needs and does not have."""
+        return _missing_env(self.url_env, self.key_env)
+
+
+def check_credentials(sources: list[Source]) -> None:
+    """Report every account's missing variables at once, before any work starts.
+
+    Resolving these lazily meant one round trip per account: set the first
+    account's two variables, re-run, and be told about the second -- each failure
+    looking like a fresh problem rather than the rest of the one already being
+    fixed. Setting up two accounts is exactly when the reader is least sure what
+    the whole list should be.
+
+    Same reasoning as `cli.preflight_all` checking every key before any of them
+    downloads anything, and it runs first because a variable that is not set is
+    cheaper to discover than a key that is not accepted.
+
+    One account's worth of gaps keeps the message it has always had; only the
+    genuinely new case -- more than one account short -- gets the longer form.
+    """
+    gaps = [(source.name, missing)
+            for source in sources if (missing := source.missing_env())]
+    if not gaps:
+        return
+    if len(gaps) == 1:
+        name, missing = gaps[0]
+        raise RuntimeError(
+            f"missing environment variable(s) for source {name!r}: {', '.join(missing)}"
+        )
+    detail = "\n".join(f"    source {name!r}: {', '.join(missing)}"
+                       for name, missing in gaps)
+    raise RuntimeError(f"missing environment variable(s):\n{detail}")
 
 
 def sources(cfg: Config) -> list[Source]:

@@ -321,3 +321,98 @@ class TestWatermarksAreIndependentPerAccount:
         """One account gaining photos must not make the other look drifted."""
         assert pipeline.detect_drift(stored_count=10, current_count=20, newly_indexed=2)
         assert not pipeline.detect_drift(stored_count=10, current_count=12, newly_indexed=2)
+
+
+class TestEveryMissingVariableIsNamedAtOnce:
+    """Setting up two accounts is when the reader is least sure what the whole
+    list of variables should be, and it used to be revealed one account at a
+    time: set the first account's two, re-run, discover the second's.
+    """
+
+    TWO = {"immich": {"sources": [
+        {"name": "me", "person_id": "person-a"},
+        {"name": "her", "person_id": "person-b", "key_env": "IMMICH_API_KEY_PARTNER"},
+    ]}}
+
+    def clear(self, monkeypatch, *names):
+        for name in names:
+            monkeypatch.delenv(name, raising=False)
+
+    def test_one_message_carries_every_account_and_every_variable(self, monkeypatch):
+        self.clear(monkeypatch, "IMMICH_URL", "IMMICH_API_KEY", "IMMICH_API_KEY_PARTNER")
+        sources = config.sources(cfg(self.TWO))
+
+        with pytest.raises(RuntimeError) as caught:
+            config.check_credentials(sources)
+
+        message = str(caught.value)
+        for expected in ("me", "her", "IMMICH_URL", "IMMICH_API_KEY",
+                         "IMMICH_API_KEY_PARTNER"):
+            assert expected in message, f"{expected!r} missing from:\n{message}"
+
+    def test_the_second_account_is_named_before_the_first_is_fixed(self, monkeypatch):
+        """The actual complaint: the report must not stop at the first account."""
+        self.clear(monkeypatch, "IMMICH_URL", "IMMICH_API_KEY", "IMMICH_API_KEY_PARTNER")
+
+        with pytest.raises(RuntimeError, match="IMMICH_API_KEY_PARTNER"):
+            config.check_credentials(config.sources(cfg(self.TWO)))
+
+    def test_one_account_short_keeps_the_message_it_always_had(self, monkeypatch):
+        """Only the genuinely new case gets the longer form; a single-account
+        setup is the overwhelming majority and its output should not change."""
+        monkeypatch.setenv("IMMICH_URL", "https://immich.example.com")
+        monkeypatch.setenv("IMMICH_API_KEY", "k")
+        self.clear(monkeypatch, "IMMICH_API_KEY_PARTNER")
+
+        with pytest.raises(RuntimeError) as caught:
+            config.check_credentials(config.sources(cfg(self.TWO)))
+
+        message = str(caught.value)
+        assert message == ("missing environment variable(s) for source 'her': "
+                           "IMMICH_API_KEY_PARTNER")
+
+    def test_a_complete_environment_raises_nothing(self, monkeypatch):
+        monkeypatch.setenv("IMMICH_URL", "https://immich.example.com")
+        monkeypatch.setenv("IMMICH_API_KEY", "k")
+        monkeypatch.setenv("IMMICH_API_KEY_PARTNER", "k2")
+        config.check_credentials(config.sources(cfg(self.TWO)))
+
+    def test_a_shared_variable_is_reported_against_both_accounts(self, monkeypatch):
+        """`her` inherits the default URL, so an unset IMMICH_URL is her problem
+        too -- and a reader fixing only what is listed under `me` would re-run
+        into the same wall."""
+        self.clear(monkeypatch, "IMMICH_URL", "IMMICH_API_KEY", "IMMICH_API_KEY_PARTNER")
+
+        with pytest.raises(RuntimeError) as caught:
+            config.check_credentials(config.sources(cfg(self.TWO)))
+
+        lines = str(caught.value).splitlines()
+        hers = next(line for line in lines if "'her'" in line)
+        assert "IMMICH_URL" in hers
+
+    def test_it_runs_before_any_account_is_contacted(self, monkeypatch):
+        """It is the first thing preflight does, so a variable that is not set
+        is reported without a single request going out."""
+        from grow_up import cli
+
+        self.clear(monkeypatch, "IMMICH_URL", "IMMICH_API_KEY", "IMMICH_API_KEY_PARTNER")
+        monkeypatch.setattr(cli, "_client", lambda *a, **k: pytest.fail(
+            "a client was built before the environment was checked"))
+
+        with pytest.raises(RuntimeError, match="IMMICH_API_KEY_PARTNER"):
+            asyncio.run(cli.preflight_all(cfg(self.TWO), config.sources(cfg(self.TWO))))
+
+    def test_status_still_works_with_no_credentials_at_all(self, monkeypatch, tmp_path):
+        """The check belongs to the stages that talk to Immich. `status` reads
+        the manifest, and putting the check where every command shares it would
+        have made an offline report demand an API key."""
+        from grow_up import cli
+
+        self.clear(monkeypatch, "IMMICH_URL", "IMMICH_API_KEY", "IMMICH_API_KEY_PARTNER")
+        db.connect(tmp_path / "g.sqlite").close()
+        (tmp_path / "config.toml").write_text(
+            '[paths]\ndb = "g.sqlite"\nout = "out"\n'
+            '[[immich.sources]]\nname = "me"\n'
+            '[[immich.sources]]\nname = "her"\nkey_env = "IMMICH_API_KEY_PARTNER"\n')
+
+        assert cli.app(["--config", str(tmp_path / "config.toml"), "status"]) == 0

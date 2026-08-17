@@ -97,6 +97,11 @@ async def preflight_all(cfg: config.Config, sources: list[config.Source]) -> Non
     Prints nothing of its own. A healthy preflight has always been silent, so a
     per-source heading here labelled output that never arrived.
     """
+    # Every account's environment first. Building a client resolves one
+    # account's variables, so without this the second account's missing key is
+    # only reported once the first account's have been set.
+    config.check_credentials(sources)
+
     for source in sources:
         whose = f" for source {source.name!r}" if len(sources) > 1 else ""
         async with _client(cfg, source) as client:
@@ -631,6 +636,10 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     """
     cfg, conn = _open(args)
     sources = _sources(cfg, args.source)
+    # doctor deliberately skips preflight -- probing each endpoint one at a time
+    # is the whole point of it -- so it needs this check of its own. Diagnosing
+    # one account at a time is exactly what it should not do here.
+    config.check_credentials(sources)
 
     async def probe_source(source: config.Source) -> None:
         # Probe with an asset this account actually owns: another account's id
