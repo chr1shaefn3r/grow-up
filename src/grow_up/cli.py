@@ -435,7 +435,8 @@ def cmd_encode(args: argparse.Namespace) -> None:
     # The same worker count `align` uses: with a footer enabled there are two
     # independent renders, and ffmpeg cannot spread either across cores itself.
     for out in pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log,
-                                     int(cfg.get("analyze", "workers", 0))):
+                                     int(cfg.get("analyze", "workers", 0)),
+                                     force=args.force):
         log(f"  encode: wrote {out}")
 
 
@@ -550,9 +551,13 @@ def cmd_trial(args: argparse.Namespace) -> None:
         else:
             try:
                 with timing.stopwatch() as encode_elapsed:
+                    # Always renders. A trial exists to measure what encoding
+                    # costs and project the full run from it, and a skipped
+                    # render would measure nothing and project from it -- the
+                    # kind of wrong answer that arrives looking like a fast one.
                     videos = pipeline.stage_encode(
                         conn, out_dir, encode_cfg, log,
-                        int(cfg.get("analyze", "workers", 0)))
+                        int(cfg.get("analyze", "workers", 0)), force=True)
                 trial.stages.append(timing.StageTiming(
                     "encode", aligned, encode_elapsed(),
                     max(0, projected_frames - aligned),
@@ -830,7 +835,7 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=func, since=None, full=False, reanalyze=False,
                        cadence=None, no_encode=False, asset=None, limit=None,
-                       effort=None, compare=False, source=None)
+                       effort=None, compare=False, source=None, force=False)
         return p
 
     def add_source_flag(p: argparse.ArgumentParser) -> None:
@@ -897,7 +902,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("align", cmd_align, "warp selected frames onto canonical eye positions")
     add("review", cmd_review, "write the contact sheet and rejects gallery")
-    add("encode", cmd_encode, "encode the video")
+    enc = add("encode", cmd_encode, "encode the video")
+    enc.add_argument("--force", action="store_true",
+                     help="re-render even if the video is already up to date")
     add("status", cmd_status, "show manifest counts and the stored watermark")
     return parser
 

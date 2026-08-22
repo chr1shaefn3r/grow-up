@@ -21,6 +21,8 @@ and annotated videos at once rather than one after the other.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -40,6 +42,32 @@ def ffmpeg_binary() -> str:
             "apt install ffmpeg) and re-run."
         )
     return path
+
+
+def fingerprint(frames: list[tuple[str, str, str]], settings: dict,
+                extra: dict | None = None) -> str:
+    """A digest of everything that decides the bytes ffmpeg will write.
+
+    `frames` is one `(asset_id, path, warped_at)` per photograph, in order. All
+    three matter and for different reasons: the ids and their order are the
+    video's content, the paths are where the pixels are read from, and
+    `warped_at` is `align`'s own record of when it last rewrote each frame --
+    which is what catches a re-align that changed the framing without changing
+    which photographs were chosen. Comparing file contents would be the other
+    way to notice that, at the cost of reading every frame to decide whether to
+    read every frame.
+
+    Pure, and JSON rather than `hash()`, because the digest is written to the
+    manifest and has to mean the same thing in the next process. `sort_keys`
+    for the same reason: dict order must not decide whether a render is reused.
+    """
+    payload = json.dumps(
+        {"frames": [list(f) for f in frames],
+         "settings": {k: settings[k] for k in sorted(settings)},
+         "extra": extra or {}},
+        sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def moving_seconds(hold_fps: float, transition_seconds: float) -> float:

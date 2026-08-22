@@ -112,6 +112,12 @@ CREATE TABLE IF NOT EXISTS people (
     fetched_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS renders (
+    path         TEXT PRIMARY KEY,      -- the video, absolute, as it was written
+    fingerprint  TEXT NOT NULL,         -- encode.fingerprint of the inputs behind it
+    rendered_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     person_id     TEXT PRIMARY KEY,
     watermark     TEXT NOT NULL,         -- UTC ISO-8601, passed to the API as updatedAfter
@@ -319,6 +325,35 @@ def birth_date(conn: sqlite3.Connection) -> str | None:
         "SELECT birth_date FROM people WHERE birth_date IS NOT NULL"
         " ORDER BY person_id LIMIT 1").fetchone()
     return row["birth_date"] if row else None
+
+
+def _render_key(path) -> str:
+    """Absolute, so the record survives being run from another directory."""
+    return str(Path(path).resolve())
+
+
+def record_render(conn: sqlite3.Connection, path, fingerprint: str) -> None:
+    """Remember what produced this video. Called only after ffmpeg succeeded.
+
+    A killed ffmpeg leaves a partial file and no row, so the next run re-renders
+    rather than trusting a truncated video.
+    """
+    conn.execute(
+        "INSERT INTO renders (path, fingerprint, rendered_at) VALUES (?, ?, ?)"
+        " ON CONFLICT (path) DO UPDATE SET"
+        "   fingerprint = excluded.fingerprint,"
+        "   rendered_at = excluded.rendered_at",
+        (_render_key(path), fingerprint, iso_z(now_utc())),
+    )
+    conn.commit()
+
+
+def render_fingerprint(conn: sqlite3.Connection, path) -> str | None:
+    """What produced the video at `path` last time, if this manifest knows."""
+    row = conn.execute(
+        "SELECT fingerprint FROM renders WHERE path = ?", (_render_key(path),)
+    ).fetchone()
+    return row["fingerprint"] if row else None
 
 
 def count_assets(conn: sqlite3.Connection) -> int:

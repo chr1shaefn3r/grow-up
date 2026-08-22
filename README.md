@@ -103,6 +103,19 @@ because every metric is stored per asset:
 
 After any of them, `grow-up review` rewrites both pages so you can look again.
 
+`grow-up encode` is a no-op when nothing that reaches ffmpeg has changed. It compares the
+frames, their last alignment and every encode setting against what produced the video
+already on disk, and says so rather than spending the minutes again:
+
+```
+  encode: skipped out/timelapse.mp4 -- same frames and settings as last time
+  encode: nothing to render; `grow-up encode --force` renders anyway
+```
+
+The two videos are judged separately, so changing `[encode.annotate]` re-renders the
+annotated one and leaves the clean one alone. Deleting a video brings it back on the next
+run; `--force` re-renders regardless.
+
 **5. Decide how much accuracy you want to pay for.** With a sample already downloaded,
 this measures itself:
 

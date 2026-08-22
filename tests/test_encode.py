@@ -1101,3 +1101,315 @@ class TestTheTwoVideosRenderTogether:
         start = time.perf_counter()
         pipeline.stage_encode(conn, tmp_path / "out", self.ANNOTATED, lambda _: None)
         assert time.perf_counter() - start < 0.19, "the renders ran one after the other"
+
+
+@pytest.fixture()
+def conn(tmp_path):
+    """Three selected, warped frames and a subject with a birth date."""
+    from grow_up import db
+
+    pytest.importorskip("PIL.Image", reason="needs Pillow")
+    from PIL import Image
+
+    conn = db.connect(tmp_path / "t.sqlite")
+    stamp = "2026-01-01T00:00:00.000Z"
+    db.upsert_person(conn, "p1", "me", "Kid", "2020-03-14")
+    for i in range(1, 4):
+        frame = tmp_path / f"frame_{i:06d}.jpg"
+        Image.new("RGB", (120, 150), (90, 90, 90)).save(frame)
+        conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                     " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01T10:00:00", stamp))
+        conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                     " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+        conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                     " selected_at) VALUES (?, ?, 0, 0, ?)",
+                     (f"a{i}", f"2026-0{i}", stamp))
+    conn.commit()
+    return conn
+
+
+@pytest.fixture()
+def spy(monkeypatch):
+    """A stand-in ffmpeg that records every render and writes a real file."""
+    from grow_up import pipeline
+
+    calls: list[str] = []
+
+    def fake_encode(frames, out_path, **kwargs):
+        calls.append(out_path.name)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"video-bytes")
+        return out_path
+
+    monkeypatch.setattr(pipeline, "encode", fake_encode)
+    return calls
+
+
+class TestEncodeIsIdempotent:
+    """The same frames and the same settings should not pay for ffmpeg twice.
+
+    A morph is measured in minutes, so re-running `encode` after changing
+    nothing -- or as the tail of a `run` that indexed no new photos -- used to
+    cost a full render to arrive at the identical file.
+    """
+
+    PLAIN = {"fps": 0.5}
+    FOOTER = {"fps": 0.5, "annotate": {"enabled": True, "age": "year_months"}}
+
+    def run(self, conn, tmp_path, cfg=None, **kwargs):
+        from grow_up import pipeline
+
+        lines: list[str] = []
+        written = pipeline.stage_encode(conn, tmp_path / "out",
+                                        self.PLAIN if cfg is None else cfg,
+                                        lines.append, **kwargs)
+        return written, lines
+
+    def test_a_second_run_over_the_same_inputs_skips_ffmpeg(self, conn, tmp_path, spy):
+        self.run(conn, tmp_path)
+        assert spy == ["timelapse.mp4"]
+
+        spy.clear()
+        written, lines = self.run(conn, tmp_path)
+
+        assert spy == [], "ffmpeg ran again for an identical video"
+        assert written == [], "nothing was written, so nothing should be reported as written"
+        assert any("skipped" in line for line in lines)
+
+    def test_the_skip_says_which_file_and_why(self, conn, tmp_path, spy):
+        self.run(conn, tmp_path)
+        _, lines = self.run(conn, tmp_path)
+
+        skip = next(line for line in lines if "skipped" in line)
+        assert str(tmp_path / "out" / "timelapse.mp4") in skip, (
+            "cli prints no path for a skip, so the stage has to")
+        assert "same frames and settings" in skip
+
+    def test_it_names_the_way_out(self, conn, tmp_path, spy):
+        self.run(conn, tmp_path)
+        _, lines = self.run(conn, tmp_path)
+        assert any("--force" in line for line in lines)
+
+    def test_force_renders_anyway(self, conn, tmp_path, spy):
+        self.run(conn, tmp_path)
+        spy.clear()
+        self.run(conn, tmp_path, force=True)
+        assert spy == ["timelapse.mp4"]
+
+    @pytest.mark.parametrize("changed", [
+        {"fps": 1.0}, {"crf": 20}, {"codec": "libx265"},
+        {"transition": "crossfade"}, {"playback_fps": 60},
+        {"transition_seconds": 0.5}, {"filename": "other.mp4"},
+    ])
+    def test_any_setting_that_reaches_ffmpeg_invalidates_it(self, conn, tmp_path, spy,
+                                                            changed):
+        self.run(conn, tmp_path)
+        spy.clear()
+        self.run(conn, tmp_path, cfg={**self.PLAIN, **changed})
+        assert spy, f"changing {changed} reused a video encoded without it"
+
+    def test_a_re_aligned_frame_invalidates_it(self, conn, tmp_path, spy):
+        """`align` rewrites the pixels without changing which photos were
+        chosen, so the frame list alone cannot notice a reframing."""
+        self.run(conn, tmp_path)
+        spy.clear()
+        conn.execute("UPDATE frames SET warped_at = ? WHERE asset_id = 'a2'",
+                     ("2026-06-06T00:00:00.000Z",))
+        conn.commit()
+
+        self.run(conn, tmp_path)
+        assert spy == ["timelapse.mp4"]
+
+    def test_a_different_set_of_photographs_invalidates_it(self, conn, tmp_path, spy):
+        self.run(conn, tmp_path)
+        spy.clear()
+        conn.execute("DELETE FROM selection WHERE asset_id = 'a2'")
+        conn.commit()
+
+        self.run(conn, tmp_path)
+        assert spy == ["timelapse.mp4"]
+
+    def test_reordering_the_same_photographs_invalidates_it(self, conn, tmp_path, spy):
+        """Same frames, different film."""
+        self.run(conn, tmp_path)
+        spy.clear()
+        conn.execute("UPDATE frames SET seq = 99 WHERE asset_id = 'a1'")
+        conn.commit()
+
+        self.run(conn, tmp_path)
+        assert spy == ["timelapse.mp4"]
+
+    def test_a_deleted_video_is_rendered_again(self, conn, tmp_path, spy):
+        """The manifest says it exists; the disk is the authority on that."""
+        self.run(conn, tmp_path)
+        (tmp_path / "out" / "timelapse.mp4").unlink()
+        spy.clear()
+
+        self.run(conn, tmp_path)
+        assert spy == ["timelapse.mp4"]
+
+    def test_a_truncated_video_is_rendered_again(self, conn, tmp_path, spy):
+        """An ffmpeg killed early leaves the file it had opened and nothing in it."""
+        self.run(conn, tmp_path)
+        (tmp_path / "out" / "timelapse.mp4").write_bytes(b"")
+        spy.clear()
+
+        self.run(conn, tmp_path)
+        assert spy == ["timelapse.mp4"]
+
+    def test_a_failed_render_is_not_recorded_as_done(self, conn, tmp_path, monkeypatch):
+        """Recording before ffmpeg returned would make a crash look like success."""
+        from grow_up import pipeline
+
+        def exploding(frames, out_path, **kwargs):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"partial")
+            raise RuntimeError("ffmpeg failed (1)")
+
+        monkeypatch.setattr(pipeline, "encode", exploding)
+        with pytest.raises(RuntimeError):
+            self.run(conn, tmp_path)
+
+        calls = []
+        monkeypatch.setattr(pipeline, "encode", lambda f, out, **kw: (
+            calls.append(out.name), out.write_bytes(b"v"), out)[-1])
+        self.run(conn, tmp_path)
+        assert calls == ["timelapse.mp4"]
+
+
+class TestTheTwoVideosAreJudgedSeparately:
+    """The footer settings decide one render and not the other, so a language
+    change should not re-pay for the clean video."""
+
+    FOOTER = {"fps": 0.5, "annotate": {"enabled": True, "age": "year_months"}}
+
+    def run(self, conn, tmp_path, cfg, **kwargs):
+        from grow_up import pipeline
+
+        lines: list[str] = []
+        pipeline.stage_encode(conn, tmp_path / "out", cfg, lines.append, **kwargs)
+        return lines
+
+    def test_both_are_skipped_when_nothing_changed(self, conn, tmp_path, spy):
+        self.run(conn, tmp_path, self.FOOTER)
+        assert sorted(spy) == ["timelapse-annotated.mp4", "timelapse.mp4"]
+
+        spy.clear()
+        self.run(conn, tmp_path, self.FOOTER)
+        assert spy == []
+
+    def test_a_footer_change_re_renders_only_the_annotated_one(self, conn, tmp_path, spy):
+        self.run(conn, tmp_path, self.FOOTER)
+        spy.clear()
+
+        german = {**self.FOOTER,
+                  "annotate": {**self.FOOTER["annotate"], "language": "de"}}
+        self.run(conn, tmp_path, german)
+
+        assert spy == ["timelapse-annotated.mp4"], (
+            "the clean video does not carry the footer and should not be re-encoded")
+
+    def test_a_corrected_birth_date_re_renders_the_annotated_one(self, conn, tmp_path, spy):
+        """The age is drawn from it, so every caption changes."""
+        from grow_up import db
+
+        self.run(conn, tmp_path, self.FOOTER)
+        spy.clear()
+        db.upsert_person(conn, "p1", "me", "Kid", "2019-03-14")
+        conn.commit()
+
+        self.run(conn, tmp_path, self.FOOTER)
+        assert spy == ["timelapse-annotated.mp4"]
+
+    def test_no_footer_layers_are_drawn_for_a_skipped_render(self, conn, tmp_path, spy):
+        """The skip is decided before the drawing, so it costs no Pillow work."""
+        self.run(conn, tmp_path, self.FOOTER)
+        lines = self.run(conn, tmp_path, self.FOOTER)
+        assert not any("annotated frames ->" in line for line in lines)
+
+
+class TestTheFingerprint:
+    """Pure arithmetic over the inputs, so it stays testable with no ffmpeg,
+    no Pillow and no database -- the same reason `transition_filters` is."""
+
+    FRAMES = [("a1", "/f/1.jpg", "2026-01-01T00:00:00Z"),
+              ("a2", "/f/2.jpg", "2026-01-01T00:00:00Z")]
+    SETTINGS = {"fps": 0.5, "codec": "libx264", "crf": 18}
+
+    def test_the_same_inputs_give_the_same_digest(self):
+        assert (encode.fingerprint(self.FRAMES, self.SETTINGS)
+                == encode.fingerprint(self.FRAMES, self.SETTINGS))
+
+    def test_it_survives_the_process_that_wrote_it(self):
+        """It is stored in the manifest and compared on a later run, so it must
+        not depend on anything per-process the way `hash()` does."""
+        assert encode.fingerprint(self.FRAMES, self.SETTINGS) == encode.fingerprint(
+            [tuple(f) for f in self.FRAMES], dict(self.SETTINGS))
+
+    def test_key_order_does_not_change_it(self):
+        """Otherwise a settings dict built in a different order would re-encode."""
+        reordered = {k: self.SETTINGS[k] for k in reversed(list(self.SETTINGS))}
+        assert (encode.fingerprint(self.FRAMES, reordered)
+                == encode.fingerprint(self.FRAMES, self.SETTINGS))
+
+    def test_a_changed_setting_changes_it(self):
+        assert (encode.fingerprint(self.FRAMES, {**self.SETTINGS, "fps": 1.0})
+                != encode.fingerprint(self.FRAMES, self.SETTINGS))
+
+    def test_a_changed_warp_time_changes_it(self):
+        rewarped = [self.FRAMES[0], ("a2", "/f/2.jpg", "2026-09-09T00:00:00Z")]
+        assert (encode.fingerprint(rewarped, self.SETTINGS)
+                != encode.fingerprint(self.FRAMES, self.SETTINGS))
+
+    def test_order_changes_it(self):
+        assert (encode.fingerprint(list(reversed(self.FRAMES)), self.SETTINGS)
+                != encode.fingerprint(self.FRAMES, self.SETTINGS))
+
+    def test_extra_changes_it(self):
+        """What separates the plain digest from the annotated one."""
+        assert (encode.fingerprint(self.FRAMES, self.SETTINGS, {"language": "de"})
+                != encode.fingerprint(self.FRAMES, self.SETTINGS))
+
+    def test_it_copes_with_values_json_cannot_hold(self):
+        """The footer config and a birth date arrive as whatever they are."""
+        from pathlib import Path
+
+        assert encode.fingerprint(self.FRAMES, self.SETTINGS,
+                                  {"font": Path("/fonts/x.ttf"), "birth": None})
+
+
+class TestATrialAlwaysRenders:
+    """A trial measures what encoding costs and projects the full run from it.
+
+    Reusing an existing video would measure nothing and project from that, so
+    the estimate would arrive looking like very good news. The skip is right for
+    `encode` and wrong here, which is the only reason `force` is passed.
+    """
+
+    def test_cmd_trial_forces_the_render(self):
+        """Read off the call itself: a stub of everything `cmd_trial` touches
+        would test the stubs, and the thing worth pinning is one keyword."""
+        import ast
+        import inspect
+
+        from grow_up import cli
+
+        tree = ast.parse(inspect.getsource(cli.cmd_trial))
+        calls = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "stage_encode"]
+
+        assert len(calls) == 1, "cmd_trial should encode in exactly one place"
+        forced = [kw for kw in calls[0].keywords
+                  if kw.arg == "force" and getattr(kw.value, "value", None) is True]
+        assert forced, "cmd_trial must pass force=True or its projection is measured off a skip"
+
+    def test_encode_itself_does_not_force(self, conn, tmp_path, spy):
+        """The counterpart: the plain command is the one that gets to skip."""
+        from grow_up import pipeline
+
+        pipeline.stage_encode(conn, tmp_path / "out", {"fps": 0.5}, lambda _: None)
+        spy.clear()
+        pipeline.stage_encode(conn, tmp_path / "out", {"fps": 0.5}, lambda _: None)
+        assert spy == []

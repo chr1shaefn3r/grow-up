@@ -10,7 +10,7 @@ import asyncio
 import math
 import sqlite3
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
@@ -18,7 +18,7 @@ from typing import Callable, Iterable
 import numpy as np
 
 from . import align, analyze, annotate, config, db, images, review, select, timing
-from .encode import encode, moving_seconds
+from .encode import encode, fingerprint, moving_seconds
 from .immich import ImmichClient, pick_face
 from .progress import Progress
 
@@ -608,12 +608,21 @@ def _damp_flicker(results: list[tuple], log: Log, window: int = 9) -> None:
 
 
 def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
-                 log: Log, workers: int = 0) -> list[Path]:
+                 log: Log, workers: int = 0, force: bool = False) -> list[Path]:
     """Encode the aligned frames, honouring manual rejects from the contact sheet.
 
-    Returns every video written. With annotation on that is two: the plain
-    render and an annotated one. Both, deliberately -- a date format or a
-    language is a preference, and it should never cost you the clean video.
+    Returns every video *written* -- so a run that finds both already current
+    returns nothing, and the caller's "wrote" lines stay true. Skipped videos are
+    reported here instead, with their path, since nothing downstream will.
+
+    With annotation on there are two renders: the plain video and an annotated
+    one. Both, deliberately -- a date format or a language is a preference, and
+    it should never cost you the clean video.
+
+    A render is skipped when the video is already on disk and the manifest
+    records it as coming from exactly these frames and these settings. `force`
+    overrides that. The two are judged separately: changing only the footer
+    language re-renders the annotated video and leaves the plain one alone.
     """
     # `select` already excludes these, which is what lets a bucket fall through
     # to its runner-up. Kept here as well so `grow-up encode` on its own still
@@ -626,7 +635,7 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     # rejection would promote. They have frames rows like any other, and the
     # join to selection is the only thing keeping them out of the video.
     rows = conn.execute(
-        "SELECT f.asset_id, f.path, a.local_datetime FROM frames f"
+        "SELECT f.asset_id, f.path, f.warped_at, a.local_datetime FROM frames f"
         "  JOIN assets a ON a.id = f.asset_id"
         "  JOIN selection s ON s.asset_id = f.asset_id"
         " WHERE s.alternate = 0 ORDER BY f.seq ASC").fetchall()
@@ -650,22 +659,58 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     log(f"  encode: {len(frames)} frames at {settings['fps']:g} fps")
     _log_transition(settings, len(frames), log)
 
+    # One entry per photograph, and what `align` last did to it. This is what a
+    # skip is judged against, so it is built from the same rows the render is.
+    inputs = [(r["asset_id"], r["path"], r["warped_at"]) for r in kept]
+
     # Both renders are prepared before either starts. The annotated one consumes
-    # the footer layers, so they cannot still be drawing when it begins.
-    renders = [(frames, out_dir / filename, {})]
+    # the footer layers, so they cannot still be drawing when it begins -- and
+    # the skip is decided before that, so an unchanged annotated video costs no
+    # Pillow work either.
+    renders = []
+    skipped = []
+
+    def skip(path: Path) -> None:
+        skipped.append(path)
+        log(f"  encode: skipped {path} -- same frames and settings as last time")
+
+    plain_out = out_dir / filename
+    plain_print = fingerprint(inputs, settings)
+    if not force and _already_rendered(conn, plain_out, plain_print):
+        skip(plain_out)
+    else:
+        renders.append((frames, plain_out, {}, plain_print))
+
     footer = annotate.Annotation.from_config(encode_cfg.get("annotate"))
     if footer.enabled:
         # A transition keeps the footer off the frames and hands it to ffmpeg
         # as a separate layer, so the pictures dissolve and the text does not.
         moving = _resolved_transition(settings) != "none"
-        annotated = _annotated_frames(conn, kept, footer, log, as_layers=moving)
-        if annotated:
-            renders.append((frames if moving else annotated,
-                            out_dir / _annotated_name(filename),
-                            {"overlays": annotated if moving else None}))
+        annotated_out = out_dir / _annotated_name(filename)
+        # The birth date is an input to the drawing, not a setting: correcting it
+        # in Immich changes every age on screen and must re-render.
+        annotated_print = fingerprint(inputs, settings, {
+            "footer": asdict(footer), "birth": db.birth_date(conn),
+            "dates": [r["local_datetime"] for r in kept], "layers": moving,
+        })
+        if not force and _already_rendered(conn, annotated_out, annotated_print):
+            skip(annotated_out)
+        else:
+            annotated = _annotated_frames(conn, kept, footer, log, as_layers=moving)
+            if annotated:
+                renders.append((frames if moving else annotated, annotated_out,
+                                {"overlays": annotated if moving else None},
+                                annotated_print))
+
+    if not renders:
+        log("  encode: nothing to render; `grow-up encode --force` renders anyway")
+        return []
 
     with timing.stopwatch() as stage_elapsed:
-        results = _run_renders(renders, settings, workers, log)
+        results = _run_renders([r[:3] for r in renders], settings, workers, log)
+
+    for (_, out_path, _, digest), (written, _) in zip(renders, results):
+        db.record_render(conn, written or out_path, digest)
 
     for path, elapsed in results:
         log(f"  encode: {path.name} in {timing.format_duration(elapsed)}")
@@ -675,6 +720,19 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     if len(results) > 1:
         log(f"  encode: stage took {timing.format_duration(stage_elapsed())}")
     return [path for path, _ in results]
+
+
+def _already_rendered(conn: sqlite3.Connection, out_path: Path, digest: str) -> bool:
+    """Is the video on disk the one these inputs would produce?
+
+    Both halves are load-bearing. The manifest alone would skip a render whose
+    output someone has since deleted; the file alone would keep a video made
+    from different frames or different settings. The size check catches an
+    ffmpeg killed early enough to leave nothing but the file it had opened.
+    """
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return False
+    return db.render_fingerprint(conn, out_path) == digest
 
 
 def _run_renders(renders: list[tuple], settings: dict, workers: int,
