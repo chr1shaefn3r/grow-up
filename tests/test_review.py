@@ -355,20 +355,34 @@ class TestTheSheetCarriesTheRunnerUps:
         for name in names:
             assert f'data-alt="{name}"' in page
 
-    def test_the_thumbnails_share_the_row_equally(self, conn, tmp_path):
-        """Whatever the count, they are the same size as each other and on one
-        line. At a fixed width four overflow an S tile and wrap 3+1, which reads
-        as a ranking the tray does not mean."""
+    def test_the_tray_is_a_two_by_two_grid(self, conn, tmp_path):
+        """Four thumbnails in one row are a quarter of the card wide; in two
+        columns they are half, which is the difference between recognising a
+        photo and only counting them."""
         for n, name in enumerate(["a", "b", "c", "d"], start=1):
             add_alternate(conn, "2026-01", name, n, tmp_path)
         css = self.page(conn, tmp_path)
 
-        assert re.search(r"\.alt\s*\{[^}]*flex:1 1 0", css), "each takes an equal share"
+        assert re.search(r"\.alts\s*\{[^}]*grid-template-columns:repeat\(2,1fr\)", css)
         assert re.search(r"\.alt\s*\{[^}]*min-width:0", css), (
-            "without it a flex item cannot shrink below its image's own width")
-        assert re.search(r"\.alts\s*\{[^}]*flex-wrap:nowrap", css)
-        assert not re.search(r"\.alt\s*\{[^}]*width:\d+px", css), (
-            "a fixed width is what made them wrap")
+            "without it an image can force its cell wider than the track")
+
+    def test_a_thumbnail_is_never_bigger_for_having_fewer_neighbours(self, conn, tmp_path):
+        """The cell width has to come from the card, not from the count.
+
+        Two fixed `1fr` columns deliver that: one runner-up sits in the corner
+        at the same size four would be. A row that divides itself up -- which is
+        what this replaced -- grows the pictures as alternates are dropped, so
+        the same photo is a different size in two buckets and neither looks odd.
+        """
+        add_alternate(conn, "2026-01", "only-one", 1, tmp_path)
+        css = self.page(conn, tmp_path)
+
+        assert re.search(r"\.alts\s*\{[^}]*grid-template-columns:repeat\(2,1fr\)", css)
+        assert not re.search(r"\.alt\s*\{[^}]*flex:1 1 0", css), (
+            "an equal share of the row is exactly the sizing that varies with count")
+        assert not re.search(r"\.alts\s*\{[^}]*auto-fit|\.alts\s*\{[^}]*auto-fill", css), (
+            "an adaptive track count would widen the cells when there are fewer")
 
     def test_a_bucket_with_runner_ups_offers_a_comparison(self, conn, tmp_path):
         """A thumbnail answers "is there a better one in here"; choosing between

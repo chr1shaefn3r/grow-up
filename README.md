@@ -444,8 +444,9 @@ Clicking a thumbnail rejects that runner-up directly, so a bad alternate you can
 see goes in the same pass.
 
 `[select] alternates` sets how many are prepared (default 4, `0` to switch it off). They
-sit beneath the pick as a row of equal thumbnails, whatever the count, and are warped so
-you can judge them aligned — which is the only way to judge them. The cost is roughly
+sit beneath the pick in a 2×2 grid, at a size that depends on the card rather than on how
+many there are — one runner-up is drawn no larger than four would be — and are warped so
+you can judge them aligned, which is the only way to judge them. The cost is roughly
 proportional in `align` time and in the frames directory, so the default warps five
 candidates per bucket. They never enter the video.
 

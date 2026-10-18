@@ -100,13 +100,16 @@ figure.removed::after { content:"would be dropped"; position:absolute; top:8px; 
 /* Runner-ups for a bucket. Shown small: they exist to answer "what takes over if
    I drop this one", which a thumbnail settles, and the card promotes one to full
    size the moment you reject the pick. */
-.alts { display:flex; gap:6px; padding:0 9px 9px; flex-wrap:nowrap; }
-/* Equal shares of the row rather than a fixed width, so however many
-   alternates are prepared they stay the same size as each other and on one
-   line. At a fixed 64px four of them overflow an S tile and wrap 3+1, which
-   reads as a ranking the tray does not mean. min-width:0 is what lets a flex
-   item shrink below its image's own width. */
-.alt { padding:0; border-radius:6px; overflow:hidden; flex:1 1 0; min-width:0;
+/* Two fixed columns rather than a row that divides itself up. The width of a
+   cell is then a property of the card, not of how many runner-ups happen to be
+   prepared: four fill the 2x2, three leave the last cell empty, one sits in the
+   corner -- and every one of them is the same size it would be if there were
+   four. A row of `flex:1 1 0` had the opposite behaviour, growing the pictures
+   as alternates were dropped, so the same photo changed size between buckets.
+   min-width:0 keeps an image from forcing its cell wider than the track. */
+.alts { display:grid; grid-template-columns:repeat(2,1fr); gap:6px;
+        padding:0 9px 9px; align-items:start; }
+.alt { padding:0; border-radius:6px; overflow:hidden; min-width:0;
        line-height:0; border:1px solid var(--line); background:none; cursor:pointer; }
 .alt img { width:100%; height:auto; cursor:pointer; }
 .alt.gone { opacity:.3; border-color:var(--bad); }
