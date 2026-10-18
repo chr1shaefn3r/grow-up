@@ -157,8 +157,8 @@ per_bucket = 1
 # they let out/contact-sheet.html show what would take over if you reject the
 # pick, so a rejection is decided in the page instead of costing a re-run to see
 # the replacement. Costs align time and frames-directory space roughly in
-# proportion -- 2 means three warps per bucket. Set 0 to turn it off.
-alternates = 2
+# proportion -- 3 means four warps per bucket. Set 0 to turn it off.
+alternates = 3
 
 [output]
 # Frame size in pixels, and therefore the video resolution. The ratio matters as

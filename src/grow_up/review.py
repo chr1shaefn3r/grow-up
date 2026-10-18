@@ -428,17 +428,39 @@ update();
 _VIEWER_HTML = ('<div id="viewer" hidden><img id="viewer-img" alt="">'
                 '<div class="meta" id="viewer-meta"></div></div>')
 
-_SIZE_CONTROLS = ('<span class="count">size</span>'
-                  '<button data-tile="220px">S</button>'
-                  '<button data-tile="340px" aria-pressed="true">M</button>'
-                  '<button data-tile="520px">L</button>')
+_TILE_SIZES = {"S": "220px", "M": "340px", "L": "520px"}
 
 
-def _page(title: str, lede: str, body: str, script: str = "") -> str:
+def _size_controls(active: str = "M") -> str:
+    """The tile-size buttons, with `active` pressed.
+
+    Which button is pressed and what the grid actually renders at have to agree,
+    so both are derived from `_TILE_SIZES` and the page sets the variable from
+    the same name -- a sheet claiming S while drawing at M is simply wrong, and
+    nothing on screen would say which of the two to believe.
+    """
+    buttons = "".join(
+        f'<button data-tile="{px}"'
+        + (' aria-pressed="true"' if name == active else "")
+        + f">{name}</button>"
+        for name, px in _TILE_SIZES.items()
+    )
+    return f'<span class="count">size</span>{buttons}'
+
+
+def _page(title: str, lede: str, body: str, script: str = "",
+          tile: str = "M") -> str:
+    # The starting size rides on <html> rather than waiting for the script, so
+    # the grid paints at the right size instead of flashing through another.
+    # <html> specifically, because that is `documentElement`: the size buttons
+    # set the variable there, and an inline style on <body> would outrank them
+    # for everything inside it and quietly stop the buttons working.
+    style = f' style="--tile:{_TILE_SIZES[tile]}"'
     return (
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        f"<!doctype html>\n<html lang=\"en\"{style}>\n<head>\n<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-        f"<title>{html.escape(title)}</title>\n<style>{_CSS}</style>\n</head>\n<body>\n"
+        f"<title>{html.escape(title)}</title>\n<style>{_CSS}</style>\n</head>\n"
+        "<body>\n"
         f"<h1>{html.escape(title)}</h1>\n<p class=\"lede\">{html.escape(lede)}</p>\n"
         f"{body}\n"
         + (f"<script>{script}</script>\n" if script else "")
@@ -570,7 +592,7 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
         '<button id="clear">Clear</button>'
         '<span class="count"><b id="n">0</b> rejected</span>'
         '<span class="spacer"></span>'
-        f"{_SIZE_CONTROLS}"
+        f'{_size_controls("S")}'
         "</div>\n"
         f'<div class="grid">{"".join(cards)}</div>\n'
         f"{aside}"
@@ -586,7 +608,8 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
         "catches what landmarks cannot: sunglasses, a hand over the face, or someone "
         "else mistagged as the subject."
     )
-    out_path.write_text(_page("grow-up — accepted frames", lede, body, _JS), encoding="utf-8")
+    out_path.write_text(_page("grow-up — accepted frames", lede, body, _JS, tile="S"),
+                        encoding="utf-8")
     return len(picks)
 
 
@@ -730,7 +753,7 @@ def write_rejects_gallery(conn: sqlite3.Connection, out_path: Path,
     ) if limits else ""
 
     body = (
-        f'<div class="bar">{_SIZE_CONTROLS}</div>\n'
+        f'<div class="bar">{_size_controls()}</div>\n'
         f"{tuner_html}"
         f'<div id="reject-groups">{"".join(sections)}</div>\n'
         f"{_VIEWER_HTML}"

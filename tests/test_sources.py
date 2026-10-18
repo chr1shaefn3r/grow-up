@@ -416,3 +416,39 @@ class TestEveryMissingVariableIsNamedAtOnce:
             '[[immich.sources]]\nname = "her"\nkey_env = "IMMICH_API_KEY_PARTNER"\n')
 
         assert cli.app(["--config", str(tmp_path / "config.toml"), "status"]) == 0
+
+
+class TestHowManyRunnerUpsArePrepared:
+    """`[select] alternates` decides how many replacements the contact sheet can
+    offer, and every one of them costs a warp in `align`."""
+
+    def test_three_are_prepared_by_default(self, monkeypatch, tmp_path):
+        """Three, so a bucket whose first two replacements are also poor still
+        has something to promote without a re-run. The fourth warp per bucket is
+        what it costs."""
+        from grow_up import cli
+
+        seen = {}
+        monkeypatch.setattr(cli.select, "select_frames",
+                            lambda conn, cadence, per_bucket, alternates: (
+                                seen.update(alternates=alternates), 0)[1])
+        monkeypatch.setattr(cli.select, "apply_filters", lambda *a, **k: (0, 0))
+        monkeypatch.setattr(cli.pipeline, "report_rejects", lambda *a, **k: None)
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        cli._select_frames(cfg({"paths": {"out": "out"}}), conn)
+        assert seen["alternates"] == 3
+
+    def test_the_config_example_matches_the_code(self):
+        """The two defaults drifting would make the documented behaviour a lie
+        for anyone who never copied the example file."""
+        import re
+        from pathlib import Path
+
+        example = (Path(__file__).resolve().parent.parent / "config.example.toml").read_text()
+        documented = int(re.search(r"^alternates = (\d+)", example, re.M).group(1))
+
+        source = (Path(__file__).resolve().parent.parent
+                  / "src" / "grow_up" / "cli.py").read_text()
+        in_code = int(re.search(r'"select", "alternates", (\d+)', source).group(1))
+        assert documented == in_code

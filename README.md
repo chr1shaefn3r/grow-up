@@ -443,10 +443,14 @@ the replacement was no good either. Reject *every* candidate and the card says
 Clicking a thumbnail rejects that runner-up directly, so a bad alternate you can already
 see goes in the same pass.
 
-`[select] alternates` sets how many are prepared (default 2, `0` to switch it off). They
+`[select] alternates` sets how many are prepared (default 3, `0` to switch it off). They
 are warped so you can judge them aligned, which is the only way to judge them — the cost
-is roughly proportional in `align` time and in the frames directory. They never enter the
-video.
+is roughly proportional in `align` time and in the frames directory, so the default warps
+four candidates per bucket. They never enter the video.
+
+The grid starts at the smallest tile size, because the sheet is a scan for the one bad
+photo in a week and more buckets on screen beats more pixels per bucket. `M` and `L` are
+a click away, and so is the full-size viewer.
 
 The page opens with your existing rejections already marked, and shows them in a strip
 below the accepted frames; click one to keep it again. That seeding matters: the download

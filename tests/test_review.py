@@ -76,14 +76,52 @@ class TestContactSheet:
         review.write_contact_sheet(conn, out)
         assert 'data-id="asset-2"' in out.read_text()
 
-    def test_tiles_are_big_enough_to_judge_a_face(self, conn, tmp_path):
-        """A 1080x1350 frame rendered ~150px wide shows nothing useful about
-        eye alignment or sharpness, which is the whole point of the page."""
+    def test_the_contact_sheet_starts_small(self, conn, tmp_path):
+        """Judged on a real sheet: the page is a scan for the one bad photo in a
+        week, and more buckets on screen beats more pixels per bucket. The
+        full-size viewer is one click away for the frame worth staring at.
+
+        This reverses an earlier choice of M, which was reasoned from the frame
+        size rather than from using the page.
+        """
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        html = out.read_text()
+
+        assert re.search(r'<html[^>]*--tile:\s*220px', html), (
+            "the starting size belongs on <html>: the buttons set it there, and "
+            "an inline style lower down would outrank them")
+        assert re.search(r'data-tile="220px"\s+aria-pressed="true"', html)
+
+    def test_no_size_starts_too_small_to_read(self, conn, tmp_path):
+        """A 1080x1350 frame rendered ~150px wide shows nothing useful about eye
+        alignment or sharpness, which is the whole point of the page."""
         out = tmp_path / "out" / "contact-sheet.html"
         review.write_contact_sheet(conn, out)
 
-        default_tile = re.search(r"--tile:\s*(\d+)px", out.read_text())
-        assert default_tile and int(default_tile.group(1)) >= 300
+        start = re.search(r"<html[^>]*--tile:\s*(\d+)px", out.read_text())
+        assert start and int(start.group(1)) >= 200
+
+    def test_the_pressed_button_is_the_size_it_renders_at(self, conn, tmp_path):
+        """A sheet claiming S while drawing at M is wrong, and nothing on screen
+        would say which to believe."""
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        html = out.read_text()
+
+        start = re.search(r"<html[^>]*--tile:\s*(\d+px)", html).group(1)
+        pressed = re.search(r'data-tile="(\d+px)"\s+aria-pressed="true"', html).group(1)
+        assert start == pressed
+
+    def test_the_rejects_page_keeps_its_larger_default(self, conn, tmp_path):
+        """Different job: that page is read to judge blur and exposure, where a
+        bigger tile is the point rather than a cost."""
+        out = tmp_path / "out" / "rejects.html"
+        review.write_rejects_gallery(conn, out)
+        html = out.read_text()
+
+        assert re.search(r'<html[^>]*--tile:\s*340px', html)
+        assert re.search(r'data-tile="340px"\s+aria-pressed="true"', html)
 
     def test_images_are_shown_whole_never_cropped(self, conn, tmp_path):
         """object-fit: cover would crop away the framing being assessed."""
@@ -304,6 +342,17 @@ class TestTheSheetCarriesTheRunnerUps:
 
         assert 'data-alt="spare-a"' in page
         assert 'class="alts" data-count="1"' in page
+
+    def test_every_prepared_runner_up_reaches_the_tray(self, conn, tmp_path):
+        """The page shows whatever `select` prepared -- there is no display cap,
+        so `[select] alternates` is the only knob and raising it is visible."""
+        for n, name in enumerate(["spare-a", "spare-b", "spare-c"], start=1):
+            add_alternate(conn, "2026-01", name, n, tmp_path)
+        page = self.page(conn, tmp_path)
+
+        assert 'class="alts" data-count="3"' in page
+        for name in ["spare-a", "spare-b", "spare-c"]:
+            assert f'data-alt="{name}"' in page
 
     def test_a_bucket_without_alternates_has_no_tray(self, conn, tmp_path):
         assert 'class="alts"' not in self.page(conn, tmp_path)
