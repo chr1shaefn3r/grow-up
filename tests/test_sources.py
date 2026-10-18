@@ -422,10 +422,11 @@ class TestHowManyRunnerUpsArePrepared:
     """`[select] alternates` decides how many replacements the contact sheet can
     offer, and every one of them costs a warp in `align`."""
 
-    def test_three_are_prepared_by_default(self, monkeypatch, tmp_path):
-        """Three, so a bucket whose first two replacements are also poor still
-        has something to promote without a re-run. The fourth warp per bucket is
-        what it costs."""
+    def test_four_are_prepared_by_default(self, monkeypatch, tmp_path):
+        """Four, so a bucket whose first three replacements are also poor still
+        has something to promote without a re-run. The fifth warp per bucket is
+        what it costs, and the tray splits the row between however many there
+        are rather than growing."""
         from grow_up import cli
 
         seen = {}
@@ -437,7 +438,7 @@ class TestHowManyRunnerUpsArePrepared:
 
         conn = db.connect(tmp_path / "t.sqlite")
         cli._select_frames(cfg({"paths": {"out": "out"}}), conn)
-        assert seen["alternates"] == 3
+        assert seen["alternates"] == 4
 
     def test_the_config_example_matches_the_code(self):
         """The two defaults drifting would make the documented behaviour a lie

@@ -346,13 +346,29 @@ class TestTheSheetCarriesTheRunnerUps:
     def test_every_prepared_runner_up_reaches_the_tray(self, conn, tmp_path):
         """The page shows whatever `select` prepared -- there is no display cap,
         so `[select] alternates` is the only knob and raising it is visible."""
-        for n, name in enumerate(["spare-a", "spare-b", "spare-c"], start=1):
+        names = ["spare-a", "spare-b", "spare-c", "spare-d"]
+        for n, name in enumerate(names, start=1):
             add_alternate(conn, "2026-01", name, n, tmp_path)
         page = self.page(conn, tmp_path)
 
-        assert 'class="alts" data-count="3"' in page
-        for name in ["spare-a", "spare-b", "spare-c"]:
+        assert 'class="alts" data-count="4"' in page
+        for name in names:
             assert f'data-alt="{name}"' in page
+
+    def test_the_thumbnails_share_the_row_equally(self, conn, tmp_path):
+        """Whatever the count, they are the same size as each other and on one
+        line. At a fixed width four overflow an S tile and wrap 3+1, which reads
+        as a ranking the tray does not mean."""
+        for n, name in enumerate(["a", "b", "c", "d"], start=1):
+            add_alternate(conn, "2026-01", name, n, tmp_path)
+        css = self.page(conn, tmp_path)
+
+        assert re.search(r"\.alt\s*\{[^}]*flex:1 1 0", css), "each takes an equal share"
+        assert re.search(r"\.alt\s*\{[^}]*min-width:0", css), (
+            "without it a flex item cannot shrink below its image's own width")
+        assert re.search(r"\.alts\s*\{[^}]*flex-wrap:nowrap", css)
+        assert not re.search(r"\.alt\s*\{[^}]*width:\d+px", css), (
+            "a fixed width is what made them wrap")
 
     def test_a_bucket_without_alternates_has_no_tray(self, conn, tmp_path):
         assert 'class="alts"' not in self.page(conn, tmp_path)

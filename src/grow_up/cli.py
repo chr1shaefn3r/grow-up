@@ -384,7 +384,7 @@ def _select_frames(cfg: config.Config, conn, cadence: str | None = None) -> tupl
 
     cadence = _cadence(cfg, cadence)
     per_bucket = int(cfg.get("select", "per_bucket", 1))
-    alternates = int(cfg.get("select", "alternates", 3))
+    alternates = int(cfg.get("select", "alternates", 4))
     frames = select.select_frames(conn, cadence, per_bucket, alternates)
     log(f"  select: {frames} frames (cadence={cadence}, {per_bucket} per bucket)")
     if alternates:
