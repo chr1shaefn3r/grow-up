@@ -370,6 +370,39 @@ class TestTheSheetCarriesTheRunnerUps:
         assert not re.search(r"\.alt\s*\{[^}]*width:\d+px", css), (
             "a fixed width is what made them wrap")
 
+    def test_a_bucket_with_runner_ups_offers_a_comparison(self, conn, tmp_path):
+        """A thumbnail answers "is there a better one in here"; choosing between
+        them needs them large and side by side."""
+        for n, name in enumerate(["a", "b", "c", "d"], start=1):
+            add_alternate(conn, "2026-01", name, n, tmp_path)
+        page = self.page(conn, tmp_path)
+
+        assert 'class="compare-open"' in page
+        assert '<div id="compare" hidden></div>' in page
+        assert re.search(r"#compare \.pane\s*\{[^}]*grid-template-columns:repeat\(2,1fr\)", page), (
+            "two columns, so the default four land as a 2x2")
+
+    def test_a_bucket_without_runner_ups_offers_no_comparison(self, conn, tmp_path):
+        """Nothing to compare it against, so the button would do nothing."""
+        assert 'class="compare-open"' not in self.page(conn, tmp_path)
+
+    def test_the_overlay_sits_above_the_full_size_viewer(self, conn, tmp_path):
+        """It opens from there with `c`, so a lower z-index would put it behind
+        the thing it was opened from."""
+        page = self.page(conn, tmp_path)
+        viewer = int(re.search(r"#viewer \{[^}]*z-index:(\d+)", page).group(1))
+        compare = int(re.search(r"#compare \{[^}]*z-index:(\d+)", page).group(1))
+        assert compare > viewer
+
+    def test_the_comparison_is_built_from_the_same_candidate_list(self, conn, tmp_path):
+        """Not server-rendered per card: a second copy of the candidates could
+        disagree with the tray about what is still available."""
+        add_alternate(conn, "2026-01", "spare-a", 1, tmp_path)
+        page = self.page(conn, tmp_path)
+
+        assert "paintCompare" in page and "candidatesFor" in page
+        assert page.count('<div id="compare"') == 1, "one empty container, filled by JS"
+
     def test_a_bucket_without_alternates_has_no_tray(self, conn, tmp_path):
         assert 'class="alts"' not in self.page(conn, tmp_path)
 

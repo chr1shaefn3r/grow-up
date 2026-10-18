@@ -453,6 +453,12 @@ The grid starts at the smallest tile size, because the sheet is a scan for the o
 photo in a week and more buckets on screen beats more pixels per bucket. `M` and `L` are
 a click away, and so is the full-size viewer.
 
+When the thumbnails are too small to settle it, **compare** on a card — or `c` in the
+full-size viewer — fills the screen with that bucket's runner-ups side by side, four of
+them as a 2×2. Click one, or press its number, and it becomes the bucket's photo: the
+page rejects everything ranked ahead of it, which is exactly what makes `select` choose
+it on the next run. Escape closes without changing anything.
+
 The page opens with your existing rejections already marked, and shows them in a strip
 below the accepted frames; click one to keep it again. That seeding matters: the download
 replaces the whole file, so without it a second visit would quietly discard everything

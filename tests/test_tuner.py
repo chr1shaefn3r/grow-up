@@ -395,3 +395,91 @@ class TestThePagePromotesTheRunnerUp:
         """Ties the script above to review._JS, so the two cannot drift apart."""
         assert "candidates.findIndex(c => !rejected.has(c.id))" in review._JS
         assert "'promoted #' + (index + 1)" in review._JS
+
+
+class TestChoosingARunnerUpMeansWhatSelectMeans:
+    """The compare overlay lets you pick a runner-up outright. There is no
+    "chosen" column in the manifest -- `select` simply takes the best candidate
+    with no reject reason -- so choosing has to be expressed as rejecting
+    everything ahead of it. If the page and the pipeline ever disagree about
+    that, the sheet shows one photo and the video contains another.
+    """
+
+    CANDIDATES = [
+        {"id": "pick", "date": "2026-01-02", "seq": 1, "src": "a.jpg"},
+        {"id": "s1", "date": "2026-01-09", "seq": 2, "src": "b.jpg"},
+        {"id": "s2", "date": "2026-01-16", "seq": 3, "src": "c.jpg"},
+        {"id": "s3", "date": "2026-01-23", "seq": 4, "src": "d.jpg"},
+        {"id": "s4", "date": "2026-01-30", "seq": 5, "src": "e.jpg"},
+    ]
+
+    def page_chooses(self, tmp_path, chosen: str, seed: list[str] | None = None):
+        """Run the shipped page JS headlessly and return what it rejected."""
+        buckets = [{"bucket": "2026-01", "candidates": self.CANDIDATES}]
+        script = tmp_path / f"choose-{chosen}.mjs"
+        script.write_text(
+            "const ELEMENTS = {\n"
+            f"  'rejected-seed': {{textContent: {json.dumps(json.dumps(seed or []))}}},\n"
+            f"  'buckets': {{textContent: {json.dumps(json.dumps(buckets))}}},\n"
+            "};\n"
+            "globalThis.document = {\n"
+            "  getElementById: (id) => ELEMENTS[id] || null,\n"
+            "  querySelectorAll: () => [],\n"
+            "  addEventListener: () => {},\n"
+            "  createElement: () => ({classList: {add(){}, toggle(){}}, dataset: {},\n"
+            "                        appendChild(){}, setAttribute(){}}),\n"
+            "};\n"
+            f"{review._JS}\n"
+            f"chooseCandidate('2026-01', {json.dumps(chosen)});\n"
+            "console.log(JSON.stringify([...rejected]));\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return sorted(json.loads(result.stdout))
+
+    def pipeline_picks(self, tmp_path, manual: list[str]) -> str:
+        """What `select` actually puts in the video, given those rejections."""
+        from grow_up import select
+
+        conn = db.connect(tmp_path / "pipeline.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        # Scores descending in candidate order, which is what makes the page's
+        # list and the pipeline's ranking the same ordering.
+        for n, candidate in enumerate(self.CANDIDATES):
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (candidate["id"], candidate["date"], stamp))
+            conn.execute(
+                "INSERT INTO metrics (asset_id, detected, yaw, pitch, roll, gaze_x,"
+                " gaze_y, blink_l, blink_r, oob_frac, bbox_clipped, interocular_px,"
+                " sharpness, exposure_lo, exposure_hi, analyzed_at)"
+                " VALUES (?, 1, ?, 1, 1, 0.02, 0, 0.05, 0.05, 0, 0, 150, 100, 40, 200, ?)",
+                (candidate["id"], float(n), stamp))
+
+        select.apply_filters(conn, LIMITS, {}, set(manual))
+        select.select_frames(conn, "month", 1, 0)
+        row = conn.execute(
+            "SELECT asset_id FROM selection WHERE alternate = 0").fetchone()
+        return row["asset_id"] if row else ""
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_choosing_rejects_exactly_what_is_ahead_of_it(self, tmp_path):
+        assert self.page_chooses(tmp_path, "s3") == ["pick", "s1", "s2"]
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_choosing_the_first_runner_up_drops_only_the_pick(self, tmp_path):
+        assert self.page_chooses(tmp_path, "s1") == ["pick"]
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_choosing_one_you_had_rejected_takes_it_back(self, tmp_path):
+        """Otherwise the overlay would let you select a photo and then not use
+        it, which is the most confusing outcome available."""
+        assert self.page_chooses(tmp_path, "s2", seed=["s2"]) == ["pick", "s1"]
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    @pytest.mark.parametrize("chosen", ["s1", "s2", "s3", "s4"])
+    def test_the_pipeline_then_picks_the_one_you_chose(self, tmp_path, chosen):
+        """The whole claim, end to end: what the page writes into rejects.json
+        makes `select` choose the photo you clicked."""
+        rejected = self.page_chooses(tmp_path, chosen)
+        assert self.pipeline_picks(tmp_path, rejected) == chosen

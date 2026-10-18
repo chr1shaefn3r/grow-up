@@ -129,6 +129,37 @@ figure.exhausted img { opacity:.35; }
 #viewer .meta kbd { background:#ffffff22; border:1px solid #ffffff33;
                     border-radius:4px; padding:1px 6px; font-size:11px; }
 #viewer.rejected img { outline:3px solid var(--bad); }
+
+/* Side-by-side comparison of a bucket's runner-ups. The tray answers "is there
+   a better one in here"; past a thumbnail that question needs them large and
+   next to each other, because the differences that decide it -- a half-closed
+   eye, which way the head is turned -- do not survive 46px. Above the viewer's
+   z-index so opening it from there lands on top rather than behind. */
+#compare[hidden] { display:none; }
+#compare { position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.94);
+           display:flex; flex-direction:column; gap:12px; padding:20px; }
+#compare .head { color:#f0f0f0; font-size:13px; display:flex; gap:16px;
+                 align-items:center; flex-wrap:wrap; justify-content:center; }
+#compare .head kbd { background:#ffffff22; border:1px solid #ffffff33;
+                     border-radius:4px; padding:1px 6px; font-size:11px; }
+/* Two columns, so the default four land as the 2x2 they were asked for and any
+   other count still pairs up rather than becoming a strip. min-height:0 on both
+   the track and the cell is what lets the images shrink to fit the screen
+   instead of pushing the grid taller than the viewport. */
+#compare .pane { flex:1; min-height:0; display:grid; gap:12px;
+                 grid-template-columns:repeat(2,1fr); grid-auto-rows:1fr; }
+#compare .choice { padding:0; min-height:0; display:flex; flex-direction:column;
+                   gap:6px; background:none; cursor:pointer; border-radius:8px;
+                   border:2px solid #ffffff22; overflow:hidden; color:#f0f0f0;
+                   font:inherit; }
+#compare .choice:hover, #compare .choice:focus-visible { border-color:#fff; }
+#compare .choice img { width:100%; flex:1; min-height:0; object-fit:contain; }
+#compare .choice .cap { padding:0 8px 6px; font-size:12px; display:flex;
+                        gap:8px; justify-content:center; align-items:center; }
+#compare .choice.gone { opacity:.4; }
+#compare .choice.gone .cap::after { content:"rejected"; color:var(--bad); }
+#compare .choice.now { border-color:var(--good); }
+#compare .choice.now .cap::after { content:"current pick"; color:var(--good); }
 """
 
 # Viewer plus manual rejection. Uses event delegation throughout so it keeps
@@ -217,7 +248,8 @@ function paintViewer() {
     order.length + (rejected.has(fig.dataset.id) ? '  — rejected' : '');
   const hint = document.createElement('span');
   hint.innerHTML = '<kbd>&larr;</kbd> <kbd>&rarr;</kbd> step &nbsp; ' +
-                   '<kbd>r</kbd> reject &nbsp; <kbd>esc</kbd> close';
+                   '<kbd>r</kbd> reject &nbsp; <kbd>c</kbd> compare &nbsp; ' +
+                   '<kbd>esc</kbd> close';
   viewerMeta.appendChild(label);
   viewerMeta.appendChild(hint);
 }
@@ -231,7 +263,92 @@ function openAt(index) {
 
 function closeViewer() { viewer.hidden = true; current = -1; }
 
+// -- comparing a bucket's runner-ups -------------------------------------- //
+
+const compare = document.getElementById('compare');
+let comparing = null;
+
+function candidatesFor(bucket) { return byBucket.get(bucket) || []; }
+
+// Choosing a runner-up means dropping everything ranked ahead of it. That is
+// exactly what `select` will do on the next run -- it takes the best candidate
+// with no reject reason -- so the page must say the same thing rather than
+// inventing a "chosen" state the pipeline has no column for.
+function chooseCandidate(bucket, id) {
+  const candidates = candidatesFor(bucket);
+  const target = candidates.findIndex(c => c.id === id);
+  if (target < 0) { return; }
+  candidates.slice(0, target).forEach(c => rejected.add(c.id));
+  // Picking one that was itself rejected is how you change your mind back.
+  rejected.delete(id);
+  syncRejected();
+  render();
+  paintCompare();
+}
+
+function paintCompare() {
+  if (!compare || comparing === null) { return; }
+  const candidates = candidatesFor(comparing);
+  const spares = candidates.slice(1);
+  const pick = candidates.find(c => !rejected.has(c.id));
+
+  const head = document.createElement('div');
+  head.className = 'head';
+  const label = document.createElement('span');
+  label.textContent = spares.length + ' runner-up' + (spares.length === 1 ? '' : 's')
+    + ' for ' + comparing + (pick ? '  —  showing ' + pick.date : '  —  bucket empty');
+  const hint = document.createElement('span');
+  hint.innerHTML = '<kbd>1</kbd>…<kbd>' + Math.min(spares.length, 9) + '</kbd> choose'
+    + ' &nbsp; <kbd>esc</kbd> close';
+  head.appendChild(label);
+  head.appendChild(hint);
+
+  const pane = document.createElement('div');
+  pane.className = 'pane';
+  spares.forEach((spare, n) => {
+    const cell = document.createElement('button');
+    cell.type = 'button';
+    cell.className = 'choice';
+    cell.dataset.choose = spare.id;
+    if (rejected.has(spare.id)) { cell.classList.add('gone'); }
+    if (pick && spare.id === pick.id) { cell.classList.add('now'); }
+    const img = document.createElement('img');
+    img.src = spare.src;
+    img.alt = '';
+    const cap = document.createElement('span');
+    cap.className = 'cap';
+    cap.textContent = (n + 1) + '.  ' + spare.date;
+    cell.appendChild(img);
+    cell.appendChild(cap);
+    pane.appendChild(cell);
+  });
+
+  compare.innerHTML = '';
+  compare.appendChild(head);
+  compare.appendChild(pane);
+}
+
+function openCompare(bucket) {
+  if (!compare || candidatesFor(bucket).length < 2) { return; }
+  comparing = bucket;
+  compare.hidden = false;
+  paintCompare();
+}
+
+function closeCompare() {
+  if (!compare) { return; }
+  compare.hidden = true;
+  comparing = null;
+}
+
 document.addEventListener('click', ev => {
+  const choice = ev.target.closest && ev.target.closest('[data-choose]');
+  if (choice && comparing !== null) {
+    chooseCandidate(comparing, choice.dataset.choose);
+    closeCompare();
+    return;
+  }
+
   // A thumbnail in the tray toggles that candidate, not the card's current pick,
   // so a runner-up you can already see is bad can be dropped in the same pass.
   const alt = ev.target.closest && ev.target.closest('.alt');
@@ -239,6 +356,11 @@ document.addEventListener('click', ev => {
 
   const fig = ev.target.closest && ev.target.closest('figure[data-id]');
   if (!fig) { return; }
+  if (ev.target.classList && ev.target.classList.contains('compare-open')) {
+    ev.stopPropagation();
+    openCompare(fig.dataset.bucket);
+    return;
+  }
   if (ev.target.tagName === 'BUTTON') { ev.stopPropagation(); toggle(fig); return; }
   if (ev.target.tagName === 'IMG') {
     order = allFigures();
@@ -249,12 +371,30 @@ document.addEventListener('click', ev => {
 if (viewer) {
   viewer.addEventListener('click', ev => { if (ev.target === viewer) { closeViewer(); } });
 }
+if (compare) {
+  compare.addEventListener('click', ev => { if (ev.target === compare) { closeCompare(); } });
+}
 
 document.addEventListener('keydown', ev => {
+  // Compare sits above the viewer, so it answers for the keyboard first --
+  // otherwise Escape would close the thing underneath the one you are looking at.
+  if (compare && !compare.hidden) {
+    if (ev.key === 'Escape') { closeCompare(); return; }
+    const n = Number(ev.key);
+    if (n >= 1 && n <= 9) {
+      const spares = candidatesFor(comparing).slice(1);
+      if (spares[n - 1]) { chooseCandidate(comparing, spares[n - 1].id); closeCompare(); }
+    }
+    return;
+  }
   if (!viewer || viewer.hidden) { return; }
   if (ev.key === 'Escape') { closeViewer(); }
   else if (ev.key === 'ArrowRight') { openAt(current + 1); }
   else if (ev.key === 'ArrowLeft') { openAt(current - 1); }
+  else if (ev.key === 'c' || ev.key === 'C') {
+    const fig = order[current];
+    if (fig) { openCompare(fig.dataset.bucket); }
+  }
   else if (ev.key === 'r' || ev.key === 'R') { toggle(order[current]); }
 });
 
@@ -431,7 +571,8 @@ update();
 """
 
 _VIEWER_HTML = ('<div id="viewer" hidden><img id="viewer-img" alt="">'
-                '<div class="meta" id="viewer-meta"></div></div>')
+                '<div class="meta" id="viewer-meta"></div></div>'
+                '<div id="compare" hidden></div>')
 
 _TILE_SIZES = {"S": "220px", "M": "340px", "L": "520px"}
 
@@ -514,7 +655,9 @@ def _bucket_card(bucket: str, candidates: list[dict]) -> str:
         f'data-label="{html.escape(label)}">'
         f'<img loading="lazy" src="{top["src"]}" alt="">'
         f'<figcaption><span class="when">{html.escape(top["date"])}</span>'
-        f'<button type="button">reject</button>'
+        + ('<button type="button" class="compare-open">compare</button>'
+           if spares else "")
+        + f'<button type="button">reject</button>'
         f'<span class="rank"></span></figcaption>'
         f"{tray}</figure>"
     )
