@@ -483,3 +483,105 @@ class TestChoosingARunnerUpMeansWhatSelectMeans:
         makes `select` choose the photo you clicked."""
         rejected = self.page_chooses(tmp_path, chosen)
         assert self.pipeline_picks(tmp_path, rejected) == chosen
+
+
+class TestTheViewerExplainsARejection:
+    """A category is not an answer to "which slider". looking_away is two checks
+    on one slider, and a photo can fail several checks while being filed under
+    only the first -- so clicking a photo lists every check, red where it fails.
+    """
+
+    def run_breakdown(self, tmp_path, cases):
+        script = tmp_path / "breakdown.mjs"
+        script.write_text(
+            f"const RULES={json.dumps([r.__dict__ for r in RULES])};\n"
+            f"const LIMITS={json.dumps(LIMITS)};\n"
+            f"const CASES={json.dumps(cases)};\n"
+            f"{review._FILTER_JS}\n"
+            "console.log(JSON.stringify(CASES.map(c => breakdown(c, LIMITS))));\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_every_red_row_is_a_check_python_fails(self, tmp_path):
+        cases = [c for c in fixtures() if c.get("detected")]
+        for case, rows in zip(cases, self.run_breakdown(tmp_path, cases)):
+            frame = FaceMetrics(**{k: v for k, v in case.items()
+                                   if k in FaceMetrics.__dataclass_fields__})
+            assert [r["failed"] for r in rows] == [
+                metrics.violates(rule, frame, LIMITS) for rule in RULES], case
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_the_row_marked_as_the_reason_is_the_category_it_is_filed_under(self, tmp_path):
+        cases = [c for c in fixtures() if c.get("detected")]
+        for case, rows in zip(cases, self.run_breakdown(tmp_path, cases)):
+            frame = FaceMetrics(**{k: v for k, v in case.items()
+                                   if k in FaceMetrics.__dataclass_fields__})
+            deciding = [r["reason"] for r in rows if r["decides"]]
+            expected = metrics.hard_reject(frame, LIMITS)
+            assert deciding == ([expected] if expected else []), case
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_it_says_which_gaze_check_failed_not_just_looking_away(self, tmp_path):
+        base = fixtures()[0]
+        [rows] = self.run_breakdown(tmp_path, [{**base, "gaze_y": -0.9}])
+        failed = [r["label"] for r in rows if r["failed"]]
+        assert failed == ["gaze up/down"]
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_a_photo_failing_several_checks_shows_them_all(self, tmp_path):
+        base = fixtures()[0]
+        [rows] = self.run_breakdown(
+            tmp_path, [{**base, "gaze_x": 0.9, "blink_l": 0.9, "sharpness": 1.0}])
+        assert [r["reason"] for r in rows if r["failed"]] == [
+            "looking_away", "eyes_closed", "blurry"]
+
+    def test_the_tuner_wires_the_explanation_into_the_viewer(self, conn, tmp_path):
+        out = tmp_path / "out" / "rejects.html"
+        review.write_rejects_gallery(conn, out, limits=LIMITS)
+        page = out.read_text()
+        assert 'id="viewer-details"' in page
+        assert "describe = describeAsset;" in page
+
+
+class TestASharedThresholdIsOneSliderForAllItsChecks:
+    """max_gaze decides both gaze checks. Its slider used to be labelled and
+    sized from gaze_x alone."""
+
+    def test_the_slider_names_every_check_it_controls(self, conn, tmp_path):
+        out = tmp_path / "out" / "rejects.html"
+        review.write_rejects_gallery(conn, out, limits=LIMITS)
+        assert "gaze sideways, gaze up/down</span>" in out.read_text()
+
+    def test_the_track_reaches_a_photo_only_gaze_y_rejected(self, conn, tmp_path):
+        conn.execute("UPDATE metrics SET gaze_y = -0.9 WHERE asset_id = 'good'")
+        out = tmp_path / "out" / "rejects.html"
+        review.write_rejects_gallery(conn, out, limits=LIMITS)
+        assert payload(out.read_text(), "RANGES")["max_gaze"]["max"] >= 0.9
+
+
+class TestTheViewerOnlyOffersWhatThePageCanDo:
+    """Rejecting and comparing exist on the contact sheet alone. The rejects page
+    shares the viewer, and used to advertise both keys anyway."""
+
+    def test_the_rejects_page_viewer_does_not_curate(self, conn, tmp_path):
+        out = tmp_path / "out" / "rejects.html"
+        review.write_rejects_gallery(conn, out, limits=LIMITS)
+        assert '<div id="viewer" hidden>' in out.read_text()
+
+    def test_the_contact_sheet_viewer_does(self, tmp_path):
+        conn = db.connect(tmp_path / "c.sqlite")
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        assert '<div id="viewer" data-curate="true" hidden>' in out.read_text()
+
+    def test_both_hints_and_both_keys_are_gated_on_it(self):
+        assert "(curating ? '<kbd>r</kbd> reject" in review._JS
+        assert "(curating && candidatesFor(fig.dataset.bucket).length > 1" in review._JS
+        assert "else if (!curating) { return; }" in review._JS
+        # Nothing advertises the keys outside those guards.
+        assert review._JS.count("<kbd>r</kbd>") == 1
+        assert review._JS.count("<kbd>c</kbd>") == 1

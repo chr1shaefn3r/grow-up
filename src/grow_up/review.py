@@ -125,8 +125,32 @@ figure.exhausted img { opacity:.35; }
 #viewer { position:fixed; inset:0; z-index:50; background:rgba(0,0,0,.92);
           display:flex; flex-direction:column; align-items:center;
           justify-content:center; gap:14px; padding:20px; }
+#viewer .stage { display:flex; gap:18px; align-items:center; justify-content:center;
+                 max-width:100%; min-height:0; }
 #viewer img { max-width:min(100%,1000px); max-height:82vh; object-fit:contain;
-              border-radius:6px; }
+              border-radius:6px; min-width:0; }
+/* Why this photo was filed where it was: every check, its measurement and the
+   current threshold. The category alone cannot say which slider to move --
+   looking_away is two checks, and a photo can fail several at once. */
+#viewer-details[hidden] { display:none; }
+#viewer-details { flex:none; width:360px; max-height:82vh; overflow:auto;
+                  background:#1d1d22; color:#e8e8e8; border-radius:8px;
+                  padding:12px 14px; font-size:12px; }
+#viewer-details h3 { margin:0 0 4px; font-size:14px; }
+#viewer-details p { margin:0 0 10px; color:#a8a8a8; }
+#viewer-details table { width:100%; border-collapse:collapse; }
+#viewer-details td { padding:4px 4px; border-top:1px solid #ffffff14;
+                     vertical-align:top; font-variant-numeric:tabular-nums; }
+#viewer-details td.num { text-align:right; white-space:nowrap; }
+#viewer-details .why { display:block; color:#8a8a8a; font-size:11px; }
+#viewer-details tr.fail td { color:#ff7a6b; background:#ff7a6b1a; font-weight:600; }
+#viewer-details tr.fail .why { color:#ff7a6b; font-weight:400; }
+#viewer-details tr.skip td { color:#777; }
+@media (max-width:800px) {
+  #viewer .stage { flex-direction:column; }
+  #viewer img { max-height:38vh; }
+  #viewer-details { width:100%; max-height:44vh; }
+}
 #viewer .meta { color:#f0f0f0; font-size:13px; display:flex; gap:16px;
                 align-items:center; flex-wrap:wrap; justify-content:center; }
 #viewer .meta kbd { background:#ffffff22; border:1px solid #ffffff33;
@@ -176,6 +200,13 @@ const rejected = new Set(seed ? JSON.parse(seed.textContent) : []);
 const viewer = document.getElementById('viewer');
 const viewerImg = document.getElementById('viewer-img');
 const viewerMeta = document.getElementById('viewer-meta');
+const viewerDetails = document.getElementById('viewer-details');
+// Rejecting and comparing only exist on the contact sheet. The rejects page
+// shares this viewer, and advertising keys that do nothing there -- or that
+// mark a photo in a set it has no way to save -- is worse than no hint.
+const curating = Boolean(viewer && viewer.dataset.curate === 'true');
+// Set by the tuner to explain a photo; the contact sheet leaves it unset.
+let describe = null;
 let order = [];
 let current = -1;
 
@@ -251,10 +282,18 @@ function paintViewer() {
     order.length + (rejected.has(fig.dataset.id) ? '  — rejected' : '');
   const hint = document.createElement('span');
   hint.innerHTML = '<kbd>&larr;</kbd> <kbd>&rarr;</kbd> step &nbsp; ' +
-                   '<kbd>r</kbd> reject &nbsp; <kbd>c</kbd> compare &nbsp; ' +
-                   '<kbd>esc</kbd> close';
+    (curating ? '<kbd>r</kbd> reject &nbsp; ' : '') +
+    (curating && candidatesFor(fig.dataset.bucket).length > 1
+      ? '<kbd>c</kbd> compare &nbsp; ' : '') +
+    '<kbd>esc</kbd> close';
   viewerMeta.appendChild(label);
   viewerMeta.appendChild(hint);
+  if (viewerDetails) {
+    viewerDetails.innerHTML = '';
+    const panel = describe ? describe(fig.dataset.id) : null;
+    if (panel) { viewerDetails.appendChild(panel); }
+    viewerDetails.hidden = !panel;
+  }
 }
 
 function openAt(index) {
@@ -394,6 +433,7 @@ document.addEventListener('keydown', ev => {
   if (ev.key === 'Escape') { closeViewer(); }
   else if (ev.key === 'ArrowRight') { openAt(current + 1); }
   else if (ev.key === 'ArrowLeft') { openAt(current - 1); }
+  else if (!curating) { return; }
   else if (ev.key === 'c' || ev.key === 'C') {
     const fig = order[current];
     if (fig) { openCompare(fig.dataset.bucket); }
@@ -457,6 +497,24 @@ function rejectReason(m, limits) {
   if (!m.detected) { return 'no_face_detected'; }
   for (const rule of RULES) { if (violates(rule, m, limits)) { return rule.reason; } }
   return null;
+}
+
+// Every check, not just the first failure, for the viewer's explanation. The
+// verdict on each row is violates() itself, so the panel cannot disagree with
+// the grouping -- only the first failing row names the category, and a photo
+// stays rejected until every failing row is relaxed.
+function breakdown(m, limits) {
+  let decided = false;
+  return RULES.map(rule => {
+    const values = rule.fields.map(f => m[f]);
+    const failed = Boolean(m.detected) && violates(rule, m, limits);
+    const decides = failed && !decided;
+    if (failed) { decided = true; }
+    return {reason: rule.reason, label: rule.label, op: rule.op, limit: rule.limit,
+            fields: rule.fields, values: values, threshold: limits[rule.limit],
+            measured: values.some(v => v !== null && v !== undefined),
+            failed: failed, decides: decides};
+  });
 }
 """
 
@@ -569,13 +627,106 @@ document.querySelectorAll('.slider input').forEach(input => {
   }
 });
 
+// -- explaining one photo in the viewer ----------------------------------- //
+
+const assetById = new Map(ASSETS.map(a => [a.id, a]));
+
+// At least one decimal more than the slider shows, so a value just past its
+// limit does not print as equal to it.
+function valueFor(key, value) {
+  if (value === null || value === undefined) { return '\u2014'; }
+  const spec = RANGES[key];
+  const decimals = !spec || spec.step === undefined || spec.step < 1 ? 3 : 1;
+  return Number(value).toFixed(decimals);
+}
+
+function passesWhen(row) {
+  const t = numberFor(row.limit, row.threshold);
+  if (row.op === 'flag') { return row.threshold ? 'allowed' : 'not allowed'; }
+  if (row.op === 'abs_gt') { return '|x| \u2264 ' + t; }
+  if (row.op === 'gt') { return '\u2264 ' + t; }
+  if (row.op === 'lt') { return '\u2265 ' + t; }
+  if (row.op === 'max_gt') { return 'each \u2264 ' + t; }
+  return t;
+}
+
+function shownValue(row) {
+  if (row.op === 'flag') { return row.values[0] ? 'yes' : 'no'; }
+  return row.values.map(v => valueFor(row.limit, v)).join(' / ');
+}
+
+function describeAsset(id) {
+  const asset = assetById.get(id);
+  if (!asset) { return null; }
+  const box = document.createElement('div');
+  const title = document.createElement('h3');
+  const note = document.createElement('p');
+  box.appendChild(title);
+  box.appendChild(note);
+
+  if (!asset.detected) {
+    title.textContent = 'no_face_detected';
+    note.textContent = 'No face was found, so there is nothing to measure. ' +
+                       'No threshold can bring this photo back.';
+    return box;
+  }
+
+  const rows = breakdown(asset, limits);
+  const failing = rows.filter(r => r.failed);
+  title.textContent = failing.length ? 'Rejected: ' + failing[0].reason
+                                     : 'Accepted at these thresholds';
+  note.textContent = failing.length > 1
+    ? 'Fails ' + failing.length + ' checks. It is filed under the first; ' +
+      'every red row has to be relaxed to keep it.'
+    : failing.length ? 'Fails one check, shown in red.'
+    : 'Passes every check at the current slider positions.';
+
+  // Failures first: they are the answer to "which slider", and on a phone the
+  // rest of the table is below the fold.
+  const table = document.createElement('table');
+  failing.concat(rows.filter(r => !r.failed)).forEach(row => {
+    const tr = document.createElement('tr');
+    if (row.failed) { tr.className = 'fail'; }
+    else if (!row.measured && row.op !== 'flag') { tr.className = 'skip'; }
+
+    const name = document.createElement('td');
+    name.textContent = row.label;
+    const why = document.createElement('span');
+    why.className = 'why';
+    why.textContent = row.reason + (row.decides ? '  \u00b7 filed here' : '');
+    name.appendChild(why);
+
+    const value = document.createElement('td');
+    value.className = 'num';
+    value.textContent = shownValue(row);
+    const limit = document.createElement('td');
+    limit.className = 'num';
+    limit.textContent = passesWhen(row);
+
+    tr.appendChild(name);
+    tr.appendChild(value);
+    tr.appendChild(limit);
+    table.appendChild(tr);
+  });
+  box.appendChild(table);
+  return box;
+}
+
+describe = describeAsset;
+
 ASSETS.forEach(a => { a.baseline = Boolean(rejectReason(a, limits)); });
 update();
 """
 
-_VIEWER_HTML = ('<div id="viewer" hidden><img id="viewer-img" alt="">'
-                '<div class="meta" id="viewer-meta"></div></div>'
-                '<div id="compare" hidden></div>')
+def _viewer_html(curate: bool) -> str:
+    """The full-size viewer. `curate` is the contact sheet: only there can a
+    photo be rejected or its bucket compared, so only there does the viewer
+    offer the keys for it."""
+    flag = ' data-curate="true"' if curate else ""
+    return (f'<div id="viewer"{flag} hidden><div class="stage">'
+            '<img id="viewer-img" alt=""><div id="viewer-details" hidden></div></div>'
+            '<div class="meta" id="viewer-meta"></div></div>'
+            '<div id="compare" hidden></div>')
 
 _TILE_SIZES = {"S": "220px", "M": "340px", "L": "520px"}
 
@@ -748,7 +899,7 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
         f'<div class="grid">{"".join(cards)}</div>\n'
         f"{aside}"
         '<textarea id="out" readonly></textarea>\n'
-        f"{_VIEWER_HTML}"
+        f"{_viewer_html(curate=True)}"
     )
     lede = (
         "Click a frame to open it full size; the arrow keys step through the sequence "
@@ -867,20 +1018,25 @@ def write_rejects_gallery(conn: sqlite3.Connection, out_path: Path,
     for rule in RULES:
         if rule.limit in ranges or rule.limit not in limits:
             continue
+        # max_gaze governs both gaze checks. Labelling its slider after only the
+        # first, and sizing it from only gaze_x, hid that it also decides gaze
+        # up/down -- and could stop short of the photos gaze_y rejected.
+        sharing = [r for r in RULES if r.limit == rule.limit]
+        label = ", ".join(dict.fromkeys(r.label for r in sharing))
         current = limits[rule.limit]
         if isinstance(current, bool):
             control = ('<input type="checkbox" data-limit="'
                        f'{rule.limit}"{" checked" if current else ""}>')
             ranges[rule.limit] = {}
         else:
-            values = [a[rule.fields[0]] for a in assets]
+            values = [a[f] for r in sharing for f in r.fields for a in assets]
             spec = _slider_range(values, float(current), rule.op)
             ranges[rule.limit] = spec
             control = (f'<input type="range" data-limit="{rule.limit}" '
                        f'min="{spec["min"]}" max="{spec["max"]}" '
                        f'step="{spec["step"]}" value="{current}">')
         rows_html.append(
-            f'<label class="slider"><span class="name">{html.escape(rule.label)}</span>'
+            f'<label class="slider"><span class="name">{html.escape(label)}</span>'
             f'{control}<output></output>'
             f'<button type="button">reset</button></label>'
         )
@@ -907,7 +1063,7 @@ def write_rejects_gallery(conn: sqlite3.Connection, out_path: Path,
         f'<div class="bar">{_size_controls()}</div>\n'
         f"{tuner_html}"
         f'<div id="reject-groups">{"".join(sections)}</div>\n'
-        f"{_VIEWER_HTML}"
+        f"{_viewer_html(curate=False)}"
     )
     if limits:
         title = "grow-up — threshold tuner"
@@ -915,7 +1071,9 @@ def write_rejects_gallery(conn: sqlite3.Connection, out_path: Path,
             "Move a slider to see exactly which photos that threshold would add or drop — "
             "the page re-runs the same filter the pipeline uses, over every analyzed photo. "
             "When it looks right, copy the [filter] block into config.toml and re-run "
-            "select; no re-analysis is needed. Click any photo to see it full size."
+            "select; no re-analysis is needed. Click any photo to see it full size, "
+            "with every check it was measured against -- the ones it fails in red, "
+            "so you can tell which slider to move."
         )
         script = data + _FILTER_JS + _JS + _TUNER_JS
     else:

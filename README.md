@@ -351,6 +351,12 @@ dropped. It carries a slider per `[filter]` threshold and, as you move one, show
 **exactly which photos that change would add or drop** — because guessing what
 `max_yaw = 25` buys you is not something a static gallery can answer.
 
+Click a photo to see why it landed where it did: every check, the photo's
+measurement, and the current threshold, with the ones it fails in red. A category
+such as `looking_away` covers more than one check (gaze sideways *and* up/down, on one
+slider), and a photo is filed under only the first check it fails — so this is what
+tells you which slider to move, and whether moving one is enough.
+
 Each slider's range comes from the spread of your own library, so the track always
 covers the photos that actually exist. When it looks right, copy the generated
 `[filter]` block into `config.toml` and:
