@@ -385,13 +385,18 @@ function closeCompare() {
   comparing = null;
 }
 
+// A choice is the end of the decision, so it goes straight back to the sheet.
+// Compare can be opened from the full-size viewer (c), and closing only the
+// overlay left that viewer standing, one Escape short of where you started.
+function choose(id) {
+  chooseCandidate(comparing, id);
+  closeCompare();
+  closeViewer();
+}
+
 document.addEventListener('click', ev => {
   const choice = ev.target.closest && ev.target.closest('[data-choose]');
-  if (choice && comparing !== null) {
-    chooseCandidate(comparing, choice.dataset.choose);
-    closeCompare();
-    return;
-  }
+  if (choice && comparing !== null) { choose(choice.dataset.choose); return; }
 
   // A thumbnail in the tray toggles that candidate, not the card's current pick,
   // so a runner-up you can already see is bad can be dropped in the same pass.
@@ -427,7 +432,7 @@ document.addEventListener('keydown', ev => {
     const n = Number(ev.key);
     if (n >= 1 && n <= 9) {
       const spares = candidatesFor(comparing).slice(1);
-      if (spares[n - 1]) { chooseCandidate(comparing, spares[n - 1].id); closeCompare(); }
+      if (spares[n - 1]) { choose(spares[n - 1].id); }
     }
     return;
   }

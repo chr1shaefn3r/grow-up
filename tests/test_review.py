@@ -448,3 +448,25 @@ class TestRelabellingTouchesOnlyTheRejectButton:
         assert labels and all(cls == ' class="reject"' for cls, _ in labels)
         assert any("compare-open" in c for c in captions), "the case that broke"
         assert 'class="compare-open reject"' not in page
+
+
+class TestChoosingARunnerUpReturnsToTheSheet:
+    """Compare can be opened from the full-size viewer. A choice used to close
+    only the overlay, leaving the viewer standing and one Escape still to go."""
+
+    def choose_body(self) -> str:
+        return re.search(r"function choose\(id\) \{(.*?)\n\}", review._JS, re.S).group(1)
+
+    def test_a_choice_closes_the_viewer_as_well_as_the_comparison(self):
+        body = self.choose_body()
+        assert "closeCompare();" in body and "closeViewer();" in body
+
+    def test_clicking_and_the_number_keys_both_go_through_it(self):
+        assert "choose(choice.dataset.choose)" in review._JS
+        assert "choose(spares[n - 1].id)" in review._JS
+        # Nothing else applies a choice and so skips the way out.
+        assert review._JS.count("chooseCandidate(comparing") == 1
+
+    def test_escape_without_choosing_still_steps_back_one_level(self):
+        """Cancelling a comparison is not a decision, so it keeps the viewer."""
+        assert "if (ev.key === 'Escape') { closeCompare(); return; }" in review._JS
