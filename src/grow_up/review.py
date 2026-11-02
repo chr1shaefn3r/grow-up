@@ -895,7 +895,8 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
             '<h2 class="dropped">Rejected by hand</h2>\n'
             '<p class="note">Their buckets fell through to the next best photo. '
             'Click one to keep it again, download rejects.json, then re-run '
-            '<code>grow-up select &amp;&amp; grow-up align &amp;&amp; grow-up encode</code>.</p>\n'
+            '<code>grow-up select &amp;&amp; grow-up align &amp;&amp; grow-up encode</code> '
+            'and reload this page.</p>\n'
             f'<div class="grid">{"".join(rejected_cards)}</div>\n'
         )
 
@@ -917,10 +918,10 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
         "Click a frame to open it full size; the arrow keys step through the sequence "
         "without moving the image, which is how alignment jitter becomes visible. Press r "
         "(or the reject button) to drop a frame, then download rejects.json into this "
-        "directory and re-run `grow-up select && grow-up align && grow-up encode` -- the "
-        "bucket falls through to its next best photo rather than disappearing. This "
-        "catches what landmarks cannot: sunglasses, a hand over the face, or someone "
-        "else mistagged as the subject."
+        "directory, re-run `grow-up select && grow-up align && grow-up encode` and reload "
+        "this page -- the bucket falls through to its next best photo rather than "
+        "disappearing. This catches what landmarks cannot: sunglasses, a hand over the "
+        "face, or someone else mistagged as the subject."
     )
     out_path.write_text(_page("grow-up — accepted frames", lede, body, _JS, tile="S"),
                         encoding="utf-8")

@@ -514,7 +514,17 @@ def _report_fit(rows: Iterable, eye_distance: float, eye_level: float,
 
 def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
                 log: Log, workers: int = 0, framing: dict | None = None) -> int:
-    """Warp selected frames onto canonical eye positions."""
+    """Warp selected frames onto canonical eye positions.
+
+    Each frame is named after the photograph it holds, never after its place in
+    the timeline. Places shift whenever the selection does -- one rejection in a
+    sparse month moves every later frame along by one -- and anything still
+    holding an old path then shows a different photograph without looking
+    wrong: a contact sheet written before this run, a tab left open on it, or
+    this manifest itself if a run fails part-way, since the files are written
+    before the rows that point at them. Named by asset, a path holds its own
+    photograph or nothing.
+    """
     import cv2
 
     framing = dict(framing or {})
@@ -523,6 +533,7 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
     if not rows:
         log("  align: nothing selected")
         return 0
+    previous = [row[0] for row in conn.execute("SELECT path FROM frames")]
 
     frames_dir.mkdir(parents=True, exist_ok=True)
     width, height = int(output["width"]), int(output["height"])
@@ -546,7 +557,7 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
         seq, row, p = index_row_param
         bgr = images.load_bgr(row["path"])
         warped = align.warp(bgr, align.build_affine(p), width, height, fill=fill)
-        out_path = frames_dir / f"frame_{seq:06d}.jpg"
+        out_path = frames_dir / f"{row['asset_id']}.jpg"
         cv2.imwrite(str(out_path), warped, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         luma = float(np.median(cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)[:, :, 0]))
         return row["asset_id"], str(out_path), seq, p, luma
@@ -576,8 +587,31 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
     if output.get("flicker_match", False):
         _damp_flicker(results, log)
 
+    _remove_superseded(previous, [r[1] for r in results], frames_dir)
     log(f"  align: wrote {len(results)} frames to {frames_dir}")
     return len(results)
+
+
+def _remove_superseded(previous: Iterable[str], current: Iterable[str],
+                       frames_dir: Path) -> None:
+    """Delete the frames an earlier `align` wrote that this one did not.
+
+    Only after the new rows are committed, so a failed run never leaves the
+    manifest pointing at a file that is gone. Only paths the manifest recorded,
+    and only inside `frames_dir`: these are align's own outputs, and a row left
+    from before `paths.frames` moved is not this run's to clean up.
+
+    A page still pointing at a removed frame shows a broken image, which says
+    it is out of date. Keeping the file would show a photo the video no longer
+    has, and frames named by asset would otherwise pile up with every change to
+    the selection.
+    """
+    home = frames_dir.resolve()
+    keep = {Path(path).resolve() for path in current}
+    for path in previous:
+        stale = Path(path).resolve()
+        if stale not in keep and stale.parent == home:
+            stale.unlink(missing_ok=True)
 
 
 def _damp_flicker(results: list[tuple], log: Log, window: int = 9) -> None:
@@ -880,6 +914,14 @@ def _annotated_frames(conn: sqlite3.Connection, rows: list, footer,
             target = out_dir / source.name
             drawn.save(target, quality=95)
         written.append(target)
+
+    # Named after the frame each was drawn from, so a copy left by an earlier
+    # encode belongs to a photo that is no longer in the video. Nothing reads
+    # those, and with frames named by asset they would only accumulate.
+    keep = set(written)
+    for leftover in out_dir.glob(f"*{written[0].suffix}"):
+        if leftover.is_file() and leftover not in keep:
+            leftover.unlink()
 
     log(f"  encode: {len(written)} annotated frames -> {out_dir}")
     return written

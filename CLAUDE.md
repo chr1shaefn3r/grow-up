@@ -79,6 +79,7 @@ specifically to avoid. They all look like improvements.
 | Reach for `-threads` to speed up a morph | `minterpolate` does not declare slice threading, so `-threads`, `-filter_threads` and `-filter_complex_threads` all leave it on one core; x264 below it is threaded but sits starved. The only parallelism available is more processes, which is why `stage_encode` runs the plain and annotated videos together. Splitting *one* render means chunking the frame list and concatenating, and every chunk boundary is a seam nobody here can watch. | `TestTheTwoVideosRenderTogether` (`tests/test_encode.py`) |
 | Let an alternate reach the video | `select` keeps `alternates` runner-ups per bucket and `align` warps them, so they have `frames` rows like anything else. The join to `selection` on `alternate = 0` in `stage_encode` is the only thing keeping them out — without it a week appears three times, and the video looks plausible. | `TestAlternatesNeverReachTheVideo` (`tests/test_encode.py`) |
 | Apply `rejects.json` only at `encode` | It filters the already-selected frame list, so rejecting the photo that won a week deletes the week instead of promoting the runner-up. `select.apply_filters` takes the set; `select_frames` then does the promotion for free. And the contact sheet must be *seeded* from the file — its download replaces the whole thing, so an unseeded page silently discards every earlier decision. The same mistake in prose costs the same: `run`'s closing line told users to re-run only `encode`, which reaches the safety-net filter and leaves the week empty. Four places give this advice — keep them saying `select && align && encode`. | `TestAManualRejectPromotesTheRunnerUp` (`tests/test_select.py`), `TestAStaleRejectIsNotSilent` (`tests/test_encode.py`), `TestTheRunTellsYouHowToApplyRejects` (`tests/test_docs.py`) |
+| Name a frame file by its place in the timeline | Places shift whenever the selection does — one rejection in a sparse month moves every later frame along by one — and anything holding an old path then shows a different photograph: a contact sheet written before the change, a tab left open on it, the manifest itself after an `align` that failed part-way (the files are written before the rows that point at them). This shipped: re-opened after `select && align && encode`, which never rewrote it, the sheet showed other photos in months nobody had touched, and a reject clicked there would have dropped a photo the user never saw. Frames are named after their asset, `align` deletes only the files it superseded, and `cmd_align` rewrites the sheet. The video was right whenever `align` finished, which is why nothing that checked it noticed. | `tests/test_frames.py` |
 | Fingerprint a render from the frame list and the settings alone | `align` rewrites the pixels without changing which photographs were chosen, so a reframed set has an identical frame list and would be served the old video. `frames.warped_at` is align's own record of the rewrite and is what makes the digest notice. Reading the frames to compare them would work too, at the cost of reading every frame to decide whether to read every frame. | `test_a_re_aligned_frame_invalidates_it` (`tests/test_encode.py`) |
 | Let `trial` reuse an existing render | It exists to measure what encoding costs and to project the full run from that measurement. A skipped render measures nothing and projects from it, so the estimate arrives looking like very good news. `cmd_trial` passes `force=True` for that reason alone. | `TestATrialAlwaysRenders` (`tests/test_encode.py`) |
 | Give the `birthday-months` bucket a label computed its own way | `months_between` decides which bucket a photo lands in; `birthday_month_start` only names it, and must be its exact inverse. Any other rule — `birth.replace(month=…)`, clamping the day, formatting the age — drifts from the grouping it claims to describe, and two buckets sharing a name means one month of the timelapse silently swallows another. The awkward input is a birthday on the 31st: February contains no such date, so the month does not open until March does. | `test_the_label_is_the_exact_inverse_of_the_grouping`, `test_a_birthday_on_the_31st_waits_for_a_month_that_has_one` (`tests/test_select.py`) |
@@ -120,7 +121,7 @@ pip install pillow                   # unlocks the footer-drawing tests
 # node on PATH                       # unlocks the Python/JavaScript filter parity tests
 ```
 
-With none of them, 85 tests skip and the rest still assert everything that matters.
+With none of them, 121 tests skip and the rest still assert everything that matters.
 
 **You cannot verify anything that needs real photographs.** mediapipe generally will not
 install in a sandbox, there is no Immich instance, and no credentials will be shared.
@@ -153,6 +154,11 @@ Hand these to the human running a real library:
    switches cleanly mid-dissolve. Hard cuts throughout means `scene` suppressed the
    blend; a black band behind the text means the overlay lost its alpha; a ghosted date
    means the footer went through the filter instead of over it.
+7. Reject one month's pick on the contact sheet, save `rejects.json` beside it, run
+   `grow-up select && grow-up align && grow-up encode`, and reload the page. That month
+   shows its runner-up and every other month the photo it showed before. Any other
+   month changing means a page is pointing at a frame by something other than its
+   photograph.
 
 ## Releasing
 

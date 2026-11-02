@@ -471,6 +471,12 @@ below the accepted frames; click one to keep it again. That seeding matters: the
 replaces the whole file, so without it a second visit would quietly discard everything
 you decided on the first.
 
+`grow-up align` rewrites the page as it finishes, so after
+`grow-up select && grow-up align && grow-up encode` a reload shows the new picks. A tab
+you leave open is merely out of date: every frame is named after its photo, so no
+picture on an old page can turn into a different one, and a frame that has since left
+the selection shows as a broken image rather than as somebody else's week.
+
 `rejects.json` is the one thing in `out/` that cannot be regenerated — it exists only
 because you looked at every frame. Worth keeping if you ever clear that directory.
 
@@ -531,12 +537,13 @@ takes its input from the manifest, and skips whatever is already recorded there.
 | 3 | `grow-up fetch` | Downloads the originals into `paths.cache`, concurrently, retrying transient failures. Streams to disk and renames on completion, so an interrupted run leaves no truncated file. |
 | 4 | `grow-up analyze` | Crops around the face box, runs FaceLandmarker, and stores the metrics: pose, gaze, blink, sharpness, exposure, iris positions, face extents. The expensive stage, and the only one that runs a model. |
 | 5 | `grow-up select` | Applies the `[filter]` thresholds to those stored metrics, scores the survivors with the `[score]` weights, and keeps the best per `[select] cadence` bucket. Reads only stored numbers — no image is opened, so it is sub-second and re-runnable as often as you like. |
-| 6 | `grow-up align` | Solves a similarity transform per frame that puts both eyes on the canonical positions, warps the image to `[output]` size, and writes the frames. Optionally damps brightness flicker across neighbours. |
+| 6 | `grow-up align` | Solves a similarity transform per frame that puts both eyes on the canonical positions, warps the image to `[output]` size, and writes the frames, each named after its photo. Optionally damps brightness flicker across neighbours. Rewrites `contact-sheet.html` to match. |
 | 7 | `grow-up review` | Writes `contact-sheet.html` (the accepted frames, in order) and `rejects.html` (the interactive threshold tuner). |
 | 8 | `grow-up encode` | Feeds the frames to ffmpeg and writes the video into `paths.out`. |
 
 `analyze` runs `select` immediately after itself, so the filter outcome is reported
-where you would expect it rather than at the end of the run.
+where you would expect it rather than at the end of the run. `align` likewise
+rewrites the contact sheet, whose pictures are the frames it has just written.
 
 Outside that sequence:
 

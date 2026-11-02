@@ -417,6 +417,19 @@ def cmd_align(args: argparse.Namespace) -> None:
     pipeline.stage_align(conn, cfg.path("frames"), cfg.section("output"), log,
                          int(cfg.get("analyze", "workers", 0)),
                          framing=cfg.section("align"))
+    # The contact sheet is a view of these frames, so whatever rewrites them
+    # rewrites it. `select && align && encode` -- the advice given in four
+    # places -- has no `review` in it, and the page it left behind still showed
+    # the selection from before the rejections it was meant to apply.
+    try:
+        out_dir = cfg.path("out")
+    except KeyError:
+        # Without `paths.out` there is no sheet to keep in step, and `align`
+        # never needed one before it started writing it.
+        return
+    sheet = out_dir / "contact-sheet.html"
+    review.write_contact_sheet(conn, sheet, _manual_rejects(cfg))
+    log(f"  align: rewrote {sheet} to match")
 
 
 def cmd_review(args: argparse.Namespace) -> None:
