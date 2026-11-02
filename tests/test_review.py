@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -344,8 +345,8 @@ class TestTheSheetCarriesTheRunnerUps:
         assert 'class="alts" data-count="1"' in page
 
     def test_every_prepared_runner_up_reaches_the_tray(self, conn, tmp_path):
-        """The page shows whatever `select` prepared -- there is no display cap,
-        so `[select] alternates` is the only knob and raising it is visible."""
+        """Up to a screen's worth, the tray shows whatever `select` prepared, so
+        `[select] alternates` is the only knob and raising it is visible."""
         names = ["spare-a", "spare-b", "spare-c", "spare-d"]
         for n, name in enumerate(names, start=1):
             add_alternate(conn, "2026-01", name, n, tmp_path)
@@ -417,6 +418,33 @@ class TestTheSheetCarriesTheRunnerUps:
         assert "paintCompare" in page and "candidatesFor" in page
         assert page.count('<div id="compare"') == 1, "one empty container, filled by JS"
 
+    def test_past_four_the_tray_counts_the_rest_and_opens_compare(self, conn, tmp_path):
+        """Twelve thumbnails in two columns would make every card six rows taller
+        for photos that compare draws properly anyway."""
+        for n in range(1, 13):
+            add_alternate(conn, "2026-01", f"spare-{n}", n, tmp_path)
+        page = self.page(conn, tmp_path)
+        tray = re.search(r'<div class="alts"[^>]*>(.*?)</div>', page).group(1)
+
+        assert re.findall(r'data-alt="([^"]+)"', tray) == [f"spare-{n}" for n in range(1, 5)]
+        assert '<button type="button" class="compare-open more">+8 more</button>' in tray
+
+    def test_past_four_every_runner_up_still_reaches_the_page(self, conn, tmp_path):
+        """The tray stops; the candidates do not. Promotion and compare walk the
+        listing, so a cap there would make the hidden ones unreachable."""
+        for n in range(1, 13):
+            add_alternate(conn, "2026-01", f"spare-{n}", n, tmp_path)
+        page = self.page(conn, tmp_path)
+        listing = json.loads(page.split('id="buckets">')[1].split("</script>")[0])
+        january = next(b for b in listing if b["bucket"] == "2026-01")
+
+        assert len(january["candidates"]) == 13
+
+    def test_four_or_fewer_need_no_more_button(self, conn, tmp_path):
+        for n in range(1, 5):
+            add_alternate(conn, "2026-01", f"spare-{n}", n, tmp_path)
+        assert 'class="compare-open more"' not in self.page(conn, tmp_path)
+
     def test_a_bucket_without_alternates_has_no_tray(self, conn, tmp_path):
         assert 'class="alts"' not in self.page(conn, tmp_path)
 
@@ -424,6 +452,79 @@ class TestTheSheetCarriesTheRunnerUps:
         add_alternate(conn, "2026-01", "spare-a", 1, tmp_path)
         out = tmp_path / "out" / "contact-sheet.html"
         assert review.write_contact_sheet(conn, out) == 3
+
+
+class TestTheSheetOffersScreensToFill:
+    """Past four runner-ups, the comparison can spread over extra windows, one
+    per monitor. The sheet offers only as many screens as there are fours to
+    fill, and writes the page those windows show only when it offers any."""
+
+    def sheet(self, conn, tmp_path, runner_ups: int) -> tuple[str, Path]:
+        for n in range(1, runner_ups + 1):
+            add_alternate(conn, "2026-01", f"spare-{n}", n, tmp_path)
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        return out.read_text(), out.with_name("contact-sheet-screen.html")
+
+    @pytest.mark.parametrize("runner_ups, offered", [
+        (0, []), (4, []), (5, ["1", "2"]), (8, ["1", "2"]),
+        (12, ["1", "2", "3"]), (13, ["1", "2", "3", "4"]), (40, ["1", "2", "3", "4"]),
+    ])
+    def test_as_many_screens_as_there_are_fours_to_fill(self, conn, tmp_path,
+                                                        runner_ups, offered):
+        """A third screen for eight runner-ups could only ever say "nothing
+        more"; four already fit on one, so there is no choice to offer."""
+        page, _ = self.sheet(conn, tmp_path, runner_ups)
+        assert re.findall(r'data-screens="(\d+)"', page) == offered
+
+    def test_one_screen_is_the_default(self, conn, tmp_path):
+        page, _ = self.sheet(conn, tmp_path, 12)
+        assert '<button data-screens="1" aria-pressed="true">1</button>' in page
+        assert page.count('aria-pressed="true">') == 2, "one screen button, one size button"
+
+    def test_the_screen_page_is_written_beside_the_sheet_when_offered(self, conn, tmp_path):
+        page, screen = self.sheet(conn, tmp_path, 12)
+        assert 'data-page="contact-sheet-screen.html"' in page
+        assert screen.exists()
+
+    def test_the_screen_page_is_self_contained(self, conn, tmp_path):
+        """It is opened over file:// like the sheet, so nothing remote loads."""
+        _, screen = self.sheet(conn, tmp_path, 12)
+        text = screen.read_text()
+        assert not re.search(r"""(src|href)\s*=\s*["']https?://""", text)
+        assert "cdn" not in text.lower()
+
+    def test_every_screen_is_drawn_by_the_same_code(self, conn, tmp_path):
+        """One drawing function and one stylesheet for the sheet and its
+        windows, so a runner-up cannot look different on another monitor."""
+        page, screen = self.sheet(conn, tmp_path, 12)
+        text = screen.read_text()
+        assert review._DRAW_JS in page and review._DRAW_JS in text
+        assert review._CSS in page and review._CSS in text
+
+    def test_the_screen_page_decides_nothing(self):
+        """The rejections and the rule for choosing live on the sheet alone; a
+        second copy in the windows would be a second thing to keep in step."""
+        for name in ("rejected", "chooseCandidate", "bucketState", "spreadAcross"):
+            assert name not in review._SCREEN_JS, name
+
+    def test_without_screens_to_offer_there_is_no_screen_page(self, conn, tmp_path):
+        _, screen = self.sheet(conn, tmp_path, 4)
+        assert not screen.exists()
+
+    def test_a_screen_page_left_by_an_earlier_sheet_is_removed(self, conn, tmp_path):
+        """With nothing on the sheet able to talk to it, it is only clutter."""
+        screen = tmp_path / "out" / "contact-sheet-screen.html"
+        screen.parent.mkdir(parents=True)
+        screen.write_text("stale")
+        self.sheet(conn, tmp_path, 4)
+        assert not screen.exists()
+
+    def test_the_rejects_page_offers_no_screens(self, tmp_path):
+        conn = db.connect(tmp_path / "r.sqlite")
+        out = tmp_path / "out" / "rejects.html"
+        review.write_rejects_gallery(conn, out)
+        assert "<button data-screens=" not in out.read_text()
 
 
 class TestTheSheetKnowsWhatItIsNotShowing:

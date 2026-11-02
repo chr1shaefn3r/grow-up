@@ -92,6 +92,7 @@ specifically to avoid. They all look like improvements.
 | Let `trial` reuse an existing render | It exists to measure what encoding costs and to project the full run from that measurement. A skipped render measures nothing and projects from it, so the estimate arrives looking like very good news. `cmd_trial` passes `force=True` for that reason alone. | `TestATrialAlwaysRenders` (`tests/test_encode.py`) |
 | Give the `birthday-months` bucket a label computed its own way | `months_between` decides which bucket a photo lands in; `birthday_month_start` only names it, and must be its exact inverse. Any other rule — `birth.replace(month=…)`, clamping the day, formatting the age — drifts from the grouping it claims to describe, and two buckets sharing a name means one month of the timelapse silently swallows another. The awkward input is a birthday on the 31st: February contains no such date, so the month does not open until March does. | `test_the_label_is_the_exact_inverse_of_the_grouping`, `test_a_birthday_on_the_31st_waits_for_a_month_that_has_one` (`tests/test_select.py`) |
 | Take month names or number grouping from the stdlib `locale` module | It depends on which locales the host has generated, so the same config renders a different video on a Mac and on a Linux desktop. `annotate.LANGUAGES` is a table for that reason, and because `mois` is invariable in French — a rule with an `s` on the end is wrong. | `TestLanguages` (`tests/test_annotate.py`) |
+| Draw into an extra screen's window from the sheet, or let that window decide anything | Over `file://` Chrome gives every load of a page an origin of its own. A blank window the sheet opened and drew into keeps the *old* load's origin, so after the reload that follows `select && align` the sheet may no longer touch it. Navigating it to a fresh `about:blank` does not help. This was built first and only a browser run caught it. The windows show `contact-sheet-screen.html` and talk to the sheet by `postMessage`. They say `ready` every second, because a message posted while the sheet unloads did not arrive. They hold no rejections and apply no rule, so nothing can drift. | `tests/test_screens_browser.py` (Chromium via Playwright; skips without it, so not in CI), `TestEveryScreenChoosesTheSameWay` (`tests/test_tuner.py`), `test_the_screen_page_decides_nothing` (`tests/test_review.py`) |
 | Apply `--limit` per account instead of splitting it | `trial -n 100` would sample 200 across two accounts, and the projection multiplies a per-item cost by the whole workload — so the estimate is wrong with nothing on screen to say so. | `TestSplittingASample` (`tests/test_sources.py`) |
 
 One more, without a test because it is a shape rather than a behaviour: EXIF orientation
@@ -112,7 +113,7 @@ coordinates; decoding elsewhere without the same rule silently crops the wrong r
 | `metrics.py` | Pure numpy: pose, gaze, blink, sharpness, exposure — and `RULES`, the single definition of the hard filters. |
 | `align.py` | The similarity transform. Maths is pure numpy; opencv is imported lazily, only for the warp. |
 | `select.py` | Apply the filters, score the survivors, bucket them by cadence. `birthday-months` buckets on age, borrowing `annotate.months_between` rather than restating the day-of-month rule. |
-| `review.py` | The two static HTML pages. No CDN — they open over `file://`. The rejects page is a threshold tuner driven by the serialized `RULES`. |
+| `review.py` | The static HTML pages. No CDN — they open over `file://`. The rejects page is a threshold tuner driven by the serialized `RULES`. The contact sheet's compare can spread over extra monitors through `contact-sheet-screen.html`, a page that only draws what the sheet sends it. |
 | `annotate.py` | The date/age footer. Age arithmetic, date tokens and the five language tables are plain Python; Pillow is imported lazily, only to draw. |
 | `encode.py` | The ffmpeg invocation, and the transition maths. Hold rate and playback rate are separate; the filter strings are pure arithmetic so they stay testable with no ffmpeg. |
 | `progress.py` | The progress bar. Repaints on a terminal, degrades to plain lines when piped. |
@@ -127,9 +128,10 @@ coordinates; decoding elsewhere without the same rule silently crops the wrong r
 pip install opencv-python-headless   # unlocks the warp and framing tests
 pip install pillow                   # unlocks the footer-drawing tests
 # node on PATH                       # unlocks the Python/JavaScript filter parity tests
+# node that can require('playwright')  # unlocks the multi-screen browser test
 ```
 
-With none of them, 133 tests skip and the rest still assert everything that matters.
+With none of them, 149 tests skip and the rest still assert everything that matters.
 
 **You cannot verify anything that needs real photographs.** mediapipe generally will not
 install in a sandbox, there is no Immich instance, and no credentials will be shared.
@@ -170,6 +172,11 @@ Hand these to the human running a real library:
 8. Reject all five photos on a card in a well-photographed month. The card turns amber
    with `N more after re-run` and the top of the page names it. Save `rejects.json`,
    run `grow-up select && grow-up align`, reload: that month shows its sixth-best.
+9. With `alternates = 12` and three monitors, choose `3` under screens on the contact
+   sheet and put each new window on its own monitor. Compare a month: 1–4 on the sheet,
+   5–8 and 9–12 beside it. Press `9` on the third monitor, then reload the sheet and
+   compare again: the same two windows fill, with no new ones opening. Only headless and
+   virtual-display Chromium have run this. Firefox, Safari and real monitors have not.
 
 ## Releasing
 

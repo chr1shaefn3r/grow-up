@@ -26,6 +26,14 @@ from .metrics import RULES, FaceMetrics, hard_reject
 # not, and would take a minute to paint.
 MAX_REJECT_SAMPLES = 48
 
+# Runner-ups per screen in the comparison, and so also the thumbnails a card
+# shows before it says how many more there are. The page's script carries the
+# same number; a test holds the two together.
+PER_SCREEN = 4
+
+# The most screens the contact sheet offers to spread a comparison over.
+MAX_SCREENS = 4
+
 # Metric fields the rules read, plus what the page needs to draw a tile.
 _METRIC_FIELDS = sorted({field for rule in RULES for field in rule.fields} | {"detected"})
 
@@ -115,6 +123,10 @@ figure.removed::after { content:"would be dropped"; position:absolute; top:8px; 
 .alt img { width:100%; height:auto; cursor:pointer; }
 .alt.gone { opacity:.3; border-color:var(--bad); }
 .alt.now { border-color:var(--good); border-width:2px; }
+/* Past one screen's worth the tray stops and says how many more there are:
+   twelve runner-ups in two columns would make every card six rows taller to
+   show photos that compare draws properly anyway. */
+.alts .more { grid-column:1/-1; padding:3px 0; font-size:11px; border-radius:5px; }
 figure .rank { font-variant-numeric:tabular-nums; }
 figure.exhausted { outline:2px solid var(--bad); }
 figure.exhausted img { opacity:.35; }
@@ -181,8 +193,10 @@ figure.waiting::after { content:"more to see"; position:absolute; top:8px; left:
                  align-items:center; flex-wrap:wrap; justify-content:center; }
 #compare .head kbd { background:#ffffff22; border:1px solid #ffffff33;
                      border-radius:4px; padding:1px 6px; font-size:11px; }
-/* Two columns, so the default four land as the 2x2 they were asked for and any
-   other count still pairs up rather than becoming a strip. min-height:0 on both
+/* Two columns, so each screen's four land as the 2x2 they were asked for and any
+   other count still pairs up rather than becoming a strip. The same rules draw
+   the extra screens: their page carries this stylesheet too.
+   min-height:0 on both
    the track and the cell is what lets the images shrink to fit the screen
    instead of pushing the grid taller than the viewport. */
 #compare .pane { flex:1; min-height:0; display:grid; gap:12px;
@@ -201,9 +215,104 @@ figure.waiting::after { content:"more to see"; position:absolute; top:8px; left:
 #compare .choice.now .cap::after { content:"current pick"; color:var(--good); }
 """
 
+# One screen of a comparison, drawn from plain data. Shared by the contact sheet
+# and the screen page it opens on other monitors, so every screen is drawn by
+# the same code from the same cells and none can show a photo differently.
+_DRAW_JS = """
+function drawScreen(box, text, hint, cells) {
+  box.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'head';
+  const label = document.createElement('span');
+  label.textContent = text;
+  head.appendChild(label);
+  if (hint) {
+    const keys = document.createElement('span');
+    keys.innerHTML = hint;
+    head.appendChild(keys);
+  }
+  box.appendChild(head);
+  if (!cells) { return; }
+  const pane = document.createElement('div');
+  pane.className = 'pane';
+  cells.forEach(c => {
+    const cell = document.createElement('button');
+    cell.type = 'button';
+    cell.className = 'choice';
+    cell.dataset.choose = c.id;
+    if (c.gone) { cell.classList.add('gone'); }
+    if (c.now) { cell.classList.add('now'); }
+    const img = document.createElement('img');
+    img.src = c.src;
+    img.alt = '';
+    const cap = document.createElement('span');
+    cap.className = 'cap';
+    cap.textContent = c.label;
+    cell.appendChild(img);
+    cell.appendChild(cap);
+    pane.appendChild(cell);
+  });
+  box.appendChild(pane);
+}
+"""
+
+# The screen page: an extra monitor's share of a comparison. It holds no state
+# and makes no decision -- the contact sheet that opened it sends what to draw,
+# and it sends back what was clicked or pressed.
+_SCREEN_JS = """
+const box = document.getElementById('compare');
+const screen = Number(location.hash.slice(1));
+document.title = 'grow-up — screen ' + screen;
+let orphaned = false;
+
+function send(kind, extra) {
+  const sheet = window.opener;
+  if (sheet && !sheet.closed) {
+    sheet.postMessage(Object.assign({growUp: true, kind: kind, screen: screen}, extra || {}), '*');
+  }
+}
+
+// Said every second, not once: the sheet may still be loading, or be a fresh
+// load after `select && align` that has never heard of this window, and a
+// message sent while nothing listens is simply lost. A sheet that already has
+// this window ignores it. Not left to the sheet to say it is going -- a message
+// sent while a page unloads did not arrive.
+function announce() {
+  const sheet = window.opener;
+  if (sheet && !sheet.closed) { send('ready'); return; }
+  if (orphaned) { return; }
+  orphaned = true;
+  // Its sheet closed, or never had one -- opened straight off disk.
+  drawScreen(box, 'No contact sheet is connected to this window. Close it, ' +
+    'and choose screens on contact-sheet.html instead.', '', null);
+}
+setInterval(announce, 1000);
+announce();
+
+window.addEventListener('message', ev => {
+  const msg = ev.data;
+  if (ev.source !== window.opener || !msg || msg.growUp !== true) { return; }
+  if (msg.kind === 'paint') { drawScreen(box, msg.text, msg.hint, msg.cells); }
+});
+
+document.addEventListener('click', ev => {
+  const choice = ev.target.closest && ev.target.closest('[data-choose]');
+  if (choice) {
+    send('choose', {id: choice.dataset.choose});
+    // The choice ends the decision and the sheet is where the next one starts.
+    // Browsers may decline to move focus; then it is one click.
+    if (window.opener) { window.opener.focus(); }
+  } else if (ev.target === box) {
+    send('close');
+  }
+});
+document.addEventListener('keydown', ev => send('key', {key: ev.key}));
+window.addEventListener('pagehide', () => send('gone'));
+"""
+
 # Viewer plus manual rejection. Uses event delegation throughout so it keeps
 # working over grids the tuner re-renders.
-_JS = """
+_JS = _DRAW_JS + """
 // Seeded from rejects.json by the page writer. Without this the set would start
 // empty on every regeneration, and the next download -- which replaces the whole
 // file -- would silently un-reject everything decided before it.
@@ -406,52 +515,84 @@ function chooseCandidate(bucket, id) {
   paintCompare();
 }
 
+// Four runner-ups to a screen: the 2x2 the comparison was built around,
+// repeated rather than shrunk, because what decides it -- a half-closed eye,
+// which way the head is turned -- is what goes first when the photos get
+// smaller. More runner-ups than screens means pages, never smaller pictures.
+const PER_SCREEN = 4;
+// Which page of them is up when the screens cannot hold them all.
+let comparePage = 0;
+
+// Which runner-ups each screen shows, as [start, end) into the bucket's list:
+// the sheet first, then each extra window, four apiece, and what does not fit
+// on a later page. Every runner-up lands on exactly one screen of one page, so
+// having more photos than monitors can hide none of them. Pure, so the test
+// suite can run it under node.
+function spreadAcross(count, across, page) {
+  const groups = Math.max(1, Math.ceil(count / PER_SCREEN));
+  const pages = Math.max(1, Math.ceil(groups / across));
+  const at = ((page % pages) + pages) % pages;
+  const slices = [];
+  for (let s = 0; s < across; s++) {
+    const start = Math.min(count, (at * across + s) * PER_SCREEN);
+    slices.push([start, Math.min(count, start + PER_SCREEN)]);
+  }
+  return {pages: pages, page: at, slices: slices};
+}
+
+// One screen's runner-ups as plain data, for drawScreen. Numbered by place in
+// the whole bucket, so a photo carries the same number on whichever screen or
+// page it turns up.
+function cellsFor(spares, slice, pick) {
+  return spares.slice(slice[0], slice[1]).map((spare, i) => ({
+    id: spare.id, src: spare.src, label: (slice[0] + i + 1) + '.  ' + spare.date,
+    gone: rejected.has(spare.id), now: Boolean(pick) && spare.id === pick.id,
+  }));
+}
+
 function paintCompare() {
   if (!compare || comparing === null) { return; }
-  const candidates = candidatesFor(comparing);
-  const spares = candidates.slice(1);
+  const spares = candidatesFor(comparing).slice(1);
   const state = bucketState(comparing);
   const pick = state.index < 0 ? null : state.pick;
+  const others = liveExtras();
+  const spread = spreadAcross(spares.length, 1 + others.length, comparePage);
+  comparePage = spread.page;
 
-  const head = document.createElement('div');
-  head.className = 'head';
-  const label = document.createElement('span');
-  label.textContent = spares.length + ' runner-up' + (spares.length === 1 ? '' : 's')
-    + ' for ' + comparing + (pick ? '  —  showing ' + pick.date : '  —  ' + state.label);
-  const hint = document.createElement('span');
-  hint.innerHTML = '<kbd>1</kbd>…<kbd>' + Math.min(spares.length, 9) + '</kbd> choose'
+  // A page's runner-ups are one unbroken run, so its keys are a range -- and
+  // stop at 9. Past that it is a click, which is all the rest needs.
+  const shown = spread.slices.filter(s => s[1] > s[0]);
+  const from = shown.length ? shown[0][0] + 1 : 0;
+  const to = shown.length ? Math.min(9, shown[shown.length - 1][1]) : 0;
+  const hint = (from && from <= to
+      ? '<kbd>' + from + '</kbd>' + (to > from ? '…<kbd>' + to + '</kbd>' : '') + ' choose'
+      : 'click to choose')
+    + (spread.pages > 1 ? ' &nbsp; <kbd>&larr;</kbd> <kbd>&rarr;</kbd> more' : '')
     + ' &nbsp; <kbd>esc</kbd> close';
-  head.appendChild(label);
-  head.appendChild(hint);
+  const label = spares.length + ' runner-up' + (spares.length === 1 ? '' : 's')
+    + ' for ' + comparing + (pick ? '  —  showing ' + pick.date : '  —  ' + state.label)
+    + (spread.pages > 1 ? '  —  page ' + (spread.page + 1) + ' of ' + spread.pages : '');
 
-  const pane = document.createElement('div');
-  pane.className = 'pane';
-  spares.forEach((spare, n) => {
-    const cell = document.createElement('button');
-    cell.type = 'button';
-    cell.className = 'choice';
-    cell.dataset.choose = spare.id;
-    if (rejected.has(spare.id)) { cell.classList.add('gone'); }
-    if (pick && spare.id === pick.id) { cell.classList.add('now'); }
-    const img = document.createElement('img');
-    img.src = spare.src;
-    img.alt = '';
-    const cap = document.createElement('span');
-    cap.className = 'cap';
-    cap.textContent = (n + 1) + '.  ' + spare.date;
-    cell.appendChild(img);
-    cell.appendChild(cap);
-    pane.appendChild(cell);
+  drawScreen(compare, label, hint, cellsFor(spares, spread.slices[0], pick));
+  others.forEach((screen, i) => {
+    const slice = spread.slices[i + 1];
+    const count = slice[1] - slice[0];
+    const text = 'Screen ' + screen.n + '  —  ' + (count
+      ? (count === 1 ? 'runner-up ' + slice[1]
+                     : 'runner-ups ' + (slice[0] + 1) + '–' + slice[1])
+        + ' of ' + spares.length + ' for ' + comparing
+      : 'nothing more for ' + comparing + (spread.pages > 1 ? ' on this page' : ''));
+    tell(screen, text, hint, count ? cellsFor(spares, slice, pick) : null);
   });
-
-  compare.innerHTML = '';
-  compare.appendChild(head);
-  compare.appendChild(pane);
 }
 
 function openCompare(bucket) {
   if (!compare || candidatesFor(bucket).length < 2) { return; }
+  // A window closed by hand comes back here, on a click, which is the only
+  // time a browser lets a page open one.
+  attachScreens();
   comparing = bucket;
+  comparePage = 0;
   compare.hidden = false;
   paintCompare();
 }
@@ -460,7 +601,145 @@ function closeCompare() {
   if (!compare) { return; }
   compare.hidden = true;
   comparing = null;
+  comparePage = 0;
+  liveExtras().forEach(screen => idle(screen));
 }
+
+function turnPage(step) {
+  comparePage += step;
+  paintCompare();
+}
+
+function onScreen(index) {
+  const count = candidatesFor(comparing).length - 1;
+  const spread = spreadAcross(count, 1 + liveExtras().length, comparePage);
+  return spread.slices.some(s => index >= s[0] && index < s[1]);
+}
+
+// The keys of every screen -- the sheet's own and each extra window's, which
+// forwards them here -- so a key means the same wherever the focus is.
+function compareKey(ev) {
+  if (ev.key === 'Escape') { closeCompare(); return; }
+  if (ev.key === 'ArrowRight') { turnPage(1); return; }
+  if (ev.key === 'ArrowLeft') { turnPage(-1); return; }
+  const n = Number(ev.key);
+  if (n >= 1 && n <= 9) {
+    const spares = candidatesFor(comparing).slice(1);
+    // Only a runner-up on a screen right now. With more photos than screens,
+    // the key for one on another page would choose a photo nobody is looking at.
+    if (spares[n - 1] && onScreen(n - 1)) { choose(spares[n - 1].id); }
+  }
+}
+
+// -- extra screens --------------------------------------------------------- //
+// A comparison can spread over several monitors, one window each, showing the
+// screen page written beside this one. That page decides nothing: it draws
+// what it is sent and sends back what is clicked or pressed, so the
+// rejections, the choice and its rule stay here, once. It is a page of its
+// own, talking by postMessage, because over file:// every load is an origin
+// of its own -- a window this page drew into directly is closed to it again
+// after a reload, which is exactly when it is needed.
+// Anything able to message this page is a window it opened, or one that opened
+// it, and no message does more than a click on this page could.
+
+const note = document.getElementById('screens-note');
+const screenButtons = [...document.querySelectorAll('[data-screens]')];
+const mostScreens = Math.max(1, ...screenButtons.map(b => Number(b.dataset.screens)));
+let screens = 1;
+// Set by a click on a screens button. Until then the windows that announce
+// themselves after a reload are the count, so nothing needs storing; after it,
+// the click is, and a window beyond it is closed rather than obeyed.
+let screensChosen = false;
+// extras[i] is screen i + 2: {win, n, ready}.
+const extras = [];
+
+function liveExtras() {
+  return extras.slice(0, screens - 1).filter(s => s && s.ready && !s.win.closed);
+}
+
+function tell(screen, text, hint, cells) {
+  screen.win.postMessage(
+    {growUp: true, kind: 'paint', text: text, hint: hint, cells: cells}, '*');
+}
+
+function idle(screen) {
+  tell(screen, 'Screen ' + screen.n + ' of the contact sheet. Move this window to ' +
+    'its monitor and make it full screen; runner-ups appear here when you compare.',
+    '', null);
+}
+
+// Opens the windows for screens 2..n that are not already open. Only ever from
+// a click or a key: browsers open a window for nothing else, and some for only
+// one per click -- so whatever stays shut is named, and the next click opens
+// the next. A window opened here counts once its page says it is ready.
+function attachScreens() {
+  if (!note) { return; }
+  const missing = [];
+  for (let n = 2; n <= screens; n++) {
+    const known = extras[n - 2];
+    if (known && !known.win.closed) { continue; }
+    const win = window.open(note.dataset.page + '#' + n, 'grow-up-screen-' + n,
+                            'popup,width=960,height=720');
+    extras[n - 2] = win ? {win: win, n: n, ready: false} : null;
+    if (!win) { missing.push(n); }
+  }
+  note.textContent = missing.length
+    ? 'screen ' + missing.join(' and ') + ' did not open: click ' + screens +
+      ' again, or allow pop-ups for this page'
+    : '';
+}
+
+function setScreens(n) {
+  screens = n;
+  screensChosen = true;
+  // Close what is no longer asked for: a window left over from three screens
+  // would otherwise sit there looking like part of the comparison.
+  extras.splice(n - 1).forEach(s => { if (s && !s.win.closed) { s.win.close(); } });
+  attachScreens();
+  pressScreens();
+  paintCompare();
+}
+
+function pressScreens() {
+  screenButtons.forEach(b => b.setAttribute(
+    'aria-pressed', String(Number(b.dataset.screens) === screens)));
+}
+
+function onScreenMessage(ev) {
+  const msg = ev.data;
+  if (!msg || msg.growUp !== true || !ev.source) { return; }
+  const n = Number(msg.screen);
+  if (!(n >= 2)) { return; }
+  if (msg.kind === 'ready') {
+    const known = extras[n - 2];
+    if (known && known.ready && known.win === ev.source) { return; }
+    // From a sheet that offered more screens than this one, or one more than
+    // the screens button now in force: not part of this comparison.
+    if (n > mostScreens || (n > screens && screensChosen)) { ev.source.close(); return; }
+    if (n > screens) { screens = n; pressScreens(); }
+    extras[n - 2] = {win: ev.source, n: n, ready: true};
+    if (comparing !== null) { paintCompare(); } else { idle(extras[n - 2]); }
+    return;
+  }
+  const screen = extras[n - 2];
+  if (!screen || screen.win !== ev.source) { return; }
+  if (msg.kind === 'gone') {
+    // Closed or reloaded by hand: its four move to a page the remaining
+    // screens can show, instead of vanishing with the window.
+    extras[n - 2] = null;
+    paintCompare();
+    return;
+  }
+  if (comparing === null) { return; }
+  const spares = candidatesFor(comparing).slice(1);
+  if (msg.kind === 'choose' && spares.some(s => s.id === msg.id)) { choose(msg.id); }
+  else if (msg.kind === 'key') { compareKey({key: String(msg.key)}); }
+  else if (msg.kind === 'close') { closeCompare(); }
+}
+
+// A reload after `select && align` leaves the windows where they were put; they
+// keep announcing themselves, so the new page takes them back without a click.
+window.addEventListener('message', onScreenMessage);
 
 // A choice is the end of the decision, so it goes straight back to the sheet.
 // Compare can be opened from the full-size viewer (c), and closing only the
@@ -504,15 +783,7 @@ if (compare) {
 document.addEventListener('keydown', ev => {
   // Compare sits above the viewer, so it answers for the keyboard first --
   // otherwise Escape would close the thing underneath the one you are looking at.
-  if (compare && !compare.hidden) {
-    if (ev.key === 'Escape') { closeCompare(); return; }
-    const n = Number(ev.key);
-    if (n >= 1 && n <= 9) {
-      const spares = candidatesFor(comparing).slice(1);
-      if (spares[n - 1]) { choose(spares[n - 1].id); }
-    }
-    return;
-  }
+  if (compare && !compare.hidden) { compareKey(ev); return; }
   if (!viewer || viewer.hidden) { return; }
   if (ev.key === 'Escape') { closeViewer(); }
   else if (ev.key === 'ArrowRight') { openAt(current + 1); }
@@ -532,6 +803,11 @@ document.querySelectorAll('[data-tile]').forEach(btn => {
       other => other.setAttribute('aria-pressed', String(other === btn)));
   });
 });
+
+screenButtons.forEach(btn => {
+  btn.addEventListener('click', () => setScreens(Number(btn.dataset.screens)));
+});
+pressScreens();
 
 function payload() { return JSON.stringify({rejected: [...rejected]}, null, 2); }
 function render() {
@@ -837,6 +1113,28 @@ def _size_controls(active: str = "M") -> str:
     return f'<span class="count">size</span>{buttons}'
 
 
+def _screen_controls(spares: int, screen_page: str) -> str:
+    """Buttons for spreading a comparison over one to n screens, or nothing.
+
+    Offered only as far as there are runner-ups to fill them: with eight, a
+    third screen could only ever say "nothing more", so it is not a choice worth
+    showing -- and with four, one screen holds them all and there is no choice.
+    The page presses the right button itself: the count is whichever extra
+    windows are open, and they announce themselves to it.
+    """
+    most = min(MAX_SCREENS, math.ceil(spares / PER_SCREEN))
+    if most < 2:
+        return ""
+    buttons = "".join(
+        f'<button data-screens="{n}"' + (' aria-pressed="true"' if n == 1 else "")
+        + f">{n}</button>"
+        for n in range(1, most + 1)
+    )
+    return (f'<span class="count">screens</span>{buttons}'
+            f'<span class="count" id="screens-note" '
+            f'data-page="{html.escape(screen_page)}"></span>')
+
+
 def _page(title: str, lede: str, body: str, script: str = "",
           tile: str = "M") -> str:
     # The starting size rides on <html> rather than waiting for the script, so
@@ -854,6 +1152,20 @@ def _page(title: str, lede: str, body: str, script: str = "",
         f"{body}\n"
         + (f"<script>{script}</script>\n" if script else "")
         + "</body>\n</html>\n"
+    )
+
+
+def _screen_page() -> str:
+    """The page an extra monitor shows. It carries the sheet's stylesheet, so a
+    runner-up is drawn the same on every screen, and nothing else of it."""
+    return (
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        "<title>grow-up — screen</title>\n"
+        f"<style>{_CSS}</style>\n</head>\n<body>\n"
+        '<div id="compare"><div class="head"><span>Waiting for the contact sheet.'
+        "</span></div></div>\n"
+        f"<script>{_DRAW_JS}{_SCREEN_JS}</script>\n"
+        "</body>\n</html>\n"
     )
 
 
@@ -884,13 +1196,20 @@ def _bucket_card(bucket: str, candidates: list[dict]) -> str:
     """
     top = candidates[0]
     label = f"{top['date']}  #{top['seq']}"
+    # One screen's worth as thumbnails; the rest are counted and a click away in
+    # compare, which draws them all. Every one is still in the bucket listing,
+    # so promotion reaches the hidden ones exactly as it does these.
     spares = "".join(
         f'<button type="button" class="alt" data-alt="{html.escape(spare["id"])}" '
         f'title="{html.escape(spare["date"])}">'
         f'<img loading="lazy" src="{spare["src"]}" alt="">'
         f'</button>'
-        for spare in candidates[1:]
+        for spare in candidates[1:1 + PER_SCREEN]
     )
+    unshown = len(candidates) - 1 - PER_SCREEN
+    if unshown > 0:
+        spares += (f'<button type="button" class="compare-open more">'
+                   f'+{unshown} more</button>')
     tray = f'<div class="alts" data-count="{len(candidates) - 1}">{spares}</div>' if spares else ""
     return (
         f'<figure data-bucket="{html.escape(bucket)}" '
@@ -989,6 +1308,17 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
             f'<div class="grid">{"".join(rejected_cards)}</div>\n'
         )
 
+    # Extra screens only pay off past one screen's worth of runner-ups, and
+    # their page is written only then. Removed otherwise: left behind by an
+    # earlier sheet, it would be a page that nothing here can talk to.
+    screen_page = out_path.with_name(f"{out_path.stem}-screen.html")
+    most_spares = max((len(c) - 1 for c in buckets.values()), default=0)
+    screen_controls = _screen_controls(most_spares, screen_page.name)
+    if screen_controls:
+        screen_page.write_text(_screen_page(), encoding="utf-8")
+    else:
+        screen_page.unlink(missing_ok=True)
+
     body = (
         seed +
         '<div class="bar">'
@@ -996,6 +1326,7 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
         '<button id="clear">Clear</button>'
         '<span class="count"><b id="n">0</b> rejected</span>'
         '<span class="spacer"></span>'
+        f"{screen_controls}"
         f'{_size_controls("S")}'
         "</div>\n"
         '<p class="notice" id="more-note" hidden></p>\n'

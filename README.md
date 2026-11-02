@@ -466,9 +466,10 @@ see goes in the same pass.
 `[select] alternates` sets how many are prepared (default 4, `0` to switch it off). They
 sit beneath the pick in a 2×2 grid, at a size that depends on the card rather than on how
 many there are — one runner-up is drawn no larger than four would be — and are warped so
-you can judge them aligned, which is the only way to judge them. The cost is roughly
-proportional in `align` time and in the frames directory, so the default warps five
-candidates per bucket. They never enter the video.
+you can judge them aligned, which is the only way to judge them. Past four, the card
+shows the first four and a `+8 more` button that opens compare on the rest. The cost is
+roughly proportional in `align` time and in the frames directory, so the default warps
+five candidates per bucket and 12 warps thirteen. They never enter the video.
 
 The grid starts at the smallest tile size, because the sheet is a scan for the one bad
 photo in a week and more buckets on screen beats more pixels per bucket. `M` and `L` are
@@ -479,6 +480,26 @@ full-size viewer — fills the screen with that bucket's runner-ups side by side
 them as a 2×2. Click one, or press its number, and it becomes the bucket's photo: the
 page rejects everything ranked ahead of it, which is exactly what makes `select` choose
 it on the next run. Escape closes without changing anything.
+
+**More runner-ups than one screen holds.** Four is all a screen shows, at the size that
+makes a half-closed eye visible, so more runner-ups add pages rather than shrinking
+them. With `alternates = 12` on one screen, compare shows 1–4 and the arrow keys page to
+5–8 and 9–12. Each runner-up keeps its number on every page, and a number key only
+chooses a photo that is on screen, so it can never pick one you have not seen. Keys go up
+to 9; click the rest.
+
+With more monitors, the bar at the top of the sheet offers **screens**, as many as there
+are fours to fill. Pick 3 and the sheet opens two more windows. Drag each to its monitor
+and make it full screen, once. From then on every compare spreads across all three: 1–4
+on the sheet, 5–8 and 9–12 in the other two. A click or a key in any of them counts as
+if made on the sheet, and a choice clears every screen. Some browsers open only one window
+per click; the sheet says which screen did not open, and clicking the button again opens
+it. The windows show `contact-sheet-screen.html`, which the sheet writes beside itself.
+All the decisions stay on the sheet; the windows only draw what it sends them.
+
+The windows outlive a reload. After `grow-up select && grow-up align`, reload the sheet
+and it finds them again by itself, still on their monitors. Close one and its runner-ups
+move to a later page on the screens that are left. Pick 1 and the extra windows close.
 
 The page opens with your existing rejections already marked, and shows them in a strip
 below the accepted frames; click one to keep it again. That seeding matters: the download

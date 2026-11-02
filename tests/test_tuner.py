@@ -337,20 +337,30 @@ needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not i
 
 
 def run_page(tmp_path, buckets: list[dict], rejected: list[str], epilogue: str,
-             figures: list[str] = ()):
+             figures: list[str] = (), overlays: bool = False, screens: int = 0):
     """The shipped contact-sheet JS under node, and the value of `epilogue` after it.
 
     The document is just big enough to load it: the seed, the bucket listing,
     the notice, and a stand-in card per name in `figures` -- enough for the
-    page's own load-time paint to run, with no browser.
+    page's own load-time paint to run, with no browser. `overlays` adds the
+    viewer and the comparison, for driving a choice through to its end, and
+    `screens` the buttons offering that many screens.
     """
     script = tmp_path / f"page-{len(list(tmp_path.glob('page-*.mjs')))}.mjs"
     script.write_text(
+        "function overlay() {\n"
+        "  return {hidden: true, dataset: {}, innerHTML: '', children: [],\n"
+        "          addEventListener() {}, appendChild(c) { this.children.push(c); }};\n"
+        "}\n"
         "const ELEMENTS = {\n"
         f"  'rejected-seed': {{textContent: {json.dumps(json.dumps(rejected))}}},\n"
         f"  'buckets': {{textContent: {json.dumps(json.dumps(buckets))}}},\n"
         "  'more-note': {textContent: '', hidden: true},\n"
-        "};\n"
+        + ("  'viewer': overlay(), 'compare': overlay(),\n" if overlays else "")
+        + "};\n"
+        f"const SCREEN_BUTTONS = Array.from({{length: {screens}}}, (_, i) => ({{\n"
+        "  dataset: {screens: String(i + 1)}, pressed: 'false',\n"
+        "  setAttribute(_, value) { this.pressed = value; }, addEventListener() {}}));\n"
         "function card(bucket) {\n"
         "  const parts = {img: {src: '', getAttribute() { return this.src; },\n"
         "                       setAttribute(_, value) { this.src = value; }},\n"
@@ -364,9 +374,12 @@ def run_page(tmp_path, buckets: list[dict], rejected: list[str], epilogue: str,
         "}\n"
         f"const CARDS = {json.dumps(list(figures))}.map(card);\n"
         "CARDS.forEach(c => { c.classList.owner = c; });\n"
+        # The page listens for its extra screens' windows on `window`.
+        "globalThis.window = {addEventListener() {}};\n"
         "globalThis.document = {\n"
         "  getElementById: (id) => ELEMENTS[id] || null,\n"
-        "  querySelectorAll: (sel) => sel.startsWith('figure') ? CARDS : [],\n"
+        "  querySelectorAll: (sel) => sel.startsWith('figure') ? CARDS\n"
+        "    : sel === '[data-screens]' ? SCREEN_BUTTONS : [],\n"
         "  addEventListener: () => {},\n"
         "  createElement: () => ({classList: {add(){}, toggle(){}}, dataset: {},\n"
         "                        appendChild(){}, setAttribute(){}}),\n"
@@ -617,6 +630,7 @@ class TestChoosingARunnerUpMeansWhatSelectMeans:
             f"  'rejected-seed': {{textContent: {json.dumps(json.dumps(seed or []))}}},\n"
             f"  'buckets': {{textContent: {json.dumps(json.dumps(buckets))}}},\n"
             "};\n"
+            "globalThis.window = {addEventListener() {}};\n"
             "globalThis.document = {\n"
             "  getElementById: (id) => ELEMENTS[id] || null,\n"
             "  querySelectorAll: () => [],\n"
@@ -713,6 +727,208 @@ class TestChangingYourMindInTheComparison:
     def test_another_bucket_keeps_its_rejections(self, tmp_path):
         assert self.page_chooses(tmp_path, "s1", seed=["elsewhere"]) == [
             "elsewhere", "pick"]
+
+
+class TestRunnerUpsSpreadAcrossScreens:
+    """Past four, a comparison's runner-ups go out four to a screen -- the sheet
+    first, then each extra window -- and what the screens cannot hold waits on
+    a later page. Laid out by one pure function, so the claim that matters is
+    checkable directly: no runner-up can fall between the screens."""
+
+    def spread(self, tmp_path, calls: str):
+        return run_page(tmp_path, [], [], calls)
+
+    @needs_node
+    def test_every_runner_up_is_on_exactly_one_screen_of_one_page(self, tmp_path):
+        placed = self.spread(tmp_path, """(() => {
+          const out = {};
+          for (let count = 0; count <= 17; count++) {
+            for (let across = 1; across <= 4; across++) {
+              const seen = [];
+              const pages = spreadAcross(count, across, 0).pages;
+              for (let page = 0; page < pages; page++) {
+                spreadAcross(count, across, page).slices.forEach(([a, b]) => {
+                  for (let i = a; i < b; i++) { seen.push(i); }
+                });
+              }
+              out[count + 'x' + across] = seen;
+            }
+          }
+          return out;
+        })()""")
+        for key, seen in placed.items():
+            count = int(key.split("x")[0])
+            assert seen == list(range(count)), key
+
+    @needs_node
+    def test_three_screens_hold_twelve_at_once(self, tmp_path):
+        assert self.spread(tmp_path, "spreadAcross(12, 3, 0)") == {
+            "pages": 1, "page": 0, "slices": [[0, 4], [4, 8], [8, 12]]}
+
+    @needs_node
+    def test_one_screen_pages_through_them_four_at_a_time(self, tmp_path):
+        assert self.spread(tmp_path, "spreadAcross(12, 1, 1)") == {
+            "pages": 3, "page": 1, "slices": [[4, 8]]}
+
+    @needs_node
+    def test_a_screen_with_nothing_left_is_empty_rather_than_repeating(self, tmp_path):
+        assert self.spread(tmp_path, "spreadAcross(5, 3, 0)")["slices"] == [
+            [0, 4], [4, 5], [5, 5]]
+
+    @needs_node
+    def test_paging_wraps_round_in_both_directions(self, tmp_path):
+        """As the full-size viewer does."""
+        assert self.spread(tmp_path, "[spreadAcross(12, 1, 3).page,"
+                                     " spreadAcross(12, 1, -1).page]") == [0, 2]
+
+    def test_the_page_and_python_agree_on_four_to_a_screen(self):
+        """The tray's cap and the screen buttons are worked out in Python, the
+        layout in the page; a different number in each would offer a screen
+        the layout leaves empty."""
+        assert f"const PER_SCREEN = {review.PER_SCREEN};" in review._JS
+
+
+class TestEveryScreenChoosesTheSameWay:
+    """Twelve runner-ups over three windows, driven under node through the
+    page's own paths: its keys, and the messages its extra windows send. The
+    choice must stay what it is on one screen -- everything ahead of it
+    rejected -- and a key must never reach a photo no screen is showing."""
+
+    CANDIDATES = [{"id": "pick", "date": "2026-01-01", "seq": 1, "src": "p.jpg"}] + [
+        {"id": f"s{n}", "date": f"2026-01-{n + 1:02d}", "seq": n + 1, "src": f"{n}.jpg"}
+        for n in range(1, 13)]
+
+    WINDOWS = """
+      function fakeWindow() {
+        return {closed: false, sent: [], postMessage(m) { this.sent.push(m); },
+                close() { this.closed = true; }};
+      }
+      const win2 = fakeWindow(), win3 = fakeWindow();
+      function from(win, screen, kind, extra) {
+        onScreenMessage({source: win, data: Object.assign(
+          {growUp: true, kind: kind, screen: screen}, extra || {})});
+      }
+      function shown(win) {
+        const last = win.sent[win.sent.length - 1];
+        return last.cells ? last.cells.map(c => c.id) : [];
+      }
+      function result() { return [...rejected].sort(); }
+    """
+
+    def drive(self, tmp_path, steps: str, screens: int = 3):
+        buckets = [{"bucket": "2026-01", "candidates": self.CANDIDATES, "more": 0}]
+        return run_page(tmp_path, buckets, [],
+                        "(() => {" + self.WINDOWS + steps + "})()",
+                        overlays=True, screens=screens)
+
+    def choosing(self, n: int) -> list[str]:
+        """What choosing runner-up n must reject: the pick and the n - 1 between."""
+        return sorted(c["id"] for c in self.CANDIDATES[:n])
+
+    @needs_node
+    def test_one_screen_keys_only_what_it_shows(self, tmp_path):
+        state = self.drive(tmp_path, """
+          openCompare('2026-01');
+          compareKey({key: '5'});
+          const before = result();
+          compareKey({key: '3'});
+          return {before: before, after: result()};""", screens=0)
+        assert state["before"] == [], "runner-up 5 is on page 2, out of sight"
+        assert state["after"] == self.choosing(3)
+
+    @needs_node
+    def test_turning_the_page_brings_its_keys_with_it(self, tmp_path):
+        state = self.drive(tmp_path, """
+          openCompare('2026-01');
+          compareKey({key: 'ArrowRight'});
+          compareKey({key: '5'});
+          return result();""", screens=0)
+        assert state == self.choosing(5)
+
+    @needs_node
+    def test_each_window_is_sent_its_own_four(self, tmp_path):
+        state = self.drive(tmp_path, """
+          from(win2, 2, 'ready'); from(win3, 3, 'ready');
+          openCompare('2026-01');
+          return {two: shown(win2), three: shown(win3), screens: screens};""")
+        assert state["two"] == ["s5", "s6", "s7", "s8"]
+        assert state["three"] == ["s9", "s10", "s11", "s12"]
+        assert state["screens"] == 3
+
+    @needs_node
+    def test_a_key_reaches_a_photo_on_another_monitor(self, tmp_path):
+        state = self.drive(tmp_path, """
+          from(win2, 2, 'ready'); from(win3, 3, 'ready');
+          openCompare('2026-01');
+          from(win3, 3, 'key', {key: '9'});
+          return result();""")
+        assert state == self.choosing(9)
+
+    @needs_node
+    def test_a_click_in_another_window_chooses_as_a_click_here_does(self, tmp_path):
+        state = self.drive(tmp_path, """
+          from(win2, 2, 'ready'); from(win3, 3, 'ready');
+          openCompare('2026-01');
+          from(win2, 2, 'choose', {id: 's7'});
+          return {rejected: result(), open: comparing !== null,
+                  idle: win2.sent[win2.sent.length - 1].cells};""")
+        assert state["rejected"] == self.choosing(7)
+        assert state["open"] is False, "a choice ends the comparison on every screen"
+        assert state["idle"] is None
+
+    @needs_node
+    def test_a_closed_window_hands_its_photos_to_a_later_page(self, tmp_path):
+        """Closed by hand mid-comparison. Its four must not go with it."""
+        state = self.drive(tmp_path, """
+          from(win2, 2, 'ready'); from(win3, 3, 'ready');
+          openCompare('2026-01');
+          from(win3, 3, 'gone');
+          compareKey({key: '9'});
+          const before = result();
+          compareKey({key: 'ArrowRight'});
+          compareKey({key: '9'});
+          return {before: before, after: result()};""")
+        assert state["before"] == [], "runner-up 9 is on no screen until the page turns"
+        assert state["after"] == self.choosing(9)
+
+    @needs_node
+    def test_a_message_from_a_window_it_did_not_take_on_does_nothing(self, tmp_path):
+        state = self.drive(tmp_path, """
+          from(win2, 2, 'ready');
+          openCompare('2026-01');
+          from(fakeWindow(), 2, 'choose', {id: 's5'});
+          return result();""")
+        assert state == []
+
+    @needs_node
+    def test_a_reloaded_sheet_counts_the_windows_that_announce_themselves(self, tmp_path):
+        """After `select && align` the windows are still on their monitors. The
+        page has stored nothing, so their announcing is what sets the count."""
+        state = self.drive(tmp_path, """
+          from(win3, 3, 'ready');
+          return {screens: screens, closed: win3.closed,
+                  pressed: SCREEN_BUTTONS.map(b => b.pressed)};""")
+        assert state == {"screens": 3, "closed": False,
+                         "pressed": ["false", "false", "true"]}
+
+    @needs_node
+    def test_once_a_count_is_chosen_a_window_beyond_it_is_closed(self, tmp_path):
+        state = self.drive(tmp_path, """
+          from(win3, 3, 'ready');
+          setScreens(1);
+          const after = win3.closed;
+          const late = fakeWindow();
+          from(late, 2, 'ready');
+          return {closedByChoice: after, lateClosed: late.closed, screens: screens};""")
+        assert state == {"closedByChoice": True, "lateClosed": True, "screens": 1}
+
+    @needs_node
+    def test_a_window_from_a_sheet_that_offered_more_screens_is_closed(self, tmp_path):
+        state = self.drive(tmp_path, """
+          const four = fakeWindow();
+          from(four, 4, 'ready');
+          return {closed: four.closed, screens: screens};""", screens=3)
+        assert state == {"closed": True, "screens": 1}
 
 
 class TestTheViewerExplainsARejection:

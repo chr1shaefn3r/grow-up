@@ -157,7 +157,9 @@ per_bucket = 1
 # they let out/contact-sheet.html show what would take over if you reject the
 # pick, so a rejection is decided in the page instead of costing a re-run to see
 # the replacement. Costs align time and frames-directory space roughly in
-# proportion -- 4 means five warps per bucket. Set 0 to turn it off.
+# proportion -- 4 means five warps per bucket. Set 0 to turn it off. Above 4,
+# compare shows them four to a screen: paged on one monitor, or spread over
+# several with the sheet's screens buttons -- 12 fills three.
 alternates = 4
 
 [output]
