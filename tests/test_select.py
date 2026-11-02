@@ -316,6 +316,56 @@ class TestAlternatesAreKeptButNotEncoded:
             ("second", 0), ("third", 1), ("fourth", 1)]
 
 
+class TestEveryRowKnowsHowBigItsBucketIs:
+    """The contact sheet is given the pick and its runner-ups, not the bucket.
+
+    Without the size it called a bucket empty once every candidate it held was
+    rejected -- while `select` went on to hand that bucket to the next photo
+    down, and the next encode put a photo in the video that nobody had seen.
+    """
+
+    def week(self, conn, n: int) -> None:
+        for i in range(n):
+            add(conn, f"w{i}", f"2026-03-0{2 + i % 5}T1{i}:00:00", sharpness=400.0 - i)
+
+    def sizes(self, conn) -> dict[str, int]:
+        return {r["asset_id"]: r["bucket_size"] for r in conn.execute(
+            "SELECT asset_id, bucket_size FROM selection")}
+
+    def test_photos_past_the_runner_ups_are_counted(self, conn):
+        self.week(conn, 7)
+        select.apply_filters(conn, LIMITS, WEIGHTS)
+        select.select_frames(conn, "week", 1, alternates=4)
+
+        assert self.sizes(conn) == {f"w{i}": 7 for i in range(5)}
+
+    def test_a_bucket_with_nothing_held_back_counts_what_it_has(self, conn):
+        self.week(conn, 3)
+        select.apply_filters(conn, LIMITS, WEIGHTS)
+        select.select_frames(conn, "week", 1, alternates=4)
+
+        assert set(self.sizes(conn).values()) == {3}
+
+    def test_a_photo_rejected_by_hand_or_by_the_filters_is_not_counted(self, conn):
+        """Those cannot take the bucket, so counting them would promise a
+        photo that select will never pick."""
+        self.week(conn, 7)
+        add(conn, "soft", "2026-03-04T08:00:00", sharpness=1.0)
+        select.apply_filters(conn, LIMITS, WEIGHTS, {"w0", "w1"})
+        select.select_frames(conn, "week", 1, alternates=4)
+
+        assert set(self.sizes(conn).values()) == {5}
+
+    def test_each_bucket_is_counted_on_its_own(self, conn):
+        self.week(conn, 7)
+        add(conn, "later", "2026-04-07T10:00:00")
+        select.apply_filters(conn, LIMITS, WEIGHTS)
+        select.select_frames(conn, "week", 1, alternates=4)
+
+        assert self.sizes(conn)["later"] == 1
+        assert self.sizes(conn)["w0"] == 7
+
+
 class TestADatabaseFromTheLastReleaseUpgrades:
     """1.2.0 wrote a selection table with no `alternate` column.
 
@@ -356,6 +406,15 @@ class TestADatabaseFromTheLastReleaseUpgrades:
         self.released_database(path)
         rows = db.connect(path).execute("SELECT asset_id, alternate FROM selection").fetchall()
         assert [(r["asset_id"], r["alternate"]) for r in rows] == [("a", 0)]
+
+    def test_an_existing_selection_has_no_bucket_size_rather_than_zero(self, tmp_path):
+        """Nothing counted the bucket when that row was written. Zero would
+        tell the contact sheet the bucket has nothing left -- the very claim
+        the count exists to stop it making."""
+        path = tmp_path / "released.sqlite"
+        self.released_database(path)
+        row = db.connect(path).execute("SELECT bucket_size FROM selection").fetchone()
+        assert row["bucket_size"] is None
 
     def test_such_a_row_still_reaches_the_video(self, tmp_path):
         """The join stage_encode uses, run against the upgraded database."""

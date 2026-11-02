@@ -426,6 +426,36 @@ class TestTheSheetCarriesTheRunnerUps:
         assert review.write_contact_sheet(conn, out) == 3
 
 
+class TestTheSheetKnowsWhatItIsNotShowing:
+    """Each bucket on the page carries how many of its photos passed the
+    filters beyond the candidates it holds. Reject them all and `select` still
+    has those to promote, so the page cannot call the bucket empty."""
+
+    def listing(self, conn, tmp_path) -> dict[str, int | None]:
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        data = json.loads(out.read_text().split('id="buckets">')[1].split("</script>")[0])
+        return {b["bucket"]: b["more"] for b in data}
+
+    def test_more_is_what_passed_beyond_the_candidates_on_the_page(self, conn, tmp_path):
+        add_alternate(conn, "2026-01", "spare-a", 1, tmp_path)
+        conn.execute("UPDATE selection SET bucket_size = 7 WHERE bucket = '2026-01'")
+        conn.execute("UPDATE selection SET bucket_size = 1 WHERE bucket != '2026-01'")
+
+        listing = self.listing(conn, tmp_path)
+        assert listing["2026-01"] == 5        # seven passed, two are on the page
+        assert listing["2026-02"] == 0
+
+    def test_a_selection_from_before_the_count_is_unknown_not_empty(self, conn, tmp_path):
+        """No count means nobody looked, not that nothing is left."""
+        assert set(self.listing(conn, tmp_path).values()) == {None}
+
+    def test_the_page_has_somewhere_to_say_so(self, conn, tmp_path):
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out)
+        assert '<p class="notice" id="more-note" hidden></p>' in out.read_text()
+
+
 class TestRelabellingTouchesOnlyTheRejectButton:
     """After every change the page relabels each card's reject/keep button. It
     used to take the first button in the caption -- which on a card with

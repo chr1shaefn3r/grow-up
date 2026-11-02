@@ -31,10 +31,11 @@ _METRIC_FIELDS = sorted({field for rule in RULES for field in rule.fields} | {"d
 
 _CSS = """
 :root { color-scheme: light dark; --bg:#faf9f7; --fg:#1a1a1a; --muted:#6b6b6b;
-        --card:#fff; --line:#e2e0dc; --bad:#c0392b; --good:#1e8449; --tile:340px; }
+        --card:#fff; --line:#e2e0dc; --bad:#c0392b; --good:#1e8449; --wait:#b7791f;
+        --tile:340px; }
 @media (prefers-color-scheme: dark) {
   :root { --bg:#16161a; --fg:#ececec; --muted:#9a9a9a; --card:#212127;
-          --line:#33333b; --bad:#ff7a6b; --good:#5fd08a; }
+          --line:#33333b; --bad:#ff7a6b; --good:#5fd08a; --wait:#f0b429; }
 }
 * { box-sizing: border-box; }
 body { margin:0; padding:24px; background:var(--bg); color:var(--fg);
@@ -117,6 +118,17 @@ figure.removed::after { content:"would be dropped"; position:absolute; top:8px; 
 figure .rank { font-variant-numeric:tabular-nums; }
 figure.exhausted { outline:2px solid var(--bad); }
 figure.exhausted img { opacity:.35; }
+/* Every candidate on the card is rejected, but more photos in its bucket passed
+   the filters than the page was given, and the next select promotes the best
+   of them. Amber rather than red: the bucket is not lost, it has photos nobody
+   has looked at yet. After .rejected, so it wins over it. */
+figure.waiting { outline:2px solid var(--wait); }
+figure.waiting img { opacity:.35; }
+figure.waiting::after { content:"more to see"; position:absolute; top:8px; left:8px;
+  background:var(--wait); color:#1a1a1a; font-size:10px; padding:2px 6px;
+  border-radius:4px; }
+.notice { border:1px solid var(--wait); border-left-width:4px; border-radius:8px;
+          padding:10px 12px; margin:0 0 16px; max-width:80ch; }
 
 /* Full-size viewer. Every frame is the same size, so stepping through with the
    arrow keys holds the image still and turns the sequence into a flipbook --
@@ -227,13 +239,68 @@ function toggle(fig) { toggleId(fig.dataset.id); }
 const bucketsEl = document.getElementById('buckets');
 const BUCKETS = bucketsEl ? JSON.parse(bucketsEl.textContent) : [];
 const byBucket = new Map(BUCKETS.map(b => [b.bucket, b.candidates]));
+// Photos in each bucket that passed the filters but are not on this page; null
+// when the selection predates `select` counting them.
+const unseen = new Map(BUCKETS.map(b => [b.bucket, b.more]));
+
+// What a bucket's card shows. The page holds the pick and its runner-ups;
+// `select` holds the whole bucket and gives it to the best photo with no
+// reject reason. So rejecting every candidate here empties the bucket only
+// when nothing else passed the filters -- otherwise the next encode puts in a
+// photo this page never showed, and calling the bucket empty hid exactly that.
+// Pure, so the test suite can run it under node.
+function bucketState(bucket) {
+  const candidates = candidatesFor(bucket);
+  const more = unseen.get(bucket);
+  // Not `more >= 0`: null passes that in JavaScript.
+  const known = typeof more === 'number';
+  const index = candidates.findIndex(c => !rejected.has(c.id));
+  const pick = index < 0 ? candidates[0] : candidates[index];
+  const out = index < 0;
+  return {
+    bucket: bucket, pick: pick, index: index, more: more,
+    empty: out && known && more === 0,
+    waiting: out && known && more > 0,
+    unknown: out && !known,
+    label: index > 0 ? 'promoted #' + (index + 1)
+      : !out ? '#' + pick.seq
+      : !known ? 'all rejected'
+      : more === 0 ? 'bucket empty'
+      : more + ' more after re-run',
+  };
+}
+
+// The advice for those buckets, said once at the top and naming them: whether
+// to look before encoding is a decision about the run, and the cards it is
+// about may be a long scroll away.
+function moreNotice(states) {
+  const flagged = states.filter(s => s.waiting || s.unknown);
+  if (!flagged.length) { return ''; }
+  const one = flagged.length === 1;
+  const names = flagged.map(s => s.bucket).join(', ');
+  const subject = (one ? names + ' has' : flagged.length + ' buckets (' + names + ') have') +
+    ' every photo on this page rejected';
+  const advice = ' download rejects.json into this directory, run ' +
+    '`grow-up select && grow-up align`, and reload this page.';
+  if (flagged.every(s => s.waiting)) {
+    return subject + ', but more passed the filters. The next `grow-up select` hands ' +
+      (one ? 'it' : 'each') + ' to the best of those, and `grow-up encode` would put ' +
+      'that photo in the video without your having seen it. To see them here first,' +
+      advice;
+  }
+  return subject + '. This page was written before select counted what else passed ' +
+    'the filters, so the next `grow-up select` may hand ' + (one ? 'it' : 'them') +
+    ' to a photo you have not seen, and `grow-up encode` would put that in the video. ' +
+    'To see what is left first,' + advice;
+}
 
 function promoteBuckets() {
+  const states = [];
   document.querySelectorAll('figure[data-bucket]').forEach(fig => {
-    const candidates = byBucket.get(fig.dataset.bucket) || [];
-    const index = candidates.findIndex(c => !rejected.has(c.id));
-    const pick = index < 0 ? candidates[0] : candidates[index];
+    const state = bucketState(fig.dataset.bucket);
+    const pick = state.pick;
     if (!pick) { return; }
+    states.push(state);
 
     fig.dataset.id = pick.id;
     fig.dataset.label = pick.date + '  #' + pick.seq;
@@ -243,11 +310,9 @@ function promoteBuckets() {
     if (when) { when.textContent = pick.date; }
 
     const rank = fig.querySelector('.rank');
-    if (rank) {
-      rank.textContent = index < 0 ? 'bucket empty'
-        : index > 0 ? 'promoted #' + (index + 1) : '#' + pick.seq;
-    }
-    fig.classList.toggle('exhausted', index < 0);
+    if (rank) { rank.textContent = state.label; }
+    fig.classList.toggle('exhausted', state.empty);
+    fig.classList.toggle('waiting', state.waiting);
 
     // Dim an alternate that is itself rejected, so the tray shows what is left.
     fig.querySelectorAll('.alt').forEach(alt => {
@@ -255,6 +320,12 @@ function promoteBuckets() {
       alt.classList.toggle('now', alt.dataset.alt === pick.id);
     });
   });
+
+  const note = document.getElementById('more-note');
+  if (note) {
+    note.textContent = moreNotice(states);
+    note.hidden = !note.textContent;
+  }
 }
 
 function syncRejected() {
@@ -339,13 +410,14 @@ function paintCompare() {
   if (!compare || comparing === null) { return; }
   const candidates = candidatesFor(comparing);
   const spares = candidates.slice(1);
-  const pick = candidates.find(c => !rejected.has(c.id));
+  const state = bucketState(comparing);
+  const pick = state.index < 0 ? null : state.pick;
 
   const head = document.createElement('div');
   head.className = 'head';
   const label = document.createElement('span');
   label.textContent = spares.length + ' runner-up' + (spares.length === 1 ? '' : 's')
-    + ' for ' + comparing + (pick ? '  —  showing ' + pick.date : '  —  bucket empty');
+    + ' for ' + comparing + (pick ? '  —  showing ' + pick.date : '  —  ' + state.label);
   const hint = document.createElement('span');
   hint.innerHTML = '<kbd>1</kbd>…<kbd>' + Math.min(spares.length, 9) + '</kbd> choose'
     + ' &nbsp; <kbd>esc</kbd> close';
@@ -483,6 +555,11 @@ const clear = document.getElementById('clear');
 if (clear) {
   clear.addEventListener('click', () => { rejected.clear(); syncRejected(); render(); });
 }
+// Painted once on load, not only on the first click. The server draws every
+// card at its top candidate, which is wrong as soon as rejects.json names one
+// that `select` has not yet seen -- and then neither the promotion nor the
+// warning about a bucket's unseen photos appeared until something was clicked.
+syncRejected();
 render();
 """
 
@@ -842,7 +919,7 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
     base = out_path.parent
     rows = conn.execute(
         "SELECT f.asset_id, f.path, f.seq, a.local_datetime, s.bucket, s.rank,"
-        "       s.alternate"
+        "       s.alternate, s.bucket_size"
         "  FROM frames f"
         "  JOIN assets a ON a.id = f.asset_id"
         "  JOIN selection s ON s.asset_id = f.asset_id"
@@ -854,10 +931,12 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
     # is the whole point: judging a replacement used to cost a full re-run.
     order: list[str] = []
     buckets: dict[str, list[dict]] = {}
+    sizes: dict[str, int | None] = {}
     for row in sorted(rows, key=lambda r: (r["bucket"], r["rank"])):
         if row["bucket"] not in buckets:
             buckets[row["bucket"]] = []
             order.append(row["bucket"])
+            sizes[row["bucket"]] = row["bucket_size"]
         buckets[row["bucket"]].append({
             "id": row["asset_id"],
             "src": _rel(row["path"], base),
@@ -884,11 +963,21 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
         for row in dropped
     ]
 
+    # `more` is how many photos in the bucket passed the filters and are not
+    # on this page. Reject every candidate here and `select` still has those to
+    # promote, so the card must not call the bucket empty -- that is exactly
+    # when the next encode puts in a photo nobody has looked at. None when the
+    # selection predates the count: unknown, which the page says rather than
+    # guessing either way.
+    def more(bucket: str) -> int | None:
+        size = sizes[bucket]
+        return None if size is None else max(0, size - len(buckets[bucket]))
+
+    listing = [{"bucket": b, "candidates": buckets[b], "more": more(b)} for b in order]
     seed = (f'<script type="application/json" id="rejected-seed">'
             f'{json.dumps(sorted(manual))}</script>\n'
             f'<script type="application/json" id="buckets">'
-            f'{json.dumps([{"bucket": b, "candidates": buckets[b]} for b in order])}'
-            f'</script>\n')
+            f'{json.dumps(listing)}</script>\n')
     aside = ""
     if rejected_cards:
         aside = (
@@ -909,6 +998,7 @@ def write_contact_sheet(conn: sqlite3.Connection, out_path: Path,
         '<span class="spacer"></span>'
         f'{_size_controls("S")}'
         "</div>\n"
+        '<p class="notice" id="more-note" hidden></p>\n'
         f'<div class="grid">{"".join(cards)}</div>\n'
         f"{aside}"
         '<textarea id="out" readonly></textarea>\n'

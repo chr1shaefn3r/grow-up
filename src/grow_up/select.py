@@ -178,6 +178,13 @@ def select_frames(conn: sqlite3.Connection, cadence: str, per_bucket: int,
     sheet can show what would take over if you reject the pick, and they are
     excluded from the video. Judging a replacement means seeing it aligned, and
     the alternative is a re-run per rejection.
+
+    Every row also carries `bucket_size`, how many photos in its bucket passed
+    the filters -- prepared or not. The contact sheet holds only what was
+    prepared, so without it a card whose candidates are all rejected cannot
+    tell an empty bucket from one whose next photo it has never shown. It
+    called them all empty, while the next run put that unseen photo in the
+    video.
     """
     if cadence not in CADENCES:
         raise ValueError(f"unknown cadence {cadence!r}; expected one of {CADENCES}")
@@ -194,27 +201,29 @@ def select_frames(conn: sqlite3.Connection, cadence: str, per_bucket: int,
     ).fetchall()
 
     depth = per_bucket + max(0, alternates)
-    buckets: dict[str, int] = {}
-    chosen: list[tuple[str, str, int, int, str]] = []
+    sizes: dict[str, int] = {}
+    chosen: list[tuple[str, str, int, int]] = []
     stamp = iso_z(now_utc())
     for row in rows:
         when = parse_when(row["local_datetime"])
         if when is None:
             continue
         key = bucket_key(when, cadence, born)
-        rank = buckets.get(key, 0)
-        if rank >= depth:
-            continue
-        buckets[key] = rank + 1
-        chosen.append((row["asset_id"], key, rank, int(rank >= per_bucket), stamp))
+        rank = sizes.get(key, 0)
+        # Counted past `depth` too: those are the photos the contact sheet
+        # cannot show, and the reason a bucket it calls exhausted may not be.
+        sizes[key] = rank + 1
+        if rank < depth:
+            chosen.append((row["asset_id"], key, rank, int(rank >= per_bucket)))
 
     with conn:
         conn.execute("BEGIN")
         conn.execute("DELETE FROM selection")
         conn.executemany(
-            "INSERT INTO selection (asset_id, bucket, rank, alternate, selected_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            chosen,
+            "INSERT INTO selection (asset_id, bucket, rank, alternate, bucket_size,"
+            " selected_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [(asset_id, key, rank, alternate, sizes[key], stamp)
+             for asset_id, key, rank, alternate in chosen],
         )
     return sum(1 for row in chosen if not row[3])
 

@@ -333,6 +333,53 @@ class TestTheSeedSurvivesIntoTheDownload:
         assert "new Set(seed ? JSON.parse(seed.textContent) : [])" in review._JS
 
 
+needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+
+
+def run_page(tmp_path, buckets: list[dict], rejected: list[str], epilogue: str,
+             figures: list[str] = ()):
+    """The shipped contact-sheet JS under node, and the value of `epilogue` after it.
+
+    The document is just big enough to load it: the seed, the bucket listing,
+    the notice, and a stand-in card per name in `figures` -- enough for the
+    page's own load-time paint to run, with no browser.
+    """
+    script = tmp_path / f"page-{len(list(tmp_path.glob('page-*.mjs')))}.mjs"
+    script.write_text(
+        "const ELEMENTS = {\n"
+        f"  'rejected-seed': {{textContent: {json.dumps(json.dumps(rejected))}}},\n"
+        f"  'buckets': {{textContent: {json.dumps(json.dumps(buckets))}}},\n"
+        "  'more-note': {textContent: '', hidden: true},\n"
+        "};\n"
+        "function card(bucket) {\n"
+        "  const parts = {img: {src: '', getAttribute() { return this.src; },\n"
+        "                       setAttribute(_, value) { this.src = value; }},\n"
+        "                 '.rank': {textContent: ''}};\n"
+        "  return {dataset: {bucket: bucket}, classes: new Set(),\n"
+        "          classList: {toggle(name, on) {\n"
+        "            if (on) { this.owner.classes.add(name); }\n"
+        "            else { this.owner.classes.delete(name); } }},\n"
+        "          querySelector: (sel) => parts[sel] || null,\n"
+        "          querySelectorAll: () => []};\n"
+        "}\n"
+        f"const CARDS = {json.dumps(list(figures))}.map(card);\n"
+        "CARDS.forEach(c => { c.classList.owner = c; });\n"
+        "globalThis.document = {\n"
+        "  getElementById: (id) => ELEMENTS[id] || null,\n"
+        "  querySelectorAll: (sel) => sel.startsWith('figure') ? CARDS : [],\n"
+        "  addEventListener: () => {},\n"
+        "  createElement: () => ({classList: {add(){}, toggle(){}}, dataset: {},\n"
+        "                        appendChild(){}, setAttribute(){}}),\n"
+        "};\n"
+        f"{review._JS}\n"
+        f"console.log(JSON.stringify({epilogue}));\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
 class TestThePagePromotesTheRunnerUp:
     """The whole point: reject a pick and see its replacement without a re-run.
 
@@ -346,55 +393,198 @@ class TestThePagePromotesTheRunnerUp:
         {"id": "second", "src": "b.jpg", "date": "2026-03-03", "seq": 2, "rank": 1},
         {"id": "third", "src": "c.jpg", "date": "2026-03-04", "seq": 3, "rank": 2},
     ]
+    ALL = ["best", "second", "third"]
 
-    def promote_under_node(self, tmp_path, rejected: list[str]) -> dict:
-        """Runs the page's own promotion rule and reports what the card shows."""
-        script = tmp_path / "promote.mjs"
-        script.write_text(
-            f"const candidates = {json.dumps(self.CANDIDATES)};\n"
-            f"const rejected = new Set({json.dumps(rejected)});\n"
-            # The rule as written in review._JS.
-            "const index = candidates.findIndex(c => !rejected.has(c.id));\n"
-            "const pick = index < 0 ? candidates[0] : candidates[index];\n"
-            "const rank = index < 0 ? 'bucket empty'\n"
-            "  : index > 0 ? 'promoted #' + (index + 1) : '#' + pick.seq;\n"
-            "console.log(JSON.stringify({shown: pick.id, label: rank,"
-            " exhausted: index < 0}));\n",
-            encoding="utf-8",
-        )
-        result = subprocess.run(["node", str(script)], capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-        return json.loads(result.stdout)
+    def card(self, tmp_path, rejected: list[str], more: int | None = 0) -> dict:
+        """What the shipped page shows for this bucket, given those rejections.
 
-    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+        `more` is how many photos in the bucket passed the filters beyond the
+        three on the page, as `write_contact_sheet` embeds it.
+        """
+        buckets = [{"bucket": "2026-03", "candidates": self.CANDIDATES, "more": more}]
+        return run_page(tmp_path, buckets, rejected, "bucketState('2026-03')")
+
+    @needs_node
     def test_nothing_rejected_shows_the_best(self, tmp_path):
-        assert self.promote_under_node(tmp_path, [])["shown"] == "best"
+        result = self.card(tmp_path, [])
+        assert result["pick"]["id"] == "best"
+        assert result["label"] == "#1"
 
-    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    @needs_node
     def test_rejecting_the_pick_shows_the_second(self, tmp_path):
-        result = self.promote_under_node(tmp_path, ["best"])
-        assert result["shown"] == "second"
+        result = self.card(tmp_path, ["best"])
+        assert result["pick"]["id"] == "second"
         assert result["label"] == "promoted #2"
 
-    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    @needs_node
     def test_rejecting_two_shows_the_third(self, tmp_path):
-        assert self.promote_under_node(tmp_path, ["best", "second"])["shown"] == "third"
+        assert self.card(tmp_path, ["best", "second"])["pick"]["id"] == "third"
 
-    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-    def test_rejecting_all_of_them_says_the_bucket_is_empty(self, tmp_path):
-        result = self.promote_under_node(tmp_path, ["best", "second", "third"])
-        assert result["exhausted"] is True
-        assert result["label"] == "bucket empty"
-
-    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    @needs_node
     def test_rejecting_out_of_order_still_picks_the_best_survivor(self, tmp_path):
         """Dropping a runner-up you can see is bad must not disturb the pick."""
-        assert self.promote_under_node(tmp_path, ["second"])["shown"] == "best"
+        assert self.card(tmp_path, ["second"])["pick"]["id"] == "best"
 
-    def test_the_shipped_page_uses_this_rule(self):
-        """Ties the script above to review._JS, so the two cannot drift apart."""
-        assert "candidates.findIndex(c => !rejected.has(c.id))" in review._JS
-        assert "'promoted #' + (index + 1)" in review._JS
+    @needs_node
+    def test_rejecting_all_of_them_empties_a_bucket_with_nothing_else(self, tmp_path):
+        result = self.card(tmp_path, self.ALL, more=0)
+        assert result["empty"] is True and result["waiting"] is False
+        assert result["label"] == "bucket empty"
+
+    @needs_node
+    def test_rejecting_all_of_them_is_not_empty_while_more_passed(self, tmp_path):
+        """What shipped: `bucket empty` on the card, and then a photo nobody had
+        seen in the video, because select promoted the next one down."""
+        result = self.card(tmp_path, self.ALL, more=2)
+        assert result["empty"] is False and result["waiting"] is True
+        assert result["label"] == "2 more after re-run"
+
+    @needs_node
+    def test_without_a_count_it_claims_neither(self, tmp_path):
+        """A selection written before select counted its buckets: the page
+        does not know, and must not guess "empty"."""
+        result = self.card(tmp_path, self.ALL, more=None)
+        assert result["empty"] is False and result["waiting"] is False
+        assert result["unknown"] is True
+        assert result["label"] == "all rejected"
+
+    @needs_node
+    def test_more_photos_change_nothing_while_a_candidate_survives(self, tmp_path):
+        assert self.card(tmp_path, ["best"], more=2)["label"] == "promoted #2"
+
+    def test_the_cards_and_the_comparison_are_painted_from_it(self):
+        """Ties the tests above to what reaches the screen."""
+        assert "const state = bucketState(fig.dataset.bucket);" in review._JS
+        assert "rank.textContent = state.label;" in review._JS
+        assert "const state = bucketState(comparing);" in review._JS
+
+
+class TestThePageSaysWhatToRunToSeeTheRest:
+    """A fully rejected bucket with photos left is a decision to make before
+    encoding: select will use the next one, seen or not. The page names those
+    buckets and the commands that bring the next photos onto it."""
+
+    CANDIDATES = TestThePagePromotesTheRunnerUp.CANDIDATES
+
+    def listing(self, *buckets: tuple[str, int | None]) -> list[dict]:
+        return [{"bucket": name, "more": more,
+                 "candidates": [{**c, "id": f"{name}/{c['id']}"} for c in self.CANDIDATES]}
+                for name, more in buckets]
+
+    def notice(self, tmp_path, *buckets: tuple[str, int | None],
+               rejected: list[str] | None = None) -> str:
+        listing = self.listing(*buckets)
+        if rejected is None:
+            rejected = [c["id"] for b in listing for c in b["candidates"]]
+        return run_page(tmp_path, listing, rejected,
+                        "moreNotice([...byBucket.keys()].map(bucketState))")
+
+    @needs_node
+    def test_it_names_the_bucket_and_what_to_run(self, tmp_path):
+        text = self.notice(tmp_path, ("2026-03", 2))
+        assert text.startswith("2026-03 has every photo on this page rejected")
+        assert "download rejects.json into this directory" in text
+        assert "`grow-up select && grow-up align`" in text
+        assert "reload this page" in text
+
+    @needs_node
+    def test_it_says_encode_would_use_a_photo_nobody_saw(self, tmp_path):
+        text = self.notice(tmp_path, ("2026-03", 2))
+        assert "`grow-up encode` would put that photo in the video without your having" in text
+
+    @needs_node
+    def test_several_buckets_are_all_named(self, tmp_path):
+        text = self.notice(tmp_path, ("2026-03", 2), ("2026-04", 1))
+        assert text.startswith("2 buckets (2026-03, 2026-04) have")
+
+    @needs_node
+    def test_a_bucket_that_really_is_empty_needs_no_advice(self, tmp_path):
+        assert self.notice(tmp_path, ("2026-03", 0)) == ""
+
+    @needs_node
+    def test_nothing_fully_rejected_needs_no_advice(self, tmp_path):
+        assert self.notice(tmp_path, ("2026-03", 2), rejected=["2026-03/best"]) == ""
+
+    @needs_node
+    def test_without_a_count_it_says_may_rather_than_will(self, tmp_path):
+        text = self.notice(tmp_path, ("2026-03", None))
+        assert "may hand it to a photo you have not seen" in text
+        assert "`grow-up select && grow-up align`" in text
+
+    @needs_node
+    def test_a_page_opened_with_every_candidate_rejected_warns_before_any_click(
+            self, tmp_path):
+        """rejects.json can name every candidate of a bucket before select has
+        seen it -- `grow-up review` straight after saving it. The page used to
+        paint only on a click, so it opened looking as if nothing were wrong."""
+        listing = self.listing(("2026-03", 2), ("2026-04", 0))
+        rejected = [c["id"] for c in listing[0]["candidates"]]
+        result = run_page(
+            tmp_path, listing, rejected,
+            "{note: ELEMENTS['more-note'], label: CARDS[0].querySelector('.rank').textContent,"
+            " classes: [...CARDS[0].classes], other: CARDS[1].querySelector('.rank').textContent}",
+            figures=["2026-03", "2026-04"])
+
+        assert result["note"]["hidden"] is False
+        assert result["note"]["textContent"].startswith("2026-03 has every photo")
+        assert result["label"] == "2 more after re-run"
+        assert "waiting" in result["classes"]
+        assert result["other"] == "#1"
+
+
+class TestAFullyRejectedBucketMeansWhatSelectDoes:
+    """End to end: the count select stores, what the page makes of it, and what
+    select then does with exactly those rejections."""
+
+    def outcome(self, tmp_path, photos: int) -> tuple[dict, list[str]]:
+        from grow_up import select
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        for i in range(photos):
+            # Yaw rising with i, so p0 is the best and p5 the sixth best.
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (f"p{i}", f"2026-01-{10 + i:02d}T10:00:00", stamp))
+            conn.execute(
+                "INSERT INTO metrics (asset_id, detected, yaw, pitch, roll, gaze_x,"
+                " gaze_y, blink_l, blink_r, oob_frac, bbox_clipped, interocular_px,"
+                " sharpness, exposure_lo, exposure_hi, analyzed_at)"
+                " VALUES (?, 1, ?, 1, 1, 0.02, 0, 0.05, 0.05, 0, 0, 150, 100, 40, 200, ?)",
+                (f"p{i}", float(i), stamp))
+
+        def reselect(manual: set[str]) -> None:
+            select.apply_filters(conn, LIMITS, {"w_pose": 1.0}, manual)
+            select.select_frames(conn, "month", 1, alternates=4)
+
+        reselect(set())
+        # Frames for what was selected, as `align` would leave them.
+        for seq, row in enumerate(conn.execute(
+                "SELECT asset_id FROM selection ORDER BY rank").fetchall(), 1):
+            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                         " VALUES (?, ?, ?, ?)",
+                         (row["asset_id"], str(tmp_path / f"{row['asset_id']}.jpg"), seq, stamp))
+        page = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, page)
+        listing = json.loads(page.read_text().split('id="buckets">')[1].split("</script>")[0])
+
+        shown = [c["id"] for c in listing[0]["candidates"]]
+        state = run_page(tmp_path, listing, shown, "bucketState('2026-01')")
+        reselect(set(shown))
+        picked = [r["asset_id"] for r in conn.execute(
+            "SELECT asset_id FROM selection WHERE alternate = 0")]
+        return state, picked
+
+    @needs_node
+    def test_a_bucket_the_page_calls_empty_is_left_empty(self, tmp_path):
+        state, picked = self.outcome(tmp_path, 5)
+        assert state["label"] == "bucket empty"
+        assert picked == []
+
+    @needs_node
+    def test_a_bucket_the_page_says_has_more_goes_to_the_sixth_best(self, tmp_path):
+        state, picked = self.outcome(tmp_path, 7)
+        assert state["label"] == "2 more after re-run"
+        assert picked == ["p5"]
 
 
 class TestChoosingARunnerUpMeansWhatSelectMeans:

@@ -439,12 +439,26 @@ grow-up select && grow-up align && grow-up encode
 ```
 
 **A rejection hands the bucket to its runner-up rather than deleting it, and the page
-shows you that happening.** Each card carries its bucket's next two candidates as
+shows you that happening.** Each card carries its bucket's runner-ups as
 thumbnails; reject the pick and the card immediately promotes the next one, labelled
 `promoted #2`. So the grid always shows the video as it would be, and you can settle a
 whole pass of rejections before downloading anything — rather than re-running to find out
-the replacement was no good either. Reject *every* candidate and the card says
-`bucket empty`, which is presumably what you meant.
+the replacement was no good either.
+
+Reject *every* candidate on a card and what it says depends on the rest of the bucket.
+If nothing else in it passed the filters, the card says `bucket empty`, and the bucket
+drops out of the video. If more did, the page only ever held the best few, and the next
+`grow-up select` hands the bucket to the best of the others — a photo you have not
+seen, which `grow-up encode` would put straight into the video. So the card turns amber
+and says how many are left (`2 more after re-run`), and the top of the page names those
+buckets and what to run to see them first:
+
+```bash
+grow-up select && grow-up align     # then reload the contact sheet
+```
+
+`align` rewrites the page, so the reload shows the next photos as each bucket's pick and
+runner-ups. Judge them like any other, then `grow-up encode`.
 
 Clicking a thumbnail rejects that runner-up directly, so a bad alternate you can already
 see goes in the same pass.
