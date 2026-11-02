@@ -41,6 +41,25 @@ export IMMICH_URL=https://immich.example.com
 export IMMICH_API_KEY=…            # Account Settings → API Keys
 ```
 
+`IMMICH_URL` is the address your browser shows with Immich open, `http://` or
+`https://` included. For Immich on the same machine that is usually
+`http://localhost:2283`. On Windows, in PowerShell:
+
+```powershell
+$env:IMMICH_URL = "http://localhost:2283"
+$env:IMMICH_API_KEY = "…"
+```
+
+or in cmd, with no quote marks, because cmd keeps them as part of the value:
+
+```bat
+set IMMICH_URL=http://localhost:2283
+set IMMICH_API_KEY=…
+```
+
+A value grow-up cannot use, such as an address without `http://` or one wrapped in quote
+marks, is reported before anything is sent, with what to write instead.
+
 Immich API keys carry 155 granular permissions. `grow-up` needs four, and checks them
 up front via `GET /api-keys/me` (which itself requires no permission), so a too-narrow
 key fails in one second with the missing names rather than after hundreds of requests:

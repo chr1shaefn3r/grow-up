@@ -418,6 +418,107 @@ class TestEveryMissingVariableIsNamedAtOnce:
         assert cli.app(["--config", str(tmp_path / "config.toml"), "status"]) == 0
 
 
+class TestABadAddressIsNamedBeforeAnyRequest:
+    """Reported by a first-time user on Windows: `grow-up index` answered
+    "GET /server/ping -> UnsupportedProtocol: Request URL is missing an 'http://'
+    or 'https://' protocol" -- httpx's words, naming neither the variable nor
+    what it held, after four retries with backoff. The address is now checked
+    with the other variables, before any request, and the message says what to
+    write instead."""
+
+    def problem(self, monkeypatch, url: str, key: str = "k") -> str:
+        monkeypatch.setenv("IMMICH_URL", url)
+        monkeypatch.setenv("IMMICH_API_KEY", key)
+        with pytest.raises(RuntimeError) as caught:
+            config.check_credentials(config.sources(cfg({})))
+        return str(caught.value)
+
+    @pytest.mark.parametrize("url, suggested", [
+        ("localhost:2283", "http://localhost:2283"),
+        ("192.168.1.5:2283/", "http://192.168.1.5:2283"),
+        ("//localhost:2283", "http://localhost:2283"),
+        ("http//localhost:2283", "http://localhost:2283"),
+        ("http:/localhost:2283", "http://localhost:2283"),
+    ])
+    def test_a_missing_scheme_is_named_with_the_address_to_use(self, monkeypatch,
+                                                               url, suggested):
+        message = self.problem(monkeypatch, url)
+        assert message.startswith(f"IMMICH_URL is {url}, which has no http://")
+        assert message.endswith(f"such as {suggested}")
+
+    @pytest.mark.parametrize("url", ['"http://localhost:2283"', "'http://localhost:2283'",
+                                     '"localhost:2283"'])
+    def test_quote_marks_from_windows_cmd_are_named_as_the_cause(self, monkeypatch, url):
+        """`set IMMICH_URL="http://..."` in cmd keeps the quotes, and httpx then
+        says the scheme is missing while it is plainly there. The fix offered is
+        a whole line that works, scheme included."""
+        message = self.problem(monkeypatch, url)
+        assert "quote marks included" in message
+        assert message.endswith("set IMMICH_URL=http://localhost:2283")
+
+    @pytest.mark.parametrize("url", ["ftp://x", "http://", "http://localhost:22a3"])
+    def test_anything_else_that_is_not_a_web_address_is_refused(self, monkeypatch, url):
+        assert "which is not a web address" in self.problem(monkeypatch, url)
+
+    def test_a_quoted_key_is_named_without_being_printed(self, monkeypatch):
+        """The message is printed and gets pasted into bug reports."""
+        message = self.problem(monkeypatch, "http://localhost:2283", '"s3cr3t-key"')
+        assert message.startswith("IMMICH_API_KEY has quote marks around it")
+        assert "s3cr3t" not in message
+
+    @pytest.mark.parametrize("url", ["http://localhost:2283", "https://immich.example.com/",
+                                     "https://immich.example.com/api", " http://nas:2283 "])
+    def test_a_working_address_passes_untouched(self, monkeypatch, url):
+        monkeypatch.setenv("IMMICH_URL", url)
+        monkeypatch.setenv("IMMICH_API_KEY", "k")
+        config.check_credentials(config.sources(cfg({})))
+        assert config.credentials().url == url.strip().rstrip("/").removesuffix("/api") + "/api"
+
+    def test_stray_spaces_from_the_shell_are_not_part_of_the_key(self, monkeypatch):
+        monkeypatch.setenv("IMMICH_URL", "http://localhost:2283")
+        monkeypatch.setenv("IMMICH_API_KEY", "abc ")
+        assert config.credentials().api_key == "abc"
+
+    def test_building_credentials_any_other_way_says_the_same(self, monkeypatch):
+        """Not every path goes through check_credentials first; none may reach
+        httpx with an address it will refuse."""
+        monkeypatch.setenv("IMMICH_URL", "localhost:2283")
+        monkeypatch.setenv("IMMICH_API_KEY", "k")
+        with pytest.raises(RuntimeError, match="IMMICH_URL is localhost:2283, which has no"):
+            config.credentials()
+
+    def test_a_bad_address_and_another_accounts_missing_key_come_together(self, monkeypatch):
+        """Everything wrong with the environment in one message, as for the
+        missing variables -- a second run should not reveal a second problem."""
+        monkeypatch.setenv("IMMICH_URL", "localhost:2283")
+        monkeypatch.setenv("IMMICH_API_KEY", "k")
+        monkeypatch.delenv("IMMICH_API_KEY_PARTNER", raising=False)
+        with pytest.raises(RuntimeError) as caught:
+            config.check_credentials(config.sources(cfg(TestEveryMissingVariableIsNamedAtOnce.TWO)))
+        message = str(caught.value)
+        assert "IMMICH_API_KEY_PARTNER" in message
+        assert message.count("IMMICH_URL is localhost:2283") == 1, (
+            "one variable shared by both accounts is one fix, so it is said once")
+
+    def test_index_says_so_without_contacting_immich(self, monkeypatch, tmp_path, capsys):
+        """The reported command, end to end: the message the user sees, and no
+        request -- so no retries to sit through first."""
+        from grow_up import cli
+
+        monkeypatch.setenv("IMMICH_URL", "192.168.1.5:2283")
+        monkeypatch.setenv("IMMICH_API_KEY", "k")
+        monkeypatch.setattr(cli, "_client", lambda *a, **k: pytest.fail(
+            "a client was built before the address was checked"))
+        (tmp_path / "config.toml").write_text(
+            '[paths]\ndb = "g.sqlite"\nout = "out"\n[immich]\nperson_name = "Kid"\n')
+
+        assert cli.app(["--config", str(tmp_path / "config.toml"), "index"]) == 1
+        err = capsys.readouterr().err
+        assert "error: IMMICH_URL is 192.168.1.5:2283, which has no http:// or https://" in err
+        assert "such as http://192.168.1.5:2283" in err
+        assert "UnsupportedProtocol" not in err
+
+
 class TestHowManyRunnerUpsArePrepared:
     """`[select] alternates` decides how many replacements the contact sheet can
     offer, and every one of them costs a warp in `align`."""

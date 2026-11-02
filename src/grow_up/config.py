@@ -8,10 +8,12 @@ no `[[immich.sources]]` yields exactly the single source 1.0.0 assumed.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 DEFAULT_CONFIG = Path("config.toml")
 
@@ -82,21 +84,104 @@ DEFAULT_URL_ENV = "IMMICH_URL"
 DEFAULT_KEY_ENV = "IMMICH_API_KEY"
 
 
+def _env(name: str) -> str:
+    # Stray spaces are a shell artefact -- `set NAME=value ` in Windows cmd keeps
+    # the trailing one -- and can be neither part of an address nor of a key.
+    return os.environ.get(name, "").strip()
+
+
 def _missing_env(url_env: str, key_env: str) -> list[str]:
     """Which of the two variables are unset, in the order they are documented."""
-    url = os.environ.get(url_env, "").rstrip("/")
-    api_key = os.environ.get(key_env, "")
+    url = _env(url_env).rstrip("/")
+    api_key = _env(key_env)
     return [n for n, v in ((url_env, url), (key_env, api_key)) if not v]
 
 
+_QUOTES = "\"'"
+_EXAMPLE_URL = "http://localhost:2283"
+
+
+def _quoted(value: str) -> bool:
+    return bool(value) and (value[0] in _QUOTES or value[-1] in _QUOTES)
+
+
+def _web_address(value: str) -> bool:
+    """Whether httpx can send a request to this, as far as a string can say."""
+    parts = urlsplit(value)
+    try:
+        parts.port      # raises on a port that is not a number
+    except ValueError:
+        return False
+    return parts.scheme.lower() in ("http", "https") and bool(parts.hostname)
+
+
+def _as_web_address(value: str) -> str:
+    """The value with http:// in front, for a message to suggest.
+
+    Anything already standing where the scheme belongs -- slashes, backslashes,
+    a scheme typed without its colon -- is dropped first, or the suggestion for
+    `//localhost:2283` would be `http:////localhost:2283`. http rather than
+    https because an address typed with no scheme is most often Immich on the
+    same machine or network, which serves plain http; the message says "such
+    as", and the browser has the last word.
+    """
+    if _web_address(value):
+        return value.rstrip("/")
+    host = re.sub(r"^(?:https?(?=[:/\\]))?:?[/\\]*", "", value, flags=re.IGNORECASE)
+    guess = f"http://{host.rstrip('/')}"
+    return guess if host and _web_address(guess) else _EXAMPLE_URL
+
+
+def _shape_problems(url_env: str, key_env: str) -> list[tuple[str, str]]:
+    """(variable, what is wrong with its value) for each that is set but cannot work.
+
+    Without this, an address with no scheme reached httpx, whose words for it --
+    "Request URL is missing an 'http://' or 'https://' protocol" -- name neither
+    the variable nor its value. It arrived after four retries with backoff,
+    too, since httpx files it as a network error. Saying it here costs no
+    request at all.
+
+    Quote marks get their own message because Windows cmd is where a first
+    setup most often happens and `set NAME="value"` keeps them as part of the
+    value. The key is never echoed: the message is printed, and pasted.
+    """
+    problems = []
+    url = _env(url_env)
+    if url and _quoted(url):
+        problems.append((url_env, (
+            f"{url_env} is {url}, quote marks included. Windows cmd keeps the quotes "
+            f'of set {url_env}="...", so write it without them: '
+            f"set {url_env}={_as_web_address(url.strip(_QUOTES).strip())}")))
+    elif url and "://" not in url:
+        problems.append((url_env, (
+            f"{url_env} is {url}, which has no http:// or https:// in front. Use "
+            f"the address your browser shows with Immich open, such as "
+            f"{_as_web_address(url)}")))
+    elif url and not _web_address(url):
+        problems.append((url_env, (
+            f"{url_env} is {url}, which is not a web address. Use the address "
+            f"your browser shows with Immich open, such as {_EXAMPLE_URL}")))
+    if _quoted(_env(key_env)):
+        problems.append((key_env, (
+            f"{key_env} has quote marks around it, and Immich would reject the key. "
+            f'Windows cmd keeps the quotes of set {key_env}="...", so write it '
+            f"without them.")))
+    return problems
+
+
 def _credentials_from(url_env: str, key_env: str, whose: str = "") -> Credentials:
-    url = os.environ.get(url_env, "").rstrip("/")
-    api_key = os.environ.get(key_env, "")
+    url = _env(url_env).rstrip("/")
+    api_key = _env(key_env)
     missing = _missing_env(url_env, key_env)
     if missing:
         raise RuntimeError(
             f"missing environment variable(s){whose}: {', '.join(missing)}"
         )
+    # Also checked up front by `check_credentials`; here as well so that no
+    # path to a client can skip it.
+    problems = _shape_problems(url_env, key_env)
+    if problems:
+        raise RuntimeError("\n".join(text for _, text in problems))
     if not url.endswith("/api"):
         url = f"{url}/api"
     return Credentials(url=url, api_key=api_key)
@@ -142,6 +227,10 @@ class Source:
         """The variables this account needs and does not have."""
         return _missing_env(self.url_env, self.key_env)
 
+    def shape_problems(self) -> list[tuple[str, str]]:
+        """This account's variables that are set but cannot work, and why."""
+        return _shape_problems(self.url_env, self.key_env)
+
 
 def check_credentials(sources: list[Source]) -> None:
     """Report every account's missing variables at once, before any work starts.
@@ -158,19 +247,31 @@ def check_credentials(sources: list[Source]) -> None:
 
     One account's worth of gaps keeps the message it has always had; only the
     genuinely new case -- more than one account short -- gets the longer form.
+
+    A variable that is set but cannot work -- an address with no http://, a
+    value in quote marks -- is reported in the same message, once per variable
+    however many accounts share it: the fix is to the variable, and its name
+    says which.
     """
     gaps = [(source.name, missing)
             for source in sources if (missing := source.missing_env())]
-    if not gaps:
+    shapes: dict[str, str] = {}
+    for source in sources:
+        for name, text in source.shape_problems():
+            shapes.setdefault(name, text)
+    if not gaps and not shapes:
         return
+    parts = []
     if len(gaps) == 1:
         name, missing = gaps[0]
-        raise RuntimeError(
-            f"missing environment variable(s) for source {name!r}: {', '.join(missing)}"
-        )
-    detail = "\n".join(f"    source {name!r}: {', '.join(missing)}"
-                       for name, missing in gaps)
-    raise RuntimeError(f"missing environment variable(s):\n{detail}")
+        parts.append(
+            f"missing environment variable(s) for source {name!r}: {', '.join(missing)}")
+    elif gaps:
+        detail = "\n".join(f"    source {name!r}: {', '.join(missing)}"
+                           for name, missing in gaps)
+        parts.append(f"missing environment variable(s):\n{detail}")
+    parts.extend(shapes.values())
+    raise RuntimeError("\n".join(parts))
 
 
 def sources(cfg: Config) -> list[Source]:
