@@ -266,7 +266,9 @@ function syncRejected() {
     const on = candidates ? candidates.every(c => rejected.has(c.id))
                           : rejected.has(fig.dataset.id);
     fig.classList.toggle('rejected', on);
-    const btn = fig.querySelector('figcaption button');
+    // By class, not position: a card with runner-ups has its compare button
+    // first, and relabelling "the first button" turned it into a second reject.
+    const btn = fig.querySelector('figcaption button.reject');
     if (btn) { btn.textContent = rejected.has(fig.dataset.id) ? 'keep' : 'reject'; }
   });
 }
@@ -781,7 +783,7 @@ def _card(asset_id: str, path: str, when: str, label: str, base: Path,
         f'data-label="{html.escape(label)}">'
         f'<img loading="lazy" src="{_rel(path, base)}" alt="">'
         f'<figcaption><span>{html.escape(when)}</span>'
-        f'<button type="button">{action}</button>'
+        f'<button type="button" class="reject">{action}</button>'
         f'<span>{html.escape(label.split()[-1])}</span></figcaption></figure>'
     )
 
@@ -811,7 +813,7 @@ def _bucket_card(bucket: str, candidates: list[dict]) -> str:
         f'<figcaption><span class="when">{html.escape(top["date"])}</span>'
         + ('<button type="button" class="compare-open">compare</button>'
            if spares else "")
-        + f'<button type="button">reject</button>'
+        + f'<button type="button" class="reject">reject</button>'
         f'<span class="rank"></span></figcaption>'
         f"{tray}</figure>"
     )

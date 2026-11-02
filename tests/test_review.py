@@ -424,3 +424,27 @@ class TestTheSheetCarriesTheRunnerUps:
         add_alternate(conn, "2026-01", "spare-a", 1, tmp_path)
         out = tmp_path / "out" / "contact-sheet.html"
         assert review.write_contact_sheet(conn, out) == 3
+
+
+class TestRelabellingTouchesOnlyTheRejectButton:
+    """After every change the page relabels each card's reject/keep button. It
+    used to take the first button in the caption -- which on a card with
+    runner-ups is "compare", so choosing a runner-up left two reject buttons
+    and no way to see that the first still opened the comparison.
+    """
+
+    def test_the_page_finds_it_by_class_not_position(self):
+        assert "querySelector('figcaption button.reject')" in review._JS
+        assert "querySelector('figcaption button')" not in review._JS
+
+    def test_every_reject_button_carries_the_class(self, conn, tmp_path):
+        add_alternate(conn, "2026-01", "spare", 1, tmp_path)
+        out = tmp_path / "out" / "contact-sheet.html"
+        review.write_contact_sheet(conn, out, {"spare"})
+        page = out.read_text()
+        captions = re.findall(r"<figcaption>.*?</figcaption>", page)
+        labels = re.findall(r'<button type="button"( class="[^"]*")?>(reject|keep)<', page)
+
+        assert labels and all(cls == ' class="reject"' for cls, _ in labels)
+        assert any("compare-open" in c for c in captions), "the case that broke"
+        assert 'class="compare-open reject"' not in page
