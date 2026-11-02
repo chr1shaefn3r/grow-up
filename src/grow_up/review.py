@@ -322,9 +322,14 @@ function chooseCandidate(bucket, id) {
   const candidates = candidatesFor(bucket);
   const target = candidates.findIndex(c => c.id === id);
   if (target < 0) { return; }
-  candidates.slice(0, target).forEach(c => rejected.add(c.id));
-  // Picking one that was itself rejected is how you change your mind back.
-  rejected.delete(id);
+  // The bucket ends up with exactly the photos ahead of the choice rejected:
+  // choosing runner-up n rejects n, however many picks came before it. Only
+  // adding left an earlier pick's rejections behind, so choosing #3 and then
+  // #1 kept #2 rejected too. Clearing everything from the choice on is also
+  // how picking a photo that was itself rejected takes it back.
+  candidates.forEach((c, i) => {
+    if (i < target) { rejected.add(c.id); } else { rejected.delete(c.id); }
+  });
   syncRejected();
   render();
   paintCompare();

@@ -413,10 +413,15 @@ class TestChoosingARunnerUpMeansWhatSelectMeans:
         {"id": "s4", "date": "2026-01-30", "seq": 5, "src": "e.jpg"},
     ]
 
-    def page_chooses(self, tmp_path, chosen: str, seed: list[str] | None = None):
-        """Run the shipped page JS headlessly and return what it rejected."""
+    def page_chooses(self, tmp_path, chosen: str | list[str],
+                     seed: list[str] | None = None):
+        """Run the shipped page JS headlessly and return what it rejected.
+
+        `chosen` may be a sequence, applied in order, for changing your mind.
+        """
         buckets = [{"bucket": "2026-01", "candidates": self.CANDIDATES}]
-        script = tmp_path / f"choose-{chosen}.mjs"
+        choices = [chosen] if isinstance(chosen, str) else chosen
+        script = tmp_path / f"choose-{'-'.join(choices)}.mjs"
         script.write_text(
             "const ELEMENTS = {\n"
             f"  'rejected-seed': {{textContent: {json.dumps(json.dumps(seed or []))}}},\n"
@@ -430,8 +435,8 @@ class TestChoosingARunnerUpMeansWhatSelectMeans:
             "                        appendChild(){}, setAttribute(){}}),\n"
             "};\n"
             f"{review._JS}\n"
-            f"chooseCandidate('2026-01', {json.dumps(chosen)});\n"
-            "console.log(JSON.stringify([...rejected]));\n",
+            + "".join(f"chooseCandidate('2026-01', {json.dumps(c)});\n" for c in choices)
+            + "console.log(JSON.stringify([...rejected]));\n",
             encoding="utf-8",
         )
         result = subprocess.run(["node", str(script)], capture_output=True, text=True)
@@ -483,6 +488,41 @@ class TestChoosingARunnerUpMeansWhatSelectMeans:
         makes `select` choose the photo you clicked."""
         rejected = self.page_chooses(tmp_path, chosen)
         assert self.pipeline_picks(tmp_path, rejected) == chosen
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    @pytest.mark.parametrize("n", [1, 2, 3, 4])
+    def test_choosing_runner_up_n_rejects_exactly_n(self, tmp_path, n):
+        chosen = self.CANDIDATES[n]["id"]
+        assert self.page_chooses(tmp_path, chosen) == sorted(
+            c["id"] for c in self.CANDIDATES[:n])
+
+
+class TestChangingYourMindInTheComparison:
+    """Each choice sets the bucket afresh. Choices used to only add, so picking
+    #3 and then #1 left #2 rejected as well -- two rejections where one choice
+    of the first runner-up should make exactly one."""
+
+    page_chooses = TestChoosingARunnerUpMeansWhatSelectMeans.page_chooses
+    CANDIDATES = TestChoosingARunnerUpMeansWhatSelectMeans.CANDIDATES
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    @pytest.mark.parametrize("first", ["s1", "s2", "s3", "s4"])
+    @pytest.mark.parametrize("n", [1, 2, 3, 4])
+    def test_the_last_choice_alone_decides_what_is_rejected(self, tmp_path, first, n):
+        chosen = self.CANDIDATES[n]["id"]
+        assert self.page_chooses(tmp_path, [first, chosen]) == sorted(
+            c["id"] for c in self.CANDIDATES[:n])
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_it_holds_across_a_reload_too(self, tmp_path):
+        """After a reload the earlier choice is only rejects.json; the rule
+        must not depend on remembering that a choice made it."""
+        assert self.page_chooses(tmp_path, "s1", seed=["pick", "s1", "s2"]) == ["pick"]
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+    def test_another_bucket_keeps_its_rejections(self, tmp_path):
+        assert self.page_chooses(tmp_path, "s1", seed=["elsewhere"]) == [
+            "elsewhere", "pick"]
 
 
 class TestTheViewerExplainsARejection:
