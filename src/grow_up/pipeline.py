@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import shutil
 import sqlite3
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -18,7 +19,7 @@ from typing import Callable, Iterable
 import numpy as np
 
 from . import align, analyze, annotate, config, db, images, review, select, timing
-from .encode import encode, fingerprint, moving_seconds
+from .encode import encode, face_morph_steps, fingerprint, moving_seconds
 from .immich import ImmichClient, pick_face
 from .progress import Progress
 
@@ -642,7 +643,8 @@ def _damp_flicker(results: list[tuple], log: Log, window: int = 9) -> None:
 
 
 def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
-                 log: Log, workers: int = 0, force: bool = False) -> list[Path]:
+                 log: Log, workers: int = 0, force: bool = False,
+                 analyze_opts: analyze.AnalyzeOptions | None = None) -> list[Path]:
     """Encode the aligned frames, honouring manual rejects from the contact sheet.
 
     Returns every video *written* -- so a run that finds both already current
@@ -657,6 +659,9 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     records it as coming from exactly these frames and these settings. `force`
     overrides that. The two are judged separately: changing only the footer
     language re-renders the annotated video and leaves the plain one alone.
+
+    `analyze_opts` is the landmarker face-morph finds each face with -- the
+    same model and thresholds `analyze` used. Nothing else reads it.
     """
     # `select` already excludes these, which is what lets a bucket fall through
     # to its runner-up. Kept here as well so `grow-up encode` on its own still
@@ -740,8 +745,23 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
         log("  encode: nothing to render; `grow-up encode --force` renders anyway")
         return []
 
-    with timing.stopwatch() as stage_elapsed:
-        results = _run_renders([r[:3] for r in renders], settings, workers, log)
+    # Made only now, once a render is certain: an unchanged face-morph video is
+    # skipped above without landmarking a single frame. Both videos share them.
+    morph_dir = None
+    try:
+        with timing.stopwatch() as stage_elapsed:
+            if _resolved_transition(settings) == "face-morph":
+                inbetweens, morph_dir = _face_morph_inbetweens(
+                    kept, settings, analyze_opts or analyze.AnalyzeOptions(), workers, log)
+                for _, _, extra, _ in renders:
+                    extra["inbetweens"] = inbetweens
+            results = _run_renders([r[:3] for r in renders], settings, workers, log)
+    finally:
+        if morph_dir is not None:
+            # Purely derived, and large -- hundreds of megabytes for a year of
+            # weeks. The video holds everything they were for, and the next
+            # render makes them afresh rather than trusting any left behind.
+            shutil.rmtree(morph_dir, ignore_errors=True)
 
     for (_, out_path, _, digest), (written, _) in zip(renders, results):
         db.record_render(conn, written or out_path, digest)
@@ -754,6 +774,42 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     if len(results) > 1:
         log(f"  encode: stage took {timing.format_duration(stage_elapsed())}")
     return [path for path, _ in results]
+
+
+def _face_morph_inbetweens(rows: list, settings: dict, opts: analyze.AnalyzeOptions,
+                           workers: int, log: Log) -> tuple[list[list[Path]], Path]:
+    """Every in-between frame face-morph needs, per pair, and where they were written.
+
+    A frame with no face found dissolves into its neighbours instead of
+    morphing, and the run names it by date so it can be found on the contact
+    sheet -- one odd photo should not cost the whole video its morph. No face in
+    any frame is something else: the landmarker is not seeing what `analyze`
+    saw, and a video of plain dissolves stored as face-morph would be kept by
+    every later run, so that stops the encode instead.
+    """
+    from . import morph
+
+    frames = [Path(r["path"]) for r in rows]
+    count = face_morph_steps(settings["fps"], settings["playback_fps"],
+                             settings["transition_seconds"])
+    morph_dir = frames[0].parent / "morph"
+    if count == 0 or len(frames) < 2:
+        return [[] for _ in frames[1:]], morph_dir
+
+    log(f"  morph: finding the face in {len(frames)} aligned frames")
+    meshes = morph.landmarks_for(frames, opts)
+    faceless = [(r["local_datetime"] or Path(r["path"]).stem)[:10]
+                for r, mesh in zip(rows, meshes) if mesh is None]
+    if len(faceless) == len(frames):
+        raise RuntimeError(
+            'transition = "face-morph" found no face in any aligned frame, so there '
+            "is nothing to morph. Check that `grow-up fetch-model` has the model "
+            "`analyze` used, or choose crossfade.")
+    if faceless:
+        shown = ", ".join(faceless[:8]) + (" and more" if len(faceless) > 8 else "")
+        log(f"  ! morph: no face found in {len(faceless)} aligned frame(s), which "
+            f"dissolve into their neighbours instead: {shown}")
+    return morph.render(frames, meshes, morph_dir, count, workers, log), morph_dir
 
 
 def _already_rendered(conn: sqlite3.Connection, out_path: Path, digest: str) -> bool:
@@ -852,11 +908,22 @@ def _log_transition(settings: dict, frames: int, log: Log) -> None:
     hold = 1.0 / settings["fps"]
     rate = settings["playback_fps"]
     asked = settings["transition_seconds"]
-    # Reported for both transitions. Printing it for only one is how a setting
+    # Reported for every transition. Printing it for only one is how a setting
     # that was being silently discarded went unnoticed through a whole release.
     moving = moving_seconds(settings["fps"], asked)
+    # Judged before face-morph rounds to whole frames, which would otherwise
+    # report a clamp for any value that is not a whole number of them.
+    clamped = moving < asked
     detail = f", {moving:g}s moving and {hold - moving:g}s still per {hold:g}s photo"
-    if moving < asked:
+    if transition == "face-morph":
+        # Its in-betweens are whole frames, so say what it will actually make.
+        steps = face_morph_steps(settings["fps"], rate, asked)
+        moving = steps / rate
+        detail = (f", {steps} in-between frame{'s' if steps != 1 else ''} "
+                  f"({moving:.3g}s) and {hold - moving:.3g}s still per {hold:g}s photo")
+        if steps == 0:
+            detail += " -- no room for any at these rates, so the photos cut"
+    if clamped:
         detail += " (clamped: a transition cannot outlast the photo)"
     log(f"  encode: {transition} at {rate:g} fps{detail}")
     log(f"  encode: ffmpeg will write about {round(frames * hold * rate)} frames "

@@ -8,7 +8,7 @@ of what you are able to verify.
 ## Start here
 
 `grow-up` turns the photos of one tagged person in an [Immich](https://immich.app)
-library into an eye-aligned face timelapse. Python, 14 modules, no framework.
+library into an eye-aligned face timelapse. Python, 16 modules, no framework.
 
 Every module opens with a docstring stating its design rationale. Read the one for the
 area you are touching before changing it — most "why is it like this?" questions are
@@ -93,6 +93,9 @@ specifically to avoid. They all look like improvements.
 | Give the `birthday-months` bucket a label computed its own way | `months_between` decides which bucket a photo lands in; `birthday_month_start` only names it, and must be its exact inverse. Any other rule — `birth.replace(month=…)`, clamping the day, formatting the age — drifts from the grouping it claims to describe, and two buckets sharing a name means one month of the timelapse silently swallows another. The awkward input is a birthday on the 31st: February contains no such date, so the month does not open until March does. | `test_the_label_is_the_exact_inverse_of_the_grouping`, `test_a_birthday_on_the_31st_waits_for_a_month_that_has_one` (`tests/test_select.py`) |
 | Take month names or number grouping from the stdlib `locale` module | It depends on which locales the host has generated, so the same config renders a different video on a Mac and on a Linux desktop. `annotate.LANGUAGES` is a table for that reason, and because `mois` is invariable in French — a rule with an `s` on the end is wrong. | `TestLanguages` (`tests/test_annotate.py`) |
 | Draw into an extra screen's window from the sheet, or let that window decide anything | Over `file://` Chrome gives every load of a page an origin of its own. A blank window the sheet opened and drew into keeps the *old* load's origin, so after the reload that follows `select && align` the sheet may no longer touch it. Navigating it to a fresh `about:blank` does not help. This was built first and only a browser run caught it. The windows show `contact-sheet-screen.html` and talk to the sheet by `postMessage`. They say `ready` every second, because a message posted while the sheet unloads did not arrive. They hold no rejections and apply no rule, so nothing can drift. | `tests/test_screens_browser.py` (Chromium via Playwright; skips without it, so not in CI), `TestEveryScreenChoosesTheSameWay` (`tests/test_tuner.py`), `test_the_screen_page_decides_nothing` (`tests/test_review.py`) |
+| Reuse an in-between frame that is already on disk | face-morph writes thousands of them per render. The fork it came from named them by place (`morph-000123.jpg`) and kept any that existed, which is the frame-naming trap again: a render that failed part-way, or ran before the selection changed, leaves morphs between two other photographs, and they look plausible. They are named after their two photographs, the directory is emptied before every render, and deleted after it, failed or not. | `test_nothing_left_by_an_earlier_run_survives` (`tests/test_morph.py`), `test_they_are_thrown_away_when_the_render_fails_too` (`tests/test_encode.py`) |
+| Fall back to another transition when face-morph cannot run | The render is fingerprinted as face-morph, so a fallback video of hard cuts or dissolves is kept as the finished face-morph by every later run. A missing landmarker, or no face in any frame, stops the encode. One frame with no face found dissolves only its two pairs, deterministically, and is named by date. | `test_no_face_in_any_frame_stops_rather_than_storing_dissolves`, `test_without_its_in_betweens_it_refuses` (`tests/test_encode.py`) |
+| Round a face-morph slot to whole frames | The footer advances by exactly one hold per photograph. A slot rounded to whole playback frames drifts against it by a fraction of a frame per photograph, which is a frame every few photographs at `fps = 0.7` and a visibly wrong date by the end. The in-betweens are whole frames; the still part takes up the remainder. | `test_every_slot_lasts_exactly_one_hold` (`tests/test_encode.py`) |
 | Apply `--limit` per account instead of splitting it | `trial -n 100` would sample 200 across two accounts, and the projection multiplies a per-item cost by the whole workload — so the estimate is wrong with nothing on screen to say so. | `TestSplittingASample` (`tests/test_sources.py`) |
 
 One more, without a test because it is a shape rather than a behaviour: EXIF orientation
@@ -116,6 +119,7 @@ coordinates; decoding elsewhere without the same rule silently crops the wrong r
 | `review.py` | The static HTML pages. No CDN — they open over `file://`. The rejects page is a threshold tuner driven by the serialized `RULES`. The contact sheet's compare can spread over extra monitors through `contact-sheet-screen.html`, a page that only draws what the sheet sends it. |
 | `annotate.py` | The date/age footer. Age arithmetic, date tokens and the five language tables are plain Python; Pillow is imported lazily, only to draw. |
 | `encode.py` | The ffmpeg invocation, and the transition maths. Hold rate and playback rate are separate; the filter strings are pure arithmetic so they stay testable with no ffmpeg. |
+| `morph.py` | face-morph's in-between frames: landmark the aligned frames, warp both photographs onto the in-between mesh, dissolve. The interpolation, affines and sampling map are pure numpy; opencv does the Delaunay, the rasterising and one `remap` per photograph. |
 | `progress.py` | The progress bar. Repaints on a terminal, degrades to plain lines when piped. |
 | `timing.py` | Stage timing and the full-run projection behind `grow-up trial`. |
 
@@ -131,17 +135,27 @@ pip install pillow                   # unlocks the footer-drawing tests
 # node that can require('playwright')  # unlocks the multi-screen browser test
 ```
 
-With none of them, 149 tests skip and the rest still assert everything that matters.
+With none of them, 165 tests skip and the rest still assert everything that matters.
 
-**You cannot verify anything that needs real photographs.** mediapipe generally will not
-install in a sandbox, there is no Immich instance, and no credentials will be shared.
-This means no change to landmarking, framing or filtering has ever been seen working on
-an actual face by the agent that wrote it. Say so plainly rather than describing such a
+**You cannot verify anything on the owner's library.** There is no Immich instance and
+no credentials will be shared, so no change to landmarking, framing or filtering has
+been seen on the photographs it is for. Say so plainly rather than describing such a
 change as verified.
 
-**ffmpeg is not installed either, and the tests are built so it never needs to be.** You
-can assert the exact command string and every number in it; you cannot run it or see one
-frame of the result. So anything about how a *filter behaves* — `framerate`'s blending,
+Two real faces *are* within reach, for checks that need a face rather than a library.
+MediaPipe's public test images download from the sandbox (Wikimedia does not):
+`https://storage.googleapis.com/mediapipe-assets/portrait.jpg` and
+`.../face_stylizer_raw_face_demo.png`. mediapipe itself installs into a separate venv
+(`pip install mediapipe`) once `apt-get install -y libegl1 libgles2` has supplied the
+GL library it loads, and `grow-up fetch-model` downloads the model. face-morph was
+checked end to end this way: landmarked, aligned, morphed and encoded. Keep all of it out
+of the suite, which must still run with none of it installed.
+
+**ffmpeg is not installed, and the tests are built so it never needs to be.** You can
+assert the exact command string and every number in it. For a manual check,
+`pip install imageio-ffmpeg` brings a static ffmpeg binary you can put on `PATH` and
+render with, and then extract frames to look at. Without that, you cannot see one frame
+of the result. So anything about how a *filter behaves* — `framerate`'s blending,
 `scene` suppressing it, `overlay`'s alpha handling, what `minterpolate` does to a face —
 is read from the documentation, not observed. Write it down as such. The way to keep this
 honest is the one already used: put the arithmetic in a pure function
@@ -177,6 +191,12 @@ Hand these to the human running a real library:
    5–8 and 9–12 beside it. Press `9` on the third monitor, then reload the sheet and
    compare again: the same two windows fill, with no new ones opening. Only headless and
    virtual-display Chromium have run this. Firefox, Safari and real monitors have not.
+10. `transition = "face-morph"`, then `grow-up encode`. Between two photographs the face
+    should change shape smoothly, with one set of eyes and one mouth throughout and the
+    footer switching mid-morph. A face that tears or folds near the edge of the frame
+    means landmarks fell outside it. Every pair dissolving instead of morphing means the
+    landmarker found no face in the aligned frames. It has run on two MediaPipe test
+    portraits, never on a child's photographs months apart.
 
 ## Releasing
 

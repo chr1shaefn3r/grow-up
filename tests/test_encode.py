@@ -4,6 +4,7 @@ import json
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from grow_up import encode
@@ -1413,3 +1414,286 @@ class TestATrialAlwaysRenders:
         spy.clear()
         pipeline.stage_encode(conn, tmp_path / "out", {"fps": 0.5}, lambda _: None)
         assert spy == []
+
+
+# --------------------------------------------------------------------------- #
+# face-morph
+# --------------------------------------------------------------------------- #
+
+class TestFaceMorphTiming:
+    """face-morph's frames are made one at a time, so how many go between two
+    photographs, and how long each is shown, is decided here rather than by an
+    ffmpeg filter."""
+
+    def test_the_moving_part_becomes_whole_frames(self):
+        assert encode.face_morph_steps(0.5, 30.0, 1.0) == 30
+        assert encode.face_morph_steps(0.5, 30.0, 0.5) == 15
+
+    def test_one_frame_of_the_photograph_always_stays(self):
+        """minterpolate leaves each source frame on screen; a slot that was all
+        movement would never show the photograph it belongs to."""
+        assert encode.face_morph_steps(0.5, 30.0, 5.0) == 59
+
+    def test_a_slot_with_no_room_is_a_hard_cut(self):
+        assert encode.face_morph_steps(30.0, 30.0, 1.0) == 0
+
+    def test_changing_the_length_changes_the_count(self):
+        """The trap of a setting wired to one branch and dropped by another."""
+        assert encode.face_morph_steps(0.5, 30.0, 0.2) != encode.face_morph_steps(
+            0.5, 30.0, 0.8)
+
+
+class TestFaceMorphEntries:
+
+    def paths(self, tmp_path, names):
+        return [tmp_path / name for name in names]
+
+    def test_each_photograph_is_held_then_its_in_betweens_follow(self, tmp_path):
+        frames = self.paths(tmp_path, ["a.jpg", "b.jpg"])
+        between = [self.paths(tmp_path, ["ab1.jpg", "ab2.jpg"])]
+        entries = encode.face_morph_entries(frames, between, 0.5, 10.0)
+        assert [p.name for p, _ in entries] == ["a.jpg", "ab1.jpg", "ab2.jpg", "b.jpg"]
+        assert [round(d, 6) for _, d in entries] == [1.8, 0.1, 0.1, 2.0]
+
+    @pytest.mark.parametrize("hold_fps", [0.5, 0.7, 3.0])
+    def test_every_slot_lasts_exactly_one_hold(self, tmp_path, hold_fps):
+        """Rounding a slot to whole frames would drift the picture against the
+        footer -- at 0.7 fps by a frame every few photographs."""
+        frames = self.paths(tmp_path, [f"{i}.jpg" for i in range(6)])
+        steps = encode.face_morph_steps(hold_fps, 30.0, 1.0)
+        between = [self.paths(tmp_path, [f"{i}-{k}.jpg" for k in range(steps)])
+                   for i in range(5)]
+        entries = encode.face_morph_entries(frames, between, hold_fps, 30.0)
+        assert sum(d for _, d in entries) == pytest.approx(6 / hold_fps)
+        # And slot by slot, not only in total.
+        starts = [i for i, (p, _) in enumerate(entries) if p in frames] + [len(entries)]
+        for a, b in zip(starts, starts[1:]):
+            assert sum(d for _, d in entries[a:b]) == pytest.approx(1 / hold_fps)
+
+    def test_one_list_per_pair_is_insisted_on(self, tmp_path):
+        frames = self.paths(tmp_path, ["a.jpg", "b.jpg", "c.jpg"])
+        with pytest.raises(ValueError, match="need 2"):
+            encode.face_morph_entries(frames, [[]], 0.5, 30.0)
+
+    def test_in_betweens_that_cannot_fit_are_refused(self, tmp_path):
+        frames = self.paths(tmp_path, ["a.jpg", "b.jpg"])
+        crowded = [self.paths(tmp_path, [f"{k}.jpg" for k in range(60)])]
+        with pytest.raises(ValueError, match="do not fit"):
+            encode.face_morph_entries(frames, crowded, 0.5, 30.0)
+
+
+class TestTheFaceMorphFooterSwitchesMidMorph:
+    """The morph runs at the end of each slot, as `morph` does, so the footer
+    switches half the in-betweens before the boundary."""
+
+    def test_it_switches_at_the_middle_of_the_frames_actually_made(self):
+        # 15 in-betweens at 30 fps fill the last half-second of a 2s slot.
+        assert encode.footer_concat_offset(0.5, "face-morph", 0.5, 30.0) == pytest.approx(
+            2.0 - 0.25)
+
+    def test_the_length_reaches_it(self):
+        assert encode.footer_concat_offset(0.5, "face-morph", 0.2, 30.0) != \
+            encode.footer_concat_offset(0.5, "face-morph", 0.8, 30.0)
+
+    def test_with_no_room_to_morph_it_switches_on_the_cut(self):
+        assert encode.footer_concat_offset(30.0, "face-morph", 1.0, 30.0) == \
+            pytest.approx(1 / 30)
+
+
+class TestTheFaceMorphCommand:
+
+    @pytest.fixture(autouse=True)
+    def fake_ffmpeg(self, monkeypatch):
+        monkeypatch.setattr(encode.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+
+    def test_there_is_no_filter_but_the_output_runs_at_the_playback_rate(self):
+        """The frames are already pictures. Left at the hold rate, the output
+        would drop them exactly as minterpolate's once were."""
+        assert encode.transition_filters("face-morph", 0.5, 30.0, 1.0) == ([], 30.0)
+
+    def run(self, monkeypatch, frames, tmp_path, **kwargs):
+        seen = {}
+
+        def fake_run(cmd, **_):
+            seen["cmd"] = cmd
+            return type("Done", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(encode.subprocess, "run", fake_run)
+        encode.encode(frames, tmp_path / "out" / "v.mp4", fps=0.5,
+                      transition="face-morph", playback_fps=30.0,
+                      transition_seconds=0.1, **kwargs)
+        return seen["cmd"]
+
+    def test_the_in_betweens_are_in_the_list(self, monkeypatch, frames, tmp_path):
+        between = [[tmp_path / "ab1.jpg", tmp_path / "ab2.jpg", tmp_path / "ab3.jpg"],
+                   [tmp_path / "bc1.jpg", tmp_path / "bc2.jpg", tmp_path / "bc3.jpg"]]
+        cmd = self.run(monkeypatch, frames, tmp_path, inbetweens=between)
+        listing = (tmp_path / "out" / "v.ffconcat").read_text()
+        assert "ab2.jpg" in listing and "bc3.jpg" in listing
+        assert cmd[cmd.index("-r") + 1] == "30.0"
+        assert "minterpolate" not in " ".join(cmd) and "framerate=" not in " ".join(cmd)
+
+    def test_the_footer_rides_its_own_layer(self, monkeypatch, frames, tmp_path):
+        between = [[tmp_path / "ab1.jpg"] * 3, [tmp_path / "bc1.jpg"] * 3]
+        overlays = [tmp_path / f"f{i}.png" for i in range(3)]
+        cmd = self.run(monkeypatch, frames, tmp_path, inbetweens=between,
+                       overlays=overlays)
+        footer = (tmp_path / "out" / "v-footer.ffconcat").read_text().splitlines()
+        assert "-filter_complex" in cmd
+        assert footer[2] == f"duration {2.0 - 3 / 30 / 2:.6f}"
+
+    def test_without_its_in_betweens_it_refuses(self, monkeypatch, frames, tmp_path):
+        """Rendering on regardless would be hard cuts stored as a face-morph."""
+        with pytest.raises(ValueError, match="in-between"):
+            self.run(monkeypatch, frames, tmp_path)
+
+
+class TestFaceMorphInTheStage:
+    """What stage_encode does around the morph: make the in-betweens only when
+    a render will run, share them between the videos, and never keep them."""
+
+    CFG = {"fps": 0.5, "transition": "face-morph", "playback_fps": 30,
+           "transition_seconds": 0.1}
+
+    @pytest.fixture()
+    def stage(self, tmp_path, monkeypatch):
+        """Three warped frames, a stand-in landmarker and morph, and a spy ffmpeg."""
+        from grow_up import db, morph, pipeline
+
+        conn = db.connect(tmp_path / "t.sqlite")
+        stamp = "2026-01-01T00:00:00.000Z"
+        for i in range(1, 4):
+            frame = tmp_path / "frames" / f"a{i}.jpg"
+            frame.parent.mkdir(exist_ok=True)
+            frame.write_bytes(b"\xff\xd8\xff")
+            conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
+                         " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01T10:00:00", stamp))
+            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
+                         " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+            conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
+                         " selected_at) VALUES (?, ?, 0, 0, ?)",
+                         (f"a{i}", f"2026-0{i}", stamp))
+
+        state = {"meshes": [np.zeros((478, 2))] * 3, "landmarked": 0, "renders": [],
+                 "morph_seen": None, "opts": None}
+
+        def landmarks_for(paths, opts):
+            state["landmarked"] += 1
+            state["opts"] = opts
+            return list(state["meshes"])
+
+        def render(frames, meshes, out_dir, count, workers=0, log=None):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            state["morph_seen"] = (len(frames), count, list(meshes))
+            made = []
+            for a, b in zip(frames, frames[1:]):
+                pair = [out_dir / f"{a.stem}--{b.stem}-{k:03d}.jpg" for k in range(1, count + 1)]
+                for p in pair:
+                    p.write_bytes(b"x")
+                made.append(pair)
+            return made
+
+        def fake_encode(frames, out_path, **kwargs):
+            state["renders"].append((out_path.name, kwargs.get("inbetweens"),
+                                     all(p.exists() for pair in kwargs.get("inbetweens") or []
+                                         for p in pair)))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"video")
+            return out_path
+
+        monkeypatch.setattr(morph, "landmarks_for", landmarks_for)
+        monkeypatch.setattr(morph, "render", render)
+        monkeypatch.setattr(pipeline, "encode", fake_encode)
+        state["conn"] = conn
+        state["out"] = tmp_path / "out"
+        state["morph_dir"] = tmp_path / "frames" / "morph"
+        return state
+
+    def encode(self, stage, cfg=None, **kwargs):
+        from grow_up import pipeline
+
+        lines = []
+        pipeline.stage_encode(stage["conn"], stage["out"], cfg or self.CFG, lines.append,
+                              **kwargs)
+        return lines
+
+    def test_the_render_gets_one_list_of_in_betweens_per_pair(self, stage):
+        self.encode(stage)
+        [(name, between, existed)] = stage["renders"]
+        assert [len(pair) for pair in between] == [3, 3]
+        assert existed, "they were deleted before ffmpeg read them"
+
+    def test_they_are_thrown_away_once_the_video_is_made(self, stage):
+        self.encode(stage)
+        assert not stage["morph_dir"].exists()
+
+    def test_they_are_thrown_away_when_the_render_fails_too(self, stage, monkeypatch):
+        from grow_up import pipeline
+
+        monkeypatch.setattr(pipeline, "encode",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ffmpeg died")))
+        with pytest.raises(RuntimeError, match="ffmpeg died"):
+            self.encode(stage)
+        assert not stage["morph_dir"].exists()
+
+    def test_an_unchanged_video_is_not_landmarked_again(self, stage):
+        """The skip is decided before the morph, so it costs nothing."""
+        self.encode(stage)
+        self.encode(stage)
+        assert stage["landmarked"] == 1
+
+    def test_switching_from_crossfade_renders_again(self, stage):
+        self.encode(stage, {**self.CFG, "transition": "crossfade"})
+        self.encode(stage)
+        assert len(stage["renders"]) == 2
+
+    def test_the_configured_landmarker_is_the_one_used(self, stage):
+        from grow_up import analyze
+
+        opts = analyze.AnalyzeOptions(model_path="elsewhere/face_landmarker.task")
+        self.encode(stage, analyze_opts=opts)
+        assert stage["opts"] is opts
+
+    def test_a_frame_with_no_face_is_named_by_date_and_morphs_nothing(self, stage):
+        stage["meshes"] = [np.zeros((478, 2)), None, np.zeros((478, 2))]
+        lines = self.encode(stage)
+        warning = [line for line in lines if "no face found" in line]
+        assert warning and "2026-02-01" in warning[0]
+        assert stage["morph_seen"][2][1] is None, "the render was told which one"
+
+    def test_no_face_in_any_frame_stops_rather_than_storing_dissolves(self, stage):
+        """A video of plain dissolves recorded as face-morph would be kept by
+        every later run."""
+        stage["meshes"] = [None, None, None]
+        with pytest.raises(RuntimeError, match="no face in any aligned frame"):
+            self.encode(stage)
+        assert stage["renders"] == []
+
+    def test_no_room_for_in_betweens_still_renders_and_says_so(self, stage):
+        lines = self.encode(stage, {**self.CFG, "fps": 30})
+        assert any("no room for any" in line for line in lines)
+        [(_, between, _)] = stage["renders"]
+        assert between == [[], []]
+        assert stage["landmarked"] == 0, "nothing to morph, so nothing to landmark"
+
+    def test_the_log_says_how_many_frames_it_will_make(self, stage):
+        lines = self.encode(stage, {**self.CFG, "transition_seconds": 0.51})
+        line = next(line for line in lines if "face-morph at 30 fps" in line)
+        assert "15 in-between frames" in line
+        assert "clamped" not in line, "rounding to whole frames is not a clamp"
+
+
+def test_the_cli_hands_the_landmarker_to_the_encode():
+    """Without it, face-morph would landmark with the defaults rather than the
+    model and thresholds `analyze` used."""
+    import ast
+    import inspect
+
+    from grow_up import cli
+
+    for command in (cli.cmd_encode, cli.cmd_trial):
+        tree = ast.parse(inspect.getsource(command))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == "stage_encode"]
+        assert calls and all(any(kw.arg == "analyze_opts" for kw in call.keywords)
+                             for call in calls), command.__name__

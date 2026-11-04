@@ -742,7 +742,7 @@ photographs.
 ```toml
 [encode]
 fps = 0.5                    # two seconds per photo
-transition = "crossfade"     # none | crossfade | morph
+transition = "crossfade"     # none | crossfade | morph | face-morph
 playback_fps = 30
 transition_seconds = 1.0     # one second moving, one second still
 ```
@@ -754,17 +754,31 @@ face becoming another, but photos a month apart differ in clothing, light and ba
 and motion estimation cannot tell that from movement. Expect smearing, worst in the
 background, and a render measured in minutes.
 
-`transition_seconds` governs both. Lower it to hold the picture longer: at `fps = 0.5`,
+**`face-morph`** morphs the face by its landmarks instead of guessing from pixels.
+MediaPipe puts the same 478 labelled points on every face, so the nose in one photograph
+is the same point as the nose in the next and there is nothing to estimate. Each
+in-between frame warps both photographs onto the face part of the way between them and
+then dissolves them: an eye becomes an eye, a smile a smile, and nothing appears twice
+the way it does halfway through a crossfade. Hair and background lie outside the face
+mesh, so they dissolve as in a crossfade. The in-between frames are made on every core
+and deleted once they are in the video. Before that, each aligned frame is landmarked
+once more, with the same model `analyze` uses. A frame where no face is found dissolves
+into its neighbours instead of morphing, and the run names it by date so you can find it
+on the contact sheet.
+
+`transition_seconds` governs all three. Lower it to hold the picture longer: at `fps = 0.5`,
 `0.5` gives a second and a half still and half a second moving. The two place it
-differently — a crossfade straddles the boundary between two photographs, while a morph
-holds and *then* melts into the next, because its hold is made by repeating the frame and
-a repeat can only hold from the start of a slot.
+differently — a crossfade straddles the boundary between two photographs, while morph and
+face-morph hold and *then* melt into the next, because the hold is made by repeating the
+frame and a repeat can only hold from the start of a slot.
 
 `morph` is also the slow one to render, and it is bound to a single core: ffmpeg's
 motion interpolation is single-threaded, so no amount of `-threads` helps it. With the
 footer enabled the two videos are rendered at the same time, which halves the wait, but
 the cost still scales with how many photographs there are — a weekly cadence is roughly
 eight times the work of a monthly one. `grow-up encode` reports what each render took.
+`face-morph` is not bound that way: its frames are made in parallel, one pair of
+photographs per core, and ffmpeg only has to string them together.
 
 Note the trade. A shorter transition is a *faster* one, and morph is warping pixels along
 estimated motion — half a second of warp between photographs a month apart is more

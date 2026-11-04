@@ -449,7 +449,8 @@ def cmd_encode(args: argparse.Namespace) -> None:
     # independent renders, and ffmpeg cannot spread either across cores itself.
     for out in pipeline.stage_encode(conn, cfg.path("out"), cfg.section("encode"), log,
                                      int(cfg.get("analyze", "workers", 0)),
-                                     force=args.force):
+                                     force=args.force,
+                                     analyze_opts=_analyze_options(cfg, args.verbose)):
         log(f"  encode: wrote {out}")
 
 
@@ -570,7 +571,8 @@ def cmd_trial(args: argparse.Namespace) -> None:
                     # kind of wrong answer that arrives looking like a fast one.
                     videos = pipeline.stage_encode(
                         conn, out_dir, encode_cfg, log,
-                        int(cfg.get("analyze", "workers", 0)), force=True)
+                        int(cfg.get("analyze", "workers", 0)), force=True,
+                        analyze_opts=opts)
                 trial.stages.append(timing.StageTiming(
                     "encode", aligned, encode_elapsed(),
                     max(0, projected_frames - aligned),

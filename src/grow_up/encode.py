@@ -17,17 +17,23 @@ across filters that opted in. x264 underneath is threaded but spends a morph
 starved, waiting on a filter that emits one frame at a time. More cores
 therefore means more ffmpeg processes, which is why `pipeline` runs the plain
 and annotated videos at once rather than one after the other.
+
+`face-morph` is the exception to all of that, because it is not a filter. Its
+in-between frames are made in Python by `morph`, across every core, and ffmpeg
+is handed them in the concat list like any other picture -- so here it is only
+timing: how many frames go between two photographs, and how long each is shown.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
 
-TRANSITIONS = ("none", "crossfade", "morph")
+TRANSITIONS = ("none", "crossfade", "morph", "face-morph")
 
 
 class FFmpegMissing(RuntimeError):
@@ -79,6 +85,51 @@ def moving_seconds(hold_fps: float, transition_seconds: float) -> float:
     """
     hold = 1.0 / float(hold_fps)
     return max(0.0, min(float(transition_seconds), hold))
+
+
+def face_morph_steps(hold_fps: float, playback_fps: float,
+                     transition_seconds: float) -> int:
+    """How many in-between frames face-morph makes for each pair of photographs.
+
+    The moving part of the slot in whole frames at the playback rate. Unlike
+    the ffmpeg transitions these frames are made one at a time, so the count is
+    decided up front. At least one frame of the photograph itself is always
+    left, as `minterpolate` leaves each source frame on screen: a slot that is
+    all movement would never show the picture it belongs to. A slot with no
+    room for an in-between at all is a hard cut.
+    """
+    slot = math.floor(float(playback_fps) / float(hold_fps) + 1e-9)
+    wanted = round(moving_seconds(hold_fps, transition_seconds) * float(playback_fps))
+    return max(0, min(int(wanted), slot - 1))
+
+
+def face_morph_entries(frames: list[Path], inbetweens: list[list[Path]],
+                       hold_fps: float, playback_fps: float) -> list[tuple[Path, float]]:
+    """The ffconcat entries for face-morph: each photograph held, then its in-betweens.
+
+    `inbetweens[i]` leads from photograph i to photograph i + 1, so there is one
+    list fewer than there are photographs. Every slot lasts exactly one hold:
+    the still part gives back what the in-betweens take. Rounding each slot to
+    whole frames instead would drift the picture against the footer, which
+    advances by the hold -- a frame every few photographs, and visibly by the
+    end. ffmpeg's output rate places the frames; the durations keep the
+    timeline exact.
+    """
+    if len(inbetweens) != max(0, len(frames) - 1):
+        raise ValueError(f"{len(frames)} photographs need {max(0, len(frames) - 1)} "
+                         f"lists of in-between frames, not {len(inbetweens)}")
+    hold = 1.0 / float(hold_fps)
+    step = 1.0 / float(playback_fps)
+    entries: list[tuple[Path, float]] = []
+    for index, frame in enumerate(frames):
+        between = inbetweens[index] if index < len(inbetweens) else []
+        still = hold - len(between) * step
+        if still <= 0:
+            raise ValueError(f"{len(between)} in-between frames do not fit a "
+                             f"{hold:g}s slot at {playback_fps:g} fps")
+        entries.append((frame, still))
+        entries.extend((path, step) for path in between)
+    return entries
 
 
 def concat_entries(frames: list[Path], hold_fps: float, transition: str,
@@ -162,7 +213,8 @@ def dissolve_bounds(fraction: float) -> tuple[int, int]:
 
 
 def footer_concat_offset(hold_fps: float, transition: str = "crossfade",
-                         transition_seconds: float = 0.0) -> float:
+                         transition_seconds: float = 0.0,
+                         playback_fps: float = 30.0) -> float:
     """How long the *first* footer holds, so switches land mid-transition.
 
     Photographs carry their own timestamps, which fall at the *end* of the
@@ -174,9 +226,14 @@ def footer_concat_offset(hold_fps: float, transition: str = "crossfade",
     Where that moment falls depends on the transition. A crossfade straddles the
     boundary, so it is the middle of the slot. A morph sits at the *end* of the
     slot -- a duplicated frame can only hold from the start of one -- so its
-    midpoint is half a morph before the boundary instead.
+    midpoint is half a morph before the boundary instead. face-morph sits there
+    too, and its midpoint is taken from the in-between frames it actually makes,
+    which are whole frames at the playback rate.
     """
     hold = 1.0 / float(hold_fps)
+    if transition == "face-morph":
+        steps = face_morph_steps(hold_fps, playback_fps, transition_seconds)
+        return hold - steps / float(playback_fps) / 2
     if transition == "morph":
         return hold - moving_seconds(hold_fps, transition_seconds) / 2
     return hold / 2
@@ -196,6 +253,12 @@ def transition_filters(transition: str, hold_fps: float, playback_fps: float,
             f"unknown transition {transition!r}; expected one of {TRANSITIONS}")
     if transition == "none":
         return [], float(hold_fps)
+
+    if transition == "face-morph":
+        # No filter: the in-between frames are already pictures in the list.
+        # The output still runs at the playback rate, or they would be dropped
+        # exactly as minterpolate's were before the rate was fixed.
+        return [], float(playback_fps)
 
     if transition == "morph":
         # scd=none for the same reason as scene=100 below. minterpolate carries
@@ -273,7 +336,8 @@ def encode(frames: list[Path], out_path: Path, fps: float = 10.0,
            codec: str = "libx264", crf: int = 18,
            interpolate: bool = False, transition: str = "none",
            playback_fps: float = 30.0, transition_seconds: float = 1.0,
-           overlays: list[Path] | None = None) -> Path:
+           overlays: list[Path] | None = None,
+           inbetweens: list[list[Path]] | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # `interpolate` predates `transition` and named the same idea, so it still
     # selects it. An explicit transition wins; only a config written before the
@@ -283,17 +347,24 @@ def encode(frames: list[Path], out_path: Path, fps: float = 10.0,
 
     filters, rate = transition_filters(transition, fps, playback_fps, transition_seconds)
 
+    if transition == "face-morph":
+        if inbetweens is None:
+            raise ValueError("face-morph needs its in-between frames; "
+                             "`pipeline.stage_encode` makes them")
+        entries = face_morph_entries(frames, inbetweens, fps, playback_fps)
+    else:
+        entries = concat_entries(frames, fps, transition, transition_seconds)
+
     stem = out_path.stem
-    list_path = write_entries(
-        concat_entries(frames, fps, transition, transition_seconds),
-        out_path.parent / f"{stem}.ffconcat")
+    list_path = write_entries(entries, out_path.parent / f"{stem}.ffconcat")
     overlay_list = None
     if overlays and transition != "none":
         # The footer is never doubled: it holds and switches, so one entry each
         # is right whatever the picture underneath is doing.
         overlay_list = write_concat_list(
             overlays, fps, out_path.parent / f"{stem}-footer.ffconcat",
-            first_duration=footer_concat_offset(fps, transition, transition_seconds))
+            first_duration=footer_concat_offset(fps, transition, transition_seconds,
+                                                playback_fps))
 
     cmd = build_command(list_path, out_path, fps, codec, crf, filters,
                         output_fps=rate, overlay_list=overlay_list)
