@@ -576,7 +576,7 @@ Everything heavy is native code, and the Python is glue:
 |---|---|
 | [Immich](https://immich.app) | the library itself, and the person tagging every stage builds on |
 | `mediapipe` | face landmarks, head pose and blendshapes |
-| `opencv-python` | affine warping, colour conversion, sharpness |
+| `opencv-contrib-python` | affine warping, colour conversion, sharpness, face-morph's triangulation; the same OpenCV `mediapipe` brings, so there is only one |
 | `numpy` | the transform maths and every metric |
 | `pillow` + `pillow-heif` | decoding, HEIC included |
 | `httpx` | the async Immich client |

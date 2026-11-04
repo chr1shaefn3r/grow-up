@@ -10,8 +10,12 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "numpy>=1.26",
-    "opencv-python>=4.9",
-	# 1.0.1 aborts building the face landmarker on macOS: its detection step
+    # contrib, because mediapipe depends on it. Declaring opencv-python as well
+    # installed two distributions into the same `cv2` folder: it works only
+    # while pip happens to choose the same version for both, and uninstalling
+    # either one deletes files the other still needs. Contrib is a superset.
+    "opencv-contrib-python>=4.9",
+    # 1.0.1 aborts building the face landmarker on macOS: its detection step
     # insists on a Metal service the CPU graph never provides, and a CPU delegate
     # does not avoid it. The pool reports only "terminated abruptly".
     "mediapipe>=0.10.14,<1.0",
