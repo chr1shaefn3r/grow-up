@@ -86,7 +86,7 @@ class TestQuietEnv:
         monkeypatch.delenv("GLOG_minloglevel", raising=False)
         seen: dict[str, str] = {}
 
-        def fake_build(opts):
+        def fake_build(opts, **_):
             seen.update(os.environ)
             return object()
 
@@ -97,14 +97,14 @@ class TestQuietEnv:
 
     def test_verbose_worker_leaves_the_environment_alone(self, monkeypatch):
         monkeypatch.delenv("GLOG_minloglevel", raising=False)
-        monkeypatch.setattr(analyze, "build_landmarker", lambda opts: object())
+        monkeypatch.setattr(analyze, "build_landmarker", lambda opts, **_: object())
 
         analyze.init_worker(analyze.AnalyzeOptions(verbose=True))
         assert "GLOG_minloglevel" not in os.environ
 
     def test_worker_pins_thread_counts(self, monkeypatch):
         monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
-        monkeypatch.setattr(analyze, "build_landmarker", lambda opts: object())
+        monkeypatch.setattr(analyze, "build_landmarker", lambda opts, **_: object())
 
         analyze.init_worker(analyze.AnalyzeOptions())
         assert os.environ["OMP_NUM_THREADS"] == "1"

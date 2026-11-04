@@ -56,15 +56,20 @@ BORDER_FRACTIONS = (
     (0.0, 1.0), (0.5, 1.0), (1.0, 1.0),
 )
 
-# How many faces the second look asks for. The subject plus a crowded
-# background; past this the subject would have to rank last to be missed.
-MAX_FACES = 6
-
 # How far, as a fraction of the distance between them, the eyes of the face
 # found may sit from where the subject's eyes are known to be. The same face
 # found again lands within a few pixels; anyone else's eyes are a whole face
 # away, so the margin can be generous without letting a stranger through.
 EYE_TOLERANCE = 0.25
+
+# Which version of this code made a face-morph video, recorded in its
+# fingerprint. A render is skipped when its inputs are unchanged, and for
+# face-morph this code is one of them: the frames it invents are part of the
+# picture. Without it, the run after a fix found the old video "already
+# rendered" and kept it -- which is how the fix for morphing a person in the
+# background never reached the video it was made for. Bump it whenever the
+# frames made from the same inputs change.
+REVISION = 2
 
 # What an in-between frame is saved at. The same as `align` writes the frames
 # themselves, so a still and the morph leaving it are not visibly different.
@@ -331,7 +336,7 @@ def landmarks_for(paths: Sequence[Path], opts,
         from . import analyze
 
         with analyze.suppress_native_output(not opts.verbose):
-            landmarker = analyze.build_landmarker(opts, num_faces=MAX_FACES)
+            landmarker = analyze.build_landmarker(opts, num_faces=analyze.MAX_FACES)
     except ImportError as exc:
         raise MorphUnavailable(
             f'transition = "face-morph" finds the face in every frame with the same '

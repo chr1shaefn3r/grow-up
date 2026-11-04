@@ -31,6 +31,17 @@ DEFAULT_MODEL_PATH = Path("models/face_landmarker.task")
 SHARPNESS_PATCH_WIDTH = 160
 
 _LANDMARKER = None
+
+# How many faces any look at a photograph asks for. The model returns them in
+# its own order, which is not by size and not by who was tagged -- a stranger in
+# the corner often comes first -- so every caller asks for several and chooses
+# the one it wants by where that face is. Six covers a subject in a crowd.
+MAX_FACES = 6
+
+# How far past Immich's box for the tagged face its eyes may sit and still be
+# that face, as a share of the box. Immich's detector and MediaPipe draw a face's
+# edges a little differently; a neighbour's eyes are a whole face away.
+TAGGED_BOX_SLACK = 0.2
 _OPTS: "AnalyzeOptions | None" = None
 
 
@@ -239,13 +250,13 @@ def init_worker(opts: AnalyzeOptions) -> None:
         pass
 
     with suppress_native_output(not opts.verbose):
-        _LANDMARKER = build_landmarker(opts)
+        _LANDMARKER = build_landmarker(opts, num_faces=MAX_FACES)
 
 
 def build_landmarker(opts: AnalyzeOptions, num_faces: int = 1):
-    """The landmarker. `analyze` asks for one face, inside Immich's box for the
-    tagged person; face-morph asks for several, because it looks at the whole
-    aligned frame and has to find the subject among whoever else is in it."""
+    """The landmarker. Both callers ask for `MAX_FACES` and choose among them:
+    asked for one, the model returns whichever it ranks first, and that is not
+    necessarily the person tagged in Immich."""
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision
 
@@ -398,13 +409,54 @@ def detect_all(landmarker, opts: AnalyzeOptions, bgr: np.ndarray,
     return looks
 
 
+def eyes_in_box(left_eye: np.ndarray, right_eye: np.ndarray,
+                box: tuple[int, int, int, int],
+                slack: float = TAGGED_BOX_SLACK) -> bool:
+    """Whether the point between these eyes lies in `box`, grown by `slack`.
+
+    The test for "this is the face that box was drawn around". Used to choose
+    among the faces one look finds, and by `align` to catch an analysis made
+    before that choice existed.
+    """
+    x1, y1, x2, y2 = (float(v) for v in box)
+    grow_x, grow_y = (x2 - x1) * slack, (y2 - y1) * slack
+    mx, my = (np.asarray(left_eye, dtype=np.float64)
+              + np.asarray(right_eye, dtype=np.float64)) / 2.0
+    return x1 - grow_x <= mx <= x2 + grow_x and y1 - grow_y <= my <= y2 + grow_y
+
+
+def pick_tagged(looks: list[Look], box: tuple[int, int, int, int]) -> Look | None:
+    """The face Immich tagged, among those one look found: the one whose eyes
+    are inside the tagged face's box, nearest its centre if several are.
+
+    None when only someone else was found. Taking whoever was there instead is
+    how a person behind the subject was analyzed, aligned and morphed as them:
+    the crop around Immich's box is grown for context, and context is exactly
+    where other people stand.
+    """
+    centre = np.array([(box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0])
+    best, best_distance = None, np.inf
+    for look in looks:
+        left, right = metrics.iris_centers(look.points)
+        if not eyes_in_box(left, right, box):
+            continue
+        distance = float(np.hypot(*((left + right) / 2.0 - centre)))
+        if distance < best_distance:
+            best, best_distance = look, distance
+    return best
+
+
 def gather_looks(landmarker, opts: AnalyzeOptions, bgr: np.ndarray,
                  box: tuple[int, int, int, int]) -> list[Look]:
-    """Walk the ladder until `ensemble` looks succeed, or it runs out."""
+    """Walk the ladder until `ensemble` looks of the tagged face succeed, or it runs out.
+
+    Every rung keeps only the face inside `box`, so an ensemble is never the
+    median of two different people.
+    """
     wanted = max(1, int(opts.ensemble))
     looks: list[Look] = []
     for attempt in attempt_ladder(opts):
-        look = detect_once(landmarker, opts, bgr, box, attempt)
+        look = pick_tagged(detect_all(landmarker, opts, bgr, box, attempt), box)
         if look is not None:
             looks.append(look)
             if len(looks) >= wanted:

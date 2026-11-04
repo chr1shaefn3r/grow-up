@@ -233,11 +233,14 @@ def selected_in_order(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT s.asset_id, s.bucket, s.rank, s.alternate, a.local_datetime, d.path,"
         "       m.left_eye_x, m.left_eye_y, m.right_eye_x, m.right_eye_y, m.score,"
-        "       m.span_w, m.span_up, m.span_down"
+        "       m.span_w, m.span_up, m.span_down,"
+        "       f.x1 AS face_x1, f.y1 AS face_y1, f.x2 AS face_x2, f.y2 AS face_y2,"
+        "       f.image_width AS face_width, f.image_height AS face_height"
         "  FROM selection s"
         "  JOIN assets a ON a.id = s.asset_id"
         "  JOIN metrics m ON m.asset_id = s.asset_id"
         "  JOIN downloads d ON d.asset_id = s.asset_id"
+        "  LEFT JOIN faces f ON f.asset_id = s.asset_id"
         " ORDER BY a.local_datetime ASC"
     ).fetchall()
 

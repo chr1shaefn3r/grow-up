@@ -1657,6 +1657,41 @@ class TestFaceMorphInTheStage:
         self.encode(stage)
         assert stage["landmarked"] == 1
 
+    def test_a_change_to_the_morph_code_renders_again(self, stage, monkeypatch):
+        """The frames are invented here, so this code is an input. Without it in
+        the digest, the run after the background-person fix found the old video
+        already rendered and kept it -- the fix never reached the video."""
+        from grow_up import morph
+
+        self.encode(stage)
+        monkeypatch.setattr(morph, "REVISION", morph.REVISION + 1)
+        self.encode(stage)
+        assert len(stage["renders"]) == 2
+
+    def test_other_transitions_are_not_re_rendered_by_it(self, stage, monkeypatch):
+        """Their frames come from ffmpeg, and their digests must stay exactly
+        what they were, or every crossfade would re-render on upgrade."""
+        from grow_up import morph
+
+        crossfade = {**self.CFG, "transition": "crossfade"}
+        self.encode(stage, crossfade)
+        monkeypatch.setattr(morph, "REVISION", morph.REVISION + 1)
+        self.encode(stage, crossfade)
+        assert len(stage["renders"]) == 1
+
+    def test_the_digest_of_a_crossfade_is_what_it_always_was(self, stage):
+        from grow_up import db
+        from grow_up.encode import fingerprint
+
+        crossfade = {**self.CFG, "transition": "crossfade"}
+        self.encode(stage, crossfade)
+        rows = stage["conn"].execute(
+            "SELECT f.asset_id, f.path, f.warped_at FROM frames f ORDER BY f.seq").fetchall()
+        settings = dict(fps=0.5, codec="libx264", crf=18, interpolate=False,
+                        transition="crossfade", playback_fps=30.0, transition_seconds=0.1)
+        expected = fingerprint([tuple(r) for r in rows], settings)
+        assert db.render_fingerprint(stage["conn"], stage["out"] / "timelapse.mp4") == expected
+
     def test_switching_from_crossfade_renders_again(self, stage):
         self.encode(stage, {**self.CFG, "transition": "crossfade"})
         self.encode(stage)

@@ -18,9 +18,9 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-from . import align, analyze, annotate, config, db, images, review, select, timing
+from . import align, analyze, annotate, config, db, images, morph, review, select, timing
 from .encode import encode, face_morph_steps, fingerprint, moving_seconds
-from .immich import ImmichClient, pick_face
+from .immich import AspectMismatch, Face, ImmichClient, pick_face, scale_bbox
 from .progress import Progress
 
 Log = Callable[[str], None]
@@ -553,10 +553,13 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
     smoothed = [align.decompose_affine(m) for m in matrices]
 
     workers = workers or max(4, analyze.physical_cores())
+    strays: list[sqlite3.Row] = []
 
     def one(index_row_param: tuple[int, sqlite3.Row, align.TransformParams]) -> tuple:
         seq, row, p = index_row_param
         bgr = images.load_bgr(row["path"])
+        if not _analyzed_the_tagged_face(row, bgr.shape[1], bgr.shape[0]):
+            strays.append(row)
         warped = align.warp(bgr, align.build_affine(p), width, height, fill=fill)
         out_path = frames_dir / f"{row['asset_id']}.jpg"
         cv2.imwrite(str(out_path), warped, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
@@ -590,7 +593,39 @@ def stage_align(conn: sqlite3.Connection, frames_dir: Path, output: dict,
 
     _remove_superseded(previous, [r[1] for r in results], frames_dir)
     log(f"  align: wrote {len(results)} frames to {frames_dir}")
+    if strays:
+        dates = sorted((r["local_datetime"] or r["asset_id"])[:10] for r in strays)
+        shown = ", ".join(dates[:8]) + (" and more" if len(dates) > 8 else "")
+        log(f"  ! align: {len(strays)} photo(s) were analyzed on someone other than the "
+            f"person tagged in Immich, so their frames are centred on that other "
+            f"person: {shown}")
+        log("    They predate analyze choosing the tagged face. Run "
+            "`grow-up analyze --reanalyze`, then "
+            "`grow-up select && grow-up align && grow-up encode`.")
     return len(results)
+
+
+def _analyzed_the_tagged_face(row: sqlite3.Row, width: int, height: int) -> bool:
+    """Whether the eyes `analyze` stored are inside Immich's box for the tagged face.
+
+    `analyze` now only keeps a face inside that box, but its results are kept
+    from run to run, and one made before could have taken whoever its crop held
+    -- a person behind the subject, centred and morphed as them. `align` reads
+    every selected photo anyway, which makes this check free here. A row with
+    no box to compare against is given the benefit of the doubt.
+    """
+    keys = ("face_x1", "face_y1", "face_x2", "face_y2", "face_width", "face_height")
+    if any(k not in row.keys() or row[k] is None for k in keys):
+        return True
+    try:
+        box = scale_bbox(Face(x1=row["face_x1"], y1=row["face_y1"], x2=row["face_x2"],
+                              y2=row["face_y2"], image_width=row["face_width"],
+                              image_height=row["face_height"], source_type=None),
+                         width, height)
+    except AspectMismatch:
+        return True
+    return analyze.eyes_in_box(np.array([row["left_eye_x"], row["left_eye_y"]]),
+                               np.array([row["right_eye_x"], row["right_eye_y"]]), box)
 
 
 def _remove_superseded(previous: Iterable[str], current: Iterable[str],
@@ -714,7 +749,12 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
         log(f"  encode: skipped {path} -- same frames and settings as last time")
 
     plain_out = out_dir / filename
-    plain_print = fingerprint(inputs, settings)
+    # face-morph's frames are made by code here, not by ffmpeg, so which
+    # version of it ran is an input too. Nothing for the other transitions,
+    # whose digests -- and so whose skips -- stay exactly what they were.
+    made_by = ({"face_morph": morph.REVISION}
+               if _resolved_transition(settings) == "face-morph" else {})
+    plain_print = fingerprint(inputs, settings, made_by or None)
     if not force and _already_rendered(conn, plain_out, plain_print):
         skip(plain_out)
     else:
@@ -731,6 +771,7 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
         annotated_print = fingerprint(inputs, settings, {
             "footer": asdict(footer), "birth": db.birth_date(conn),
             "dates": [r["local_datetime"] for r in kept], "layers": moving,
+            **made_by,
         })
         if not force and _already_rendered(conn, annotated_out, annotated_print):
             skip(annotated_out)
@@ -816,8 +857,6 @@ def _face_morph_inbetweens(conn: sqlite3.Connection, rows: list, settings: dict,
     dissolves stored as face-morph would be kept by every later run, so that
     stops the encode instead.
     """
-    from . import morph
-
     frames = [Path(r["path"]) for r in rows]
     count = face_morph_steps(settings["fps"], settings["playback_fps"],
                              settings["transition_seconds"])
