@@ -11,7 +11,10 @@ dependencies = [
     "httpx>=0.27",
     "numpy>=1.26",
     "opencv-python>=4.9",
-    "mediapipe>=0.10.14",
+	# 1.0.1 aborts building the face landmarker on macOS: its detection step
+    # insists on a Metal service the CPU graph never provides, and a CPU delegate
+    # does not avoid it. The pool reports only "terminated abruptly".
+    "mediapipe>=0.10.14,<1.0",
     "pillow>=10.2",
     "pillow-heif>=0.16",
 ]
