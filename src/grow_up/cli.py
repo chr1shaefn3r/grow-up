@@ -239,10 +239,13 @@ async def _index(cfg, conn, person_id: str, since: str | None, full: bool,
             stored_count = state.person_assets if state else None
 
             if not watermark.is_full and pipeline.detect_drift(stored_count, current_count, new):
+                why = ("The person was likely tagged in older photos"
+                       if current_count - stored_count > new else
+                       "The person was likely untagged from photos, or photos were deleted")
                 log(
                     f"  drift detected: Immich reports {current_count} assets for this person "
-                    f"(was {stored_count}) but the incremental window only found {new} new. "
-                    "The person was likely tagged in older photos — re-indexing in full."
+                    f"(was {stored_count}) but the incremental window found {new} new. "
+                    f"{why} — re-indexing in full."
                 )
                 _, new = await pipeline.stage_index(
                     client, conn, person_id, pipeline.Watermark(None, "full: drift detected"),
@@ -745,6 +748,11 @@ def cmd_status(args: argparse.Namespace) -> None:
     for table in ("assets", "faces", "downloads", "metrics", "selection", "frames"):
         n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         log(f"  {table:<12} {n:>7}")
+
+    requeued = conn.execute("SELECT count(*) FROM faces WHERE stale = 1").fetchone()[0]
+    if requeued:
+        log(f"  {'(re-check)':<12} {requeued:>7}  face boxes the person search "
+            "contradicts; the next `grow-up faces` looks them up again")
 
     # Describes the same stored rows as the counts above, so it belongs with
     # them rather than after the sync bookkeeping.

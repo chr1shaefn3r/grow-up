@@ -301,7 +301,7 @@ grow-up run --since 2026-01-01T00:00:00Z # override
 grow-up run --full                       # ignore the watermark entirely
 ```
 
-Four details in there are load-bearing:
+Five details in there are load-bearing:
 
 - **It filters on `updatedAfter`, not `takenAfter`.** Photos imported later but *taken*
   earlier — a backup restore, a phone offline for a month, scans of old photos — would
@@ -312,8 +312,18 @@ Four details in there are load-bearing:
   which costs nothing. A crash leaves the old watermark in place.
 - **It detects the case `updatedAfter` cannot see.** Tagging someone in an *old* photo need
   not bump that asset's `updatedAt`. So the person's asset count from
-  `/people/{id}/statistics` is stored alongside the watermark; if it climbs by more than
-  the incremental query found, `grow-up` re-indexes in full and says why.
+  `/people/{id}/statistics` is stored alongside the watermark. If it moved by anything
+  other than what the incremental query found (more, because older photos were tagged;
+  less, because photos were untagged or deleted), `grow-up` re-indexes in full and says
+  why.
+- **Tagging changes reach photos it already knows.** Tag the subject in a photo an
+  earlier run already holds, or correct which face is theirs, and there is no new photo
+  and no new timestamp to notice. The person search returning it is the only sign, so
+  `index` queues its face box to be looked up again. If the box changed, the photo is
+  measured again rather than kept on numbers taken around somebody else's face. A full
+  index also reads what the search leaves out: a photo the subject is no longer tagged
+  in, or one indexed while the run was pointed at the wrong person, leaves the video.
+  `grow-up status` counts what is waiting to be looked up again.
 - **The watermark constrains indexing only.** Selection, alignment and encoding always
   span the whole corpus. (Threading `--since` further would yield a timelapse of only
   the last week — a failure that produces a plausible-looking video, so

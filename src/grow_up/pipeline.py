@@ -101,7 +101,7 @@ def resolve_watermark(conn: sqlite3.Connection, person_id: str, since: str | Non
 
 def detect_drift(stored_count: int | None, current_count: int | None,
                  newly_indexed: int) -> bool:
-    """True when the incremental window provably missed assets.
+    """True when the incremental window provably missed a change.
 
     Tagging a person in an *old* photo need not bump that asset's `updatedAt` --
     Immich writes the association to the face and person tables -- so an
@@ -110,25 +110,45 @@ def detect_drift(stored_count: int | None, current_count: int | None,
     check immune to the constant offset from videos and trashed assets, which
     the count includes but this image-only pipeline does not.
 
-    A video newly tagged with the person can trigger a false positive here. That costs
-    one unnecessary full re-index, which is the right way round to be wrong.
+    A count that grew by less than what was indexed is a change too: a photo
+    untagged or deleted. Only a full listing can say which, and acting on what
+    it leaves out is what takes that photo out of the video -- without this, an
+    untagging waited for somebody to think of `--full`.
+
+    A video newly tagged or untagged can trigger a false positive here. That
+    costs one unnecessary full re-index, seconds and no downloads, which is the
+    right way round to be wrong.
     """
     if stored_count is None or current_count is None:
         return False
-    return (current_count - stored_count) > newly_indexed
+    return (current_count - stored_count) != newly_indexed
 
 
 async def stage_index(client: ImmichClient, conn: sqlite3.Connection, person_id: str,
                       watermark: Watermark, page_size: int, log: Log,
                       source: str = config.LEGACY_SOURCE_NAME) -> tuple[int, int]:
-    """Index assets, returning (seen, newly_added)."""
+    """Index assets, returning (seen, newly_added).
+
+    An asset already in the manifest can still be news. Tagging the subject in
+    a photo some earlier index pulled in -- before their face was looked up, or
+    while the account was pointed at somebody else -- moves neither the id nor
+    `updatedAt`, so the search returning it is the only sign. Its stored face
+    verdict is requeued for `faces` to look up again. A full index also reads
+    the listing the other way: a photo it leaves out is no longer the subject's,
+    and its face box and measurements are withdrawn.
+    """
     known = {row[0] for row in conn.execute("SELECT id FROM assets")}
-    seen = new = 0
+    seen = new = requeued = 0
+    # Only a full index enumerates the person completely, and only a complete
+    # enumeration says anything about what it leaves out.
+    listed: set[str] | None = set() if watermark.is_full else None
 
     async for item in client.search_assets(person_id, watermark.value, page_size):
         seen += 1
         if item["id"] not in known:
             new += 1
+        if listed is not None:
+            listed.add(item["id"])
         exif = item.get("exifInfo") or {}
         db.upsert_asset(conn, {
             "id": item["id"],
@@ -141,10 +161,19 @@ async def stage_index(client: ImmichClient, conn: sqlite3.Connection, person_id:
             "original_file_name": item.get("originalFileName"),
             "source": source,
         })
+        requeued += db.mark_face_stale(conn, item["id"], person_id)
         if seen % 500 == 0:
             log(f"  index: {seen} assets so far…")
 
     log(f"  index: {seen} assets ({new} new)")
+    if requeued:
+        log(f"  index: {requeued} already-indexed photo(s) the person is now tagged in "
+            "had no face box for them; queued to be looked up again")
+    if listed is not None:
+        withdrawn = db.withdraw_absent_faces(conn, person_id, source, listed)
+        if withdrawn:
+            log(f"  index: {len(withdrawn)} photo(s) are no longer tagged with this "
+                "person in Immich; taken out of the video, with their measurements")
     return seen, new
 
 
@@ -190,8 +219,8 @@ def eventual_workload(conn: sqlite3.Connection) -> dict[str, int]:
         return int(conn.execute(sql).fetchone()[0])
 
     total = scalar("SELECT count(*) FROM assets")
-    checked = scalar("SELECT count(*) FROM faces")
-    usable = scalar("SELECT count(*) FROM faces WHERE status = 'ok'")
+    checked = scalar("SELECT count(*) FROM faces WHERE stale = 0")
+    usable = scalar("SELECT count(*) FROM faces WHERE status = 'ok' AND stale = 0")
     downloaded = scalar("SELECT count(*) FROM downloads")
     analyzed = scalar("SELECT count(*) FROM metrics")
 
@@ -222,7 +251,7 @@ def pending_counts(conn: sqlite3.Connection,
     return {
         "faces": count(
             "SELECT count(*) FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"
-            " WHERE f.asset_id IS NULL"),
+            " WHERE (f.asset_id IS NULL OR f.stale = 1)"),
         "fetch": count(
             "SELECT count(*) FROM assets a"
             "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
@@ -230,7 +259,7 @@ def pending_counts(conn: sqlite3.Connection,
             " WHERE d.asset_id IS NULL"),
         "analyze": count(
             "SELECT count(*) FROM assets a"
-            "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
+            "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok' AND f.stale = 0"
             "  JOIN downloads d ON d.asset_id = a.id"
             "  LEFT JOIN metrics m ON m.asset_id = a.id"
             " WHERE m.asset_id IS NULL"),
@@ -274,18 +303,32 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
                       log: Log, concurrency: int = 16,
                       limit: int | None = None, source: str | None = None,
                       label: str = "faces") -> tuple[int, int]:
-    """Fetch the subject's face box per asset. Immich associates it, so no recognition."""
+    """Fetch the subject's face box per asset. Immich associates it, so no recognition.
+
+    Looks up assets with no verdict yet, and those `index` requeued because the
+    person search contradicted their verdict. A requeued asset brings its old
+    box along: if the new one differs, the measurements taken around the old
+    one are dropped, or `analyze` -- which skips anything already measured --
+    would keep numbers about somebody else's face, and `select` would use them.
+    """
     where, params = _source_clause(source)
-    pending = [row[0] for row in conn.execute(
-        "SELECT a.id FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"
-        " WHERE f.asset_id IS NULL" + where + _limit_clause(limit), params
-    )]
+    pending = conn.execute(
+        "SELECT a.id, f.status AS was_status, f.x1 AS was_x1, f.y1 AS was_y1,"
+        "       f.x2 AS was_x2, f.y2 AS was_y2"
+        "  FROM assets a LEFT JOIN faces f ON f.asset_id = a.id"
+        " WHERE (f.asset_id IS NULL OR f.stale = 1)" + where + _limit_clause(limit),
+        params,
+    ).fetchall()
     if not pending:
         log("  faces: nothing new to look up")
         return 0, 0
 
+    rechecks = sum(1 for row in pending if row["was_status"] is not None)
+    if rechecks:
+        log(f"  faces: {rechecks} of {len(pending)} are looked up again, because the "
+            "person search contradicts what was stored")
     sem = asyncio.Semaphore(concurrency)
-    ok = missing = 0
+    ok = missing = remeasure = 0
     errors: list[str] = []
     lock = asyncio.Lock()
     # `pending` is capped by --limit; the summary should still report position
@@ -295,17 +338,18 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
     bar = Progress(label, len(pending), emit=log,
                    overall=total_assets, already_done=total_assets - outstanding)
 
-    async def one(asset_id: str) -> None:
-        nonlocal ok, missing
+    async def one(row: sqlite3.Row) -> None:
+        nonlocal ok, missing, remeasure
+        asset_id = row["id"]
         async with sem:
             try:
                 faces = await client.faces_for_asset(asset_id)
             except Exception as exc:  # noqa: BLE001 - one bad asset must not stop the stage
                 async with lock:
                     conn.execute(
-                        "INSERT OR REPLACE INTO faces (asset_id, status, n_candidates, fetched_at)"
-                        " VALUES (?, 'error', 0, ?)",
-                        (asset_id, db.iso_z(db.now_utc())),
+                        "INSERT OR REPLACE INTO faces (asset_id, status, person_id, stale,"
+                        " n_candidates, fetched_at) VALUES (?, 'error', ?, 0, 0, ?)",
+                        (asset_id, person_id, db.iso_z(db.now_utc())),
                     )
                     missing += 1
                     errors.append(str(exc))
@@ -317,27 +361,53 @@ async def stage_faces(client: ImmichClient, conn: sqlite3.Connection, person_id:
         async with lock:
             if face is None:
                 conn.execute(
-                    "INSERT OR REPLACE INTO faces (asset_id, status, n_candidates, fetched_at)"
-                    " VALUES (?, 'no_face', 0, ?)",
-                    (asset_id, db.iso_z(db.now_utc())),
+                    "INSERT OR REPLACE INTO faces (asset_id, status, person_id, stale,"
+                    " n_candidates, fetched_at) VALUES (?, 'no_face', ?, 0, 0, ?)",
+                    (asset_id, person_id, db.iso_z(db.now_utc())),
                 )
                 missing += 1
             else:
                 conn.execute(
                     "INSERT OR REPLACE INTO faces (asset_id, status, x1, y1, x2, y2,"
-                    " image_width, image_height, source_type, n_candidates, fetched_at)"
-                    " VALUES (?, 'ok', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " image_width, image_height, source_type, person_id, stale,"
+                    " n_candidates, fetched_at)"
+                    " VALUES (?, 'ok', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                     (asset_id, face.x1, face.y1, face.x2, face.y2, face.image_width,
-                     face.image_height, face.source_type, n, db.iso_z(db.now_utc())),
+                     face.image_height, face.source_type, person_id, n,
+                     db.iso_z(db.now_utc())),
                 )
                 ok += 1
+            remeasure += int(_discard_superseded_metrics(conn, row, face))
         bar.advance()
 
-    await asyncio.gather(*(one(a) for a in pending))
+    await asyncio.gather(*(one(row) for row in pending))
     bar.close()
     log(f"  faces: {ok} found, {missing} without a usable detection")
+    if remeasure:
+        log(f"  faces: {remeasure} photo(s) now have a different face box, so their "
+            "measurements were dropped and `analyze` takes them again")
     _abort_if_hopeless("face lookup", ok, errors, len(pending))
     return ok, missing
+
+
+def _discard_superseded_metrics(conn: sqlite3.Connection, before: sqlite3.Row,
+                                after) -> bool:
+    """Drop the measurements taken around a face box that has just changed.
+
+    Nothing is dropped when the box comes back the same, which is the usual
+    outcome of a re-check and keeps re-tagging from costing a re-analysis of the
+    library. Returns whether anything was dropped.
+    """
+    if before["was_status"] is None:
+        return False
+    was = (before["was_status"], before["was_x1"], before["was_y1"],
+           before["was_x2"], before["was_y2"])
+    now = (("ok", after.x1, after.y1, after.x2, after.y2) if after is not None
+           else ("no_face", None, None, None, None))
+    if was == now:
+        return False
+    cur = conn.execute("DELETE FROM metrics WHERE asset_id = ?", (before["id"],))
+    return bool(cur.rowcount)
 
 
 async def stage_fetch(client: ImmichClient, conn: sqlite3.Connection, cache_dir: Path,
@@ -408,13 +478,18 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
                   log: Log, reanalyze: bool = False, limit: int | None = None,
                   persist: bool = True,
                   collect: list[tuple[str, object]] | None = None) -> int:
-    """Landmark every downloaded face and store its metrics."""
+    """Landmark every downloaded face and store its metrics.
+
+    A box waiting to be looked up again is left alone: the person search has
+    already contradicted it, so measuring around it only earns the work of
+    measuring again.
+    """
     where = "" if reanalyze else " LEFT JOIN metrics m ON m.asset_id = a.id WHERE m.asset_id IS NULL"
     rows = conn.execute(
         "SELECT a.id, d.path, f.x1, f.y1, f.x2, f.y2, f.image_width, f.image_height,"
         "       f.source_type"
         "  FROM assets a"
-        "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok'"
+        "  JOIN faces f ON f.asset_id = a.id AND f.status = 'ok' AND f.stale = 0"
         "  JOIN downloads d ON d.asset_id = a.id"
         f"{where}" + _limit_clause(limit)
     ).fetchall()
@@ -446,7 +521,8 @@ def stage_analyze(conn: sqlite3.Connection, opts: analyze.AnalyzeOptions, worker
     stamp = db.iso_z(db.now_utc())
     analyzable = conn.execute(
         "SELECT count(*) FROM downloads d"
-        "  JOIN faces f ON f.asset_id = d.asset_id AND f.status = 'ok'").fetchone()[0]
+        "  JOIN faces f ON f.asset_id = d.asset_id AND f.status = 'ok'"
+        "   AND f.stale = 0").fetchone()[0]
     outstanding = pending_counts(conn)["analyze"]
     bar = Progress("analyze", len(jobs), emit=log,
                    overall=analyzable, already_done=analyzable - outstanding)

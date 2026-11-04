@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS faces (
     image_width  INTEGER,
     image_height INTEGER,
     source_type  TEXT,
+    person_id    TEXT,                   -- whose face this row is a verdict about;
+                                         -- a box means nothing without it
+    stale        INTEGER NOT NULL DEFAULT 0,  -- the person search has since
+                                              -- contradicted this verdict
     n_candidates INTEGER NOT NULL DEFAULT 0,
     fetched_at   TEXT NOT NULL
 );
@@ -188,6 +192,7 @@ ADDED_COLUMNS = {
                 ("filtered_at", "TEXT")),
     "assets": (("source", "TEXT"),),
     "selection": (("alternate", "INTEGER NOT NULL DEFAULT 0"), ("bucket_size", "INTEGER")),
+    "faces": (("person_id", "TEXT"), ("stale", "INTEGER NOT NULL DEFAULT 0")),
 }
 
 
@@ -200,7 +205,42 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
             if name not in present:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
                 added.append(f"{table}.{name}")
+    if "faces.person_id" in added:
+        attribute_existing_faces(conn)
     return added
+
+
+def attribute_existing_faces(conn: sqlite3.Connection) -> int:
+    """Name the person face rows written before `faces.person_id` existed are about.
+
+    Safe only where an account has ever known one person: every row from its
+    assets was then looked up for them. An account that has known two -- which
+    happens as soon as a name lookup lands on the wrong person once -- could have
+    a box from either, so its rows stay unattributed, and `index` re-checks them
+    rather than let the video align on somebody else's face. Returns how many
+    rows were attributed.
+    """
+    people = conn.execute("SELECT person_id, source FROM people").fetchall()
+    if len(people) == 1:
+        # One person ever: every row is theirs, whatever account it is filed
+        # under -- including rows whose asset predates `assets.source`.
+        cur = conn.execute("UPDATE faces SET person_id = ? WHERE person_id IS NULL",
+                           (people[0]["person_id"],))
+        return int(cur.rowcount or 0)
+    by_source: dict[str, list[str]] = {}
+    for row in people:
+        if row["source"] is not None:
+            by_source.setdefault(row["source"], []).append(row["person_id"])
+    attributed = 0
+    for source, ids in by_source.items():
+        if len(ids) != 1:
+            continue
+        cur = conn.execute(
+            "UPDATE faces SET person_id = ? WHERE person_id IS NULL"
+            "   AND asset_id IN (SELECT id FROM assets WHERE source = ?)",
+            (ids[0], source))
+        attributed += int(cur.rowcount or 0)
+    return attributed
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -287,6 +327,70 @@ def upsert_asset(conn: sqlite3.Connection, asset: dict) -> None:
         "   indexed_at = excluded.indexed_at",
         {"source": None, **asset, "indexed_at": iso_z(now_utc())},
     )
+
+
+def mark_face_stale(conn: sqlite3.Connection, asset_id: str, person_id: str) -> int:
+    """Queue a stored face verdict the person search has just contradicted. Returns 0 or 1.
+
+    An asset coming back from a search for person P is Immich saying P is
+    tagged in it *now*, which is newer than anything stored. So a `no_face` or
+    `error` row predates the tagging, and a box attributed to someone else -- or
+    to nobody, where the manifest could not tell whose it was -- is not P's.
+    Only an `ok` row already attributed to P is left alone.
+
+    Without this, tagging the subject in a photo the manifest already holds
+    reaches nothing: `index` reports no new asset because it knows the id, and
+    `faces` skips it because a row exists. Re-assigning a face moves neither
+    the id nor `updatedAt`, so the search returning the asset is the only
+    evidence there is.
+    """
+    cur = conn.execute(
+        "UPDATE faces SET stale = 1"
+        " WHERE asset_id = ? AND stale = 0"
+        "   AND (status != 'ok' OR person_id IS NULL OR person_id != ?)",
+        (asset_id, person_id),
+    )
+    return int(cur.rowcount or 0)
+
+
+def withdraw_absent_faces(conn: sqlite3.Connection, person_id: str,
+                          source: str | None, listed: set[str]) -> list[str]:
+    """Retire the face boxes a *complete* search for the person did not return.
+
+    The other side of `mark_face_stale`, on the same authority: a full listing
+    of P's photos settles what it leaves out as well as what it includes. A box
+    on an asset P is no longer tagged in -- untagged, deleted, or indexed while
+    the account was pointed at somebody else -- is not P's face, and kept, it
+    stays in the video with nothing on screen to say why.
+
+    Scoped to one account, which is all the search covered, and only ever
+    called after a full index that paginated to the end. Kept as a settled
+    `no_face` rather than deleted, so the next `faces` does not ask Immich a
+    question the listing has already answered. The metrics go too: `select`
+    reads them without consulting `faces`, so leaving them leaves the frame.
+    Returns the withdrawn asset ids.
+    """
+    if not listed:
+        # Far likelier a wrong person id than a library-wide untagging.
+        return []
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _listed (asset_id TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _listed")
+    conn.executemany("INSERT OR IGNORE INTO _listed (asset_id) VALUES (?)",
+                     [(asset_id,) for asset_id in listed])
+    absent = [row["asset_id"] for row in conn.execute(
+        "SELECT f.asset_id FROM faces f JOIN assets a ON a.id = f.asset_id"
+        " WHERE a.source IS ? AND f.status = 'ok'"
+        "   AND f.asset_id NOT IN (SELECT asset_id FROM _listed)",
+        (source,))]
+    conn.execute("DELETE FROM _listed")
+    stamp = iso_z(now_utc())
+    conn.executemany(
+        "UPDATE faces SET status = 'no_face', x1 = NULL, y1 = NULL, x2 = NULL,"
+        "   y2 = NULL, image_width = NULL, image_height = NULL, source_type = NULL,"
+        "   person_id = ?, stale = 0, n_candidates = 0, fetched_at = ?"
+        " WHERE asset_id = ?", [(person_id, stamp, a) for a in absent])
+    conn.executemany("DELETE FROM metrics WHERE asset_id = ?", [(a,) for a in absent])
+    return absent
 
 
 def adopt_unsourced(conn: sqlite3.Connection, source: str) -> int:

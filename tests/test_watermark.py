@@ -123,8 +123,15 @@ class TestDriftDetection:
     def test_no_drift_when_nothing_changed(self):
         assert not pipeline.detect_drift(stored_count=100, current_count=100, newly_indexed=0)
 
-    def test_no_drift_when_assets_were_removed(self):
-        assert not pipeline.detect_drift(stored_count=100, current_count=95, newly_indexed=0)
+    def test_a_count_that_fell_calls_for_a_full_listing(self):
+        """Untagged or deleted. Only a full listing can say which photos, and
+        acting on what it leaves out is what takes them out of the video. This
+        used to be "no drift", when nothing acted on the omissions anyway."""
+        assert pipeline.detect_drift(stored_count=100, current_count=95, newly_indexed=0)
+
+    def test_a_count_that_grew_by_less_than_was_indexed_is_drift_too(self):
+        """Three new photos and one untagged: up by two, not three."""
+        assert pipeline.detect_drift(stored_count=100, current_count=102, newly_indexed=3)
 
     def test_constant_offset_from_videos_cancels_out(self):
         # The person count includes videos this image-only pipeline skips.
