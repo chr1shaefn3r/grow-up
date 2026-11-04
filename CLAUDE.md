@@ -93,6 +93,7 @@ specifically to avoid. They all look like improvements.
 | Give the `birthday-months` bucket a label computed its own way | `months_between` decides which bucket a photo lands in; `birthday_month_start` only names it, and must be its exact inverse. Any other rule — `birth.replace(month=…)`, clamping the day, formatting the age — drifts from the grouping it claims to describe, and two buckets sharing a name means one month of the timelapse silently swallows another. The awkward input is a birthday on the 31st: February contains no such date, so the month does not open until March does. | `test_the_label_is_the_exact_inverse_of_the_grouping`, `test_a_birthday_on_the_31st_waits_for_a_month_that_has_one` (`tests/test_select.py`) |
 | Take month names or number grouping from the stdlib `locale` module | It depends on which locales the host has generated, so the same config renders a different video on a Mac and on a Linux desktop. `annotate.LANGUAGES` is a table for that reason, and because `mois` is invariable in French — a rule with an `s` on the end is wrong. | `TestLanguages` (`tests/test_annotate.py`) |
 | Draw into an extra screen's window from the sheet, or let that window decide anything | Over `file://` Chrome gives every load of a page an origin of its own. A blank window the sheet opened and drew into keeps the *old* load's origin, so after the reload that follows `select && align` the sheet may no longer touch it. Navigating it to a fresh `about:blank` does not help. This was built first and only a browser run caught it. The windows show `contact-sheet-screen.html` and talk to the sheet by `postMessage`. They say `ready` every second, because a message posted while the sheet unloads did not arrive. They hold no rejections and apply no rule, so nothing can drift. | `tests/test_screens_browser.py` (Chromium via Playwright; skips without it, so not in CI), `TestEveryScreenChoosesTheSameWay` (`tests/test_tuner.py`), `test_the_screen_page_decides_nothing` (`tests/test_review.py`) |
+| Take whichever face the landmarker returns on a second look at an aligned frame | `analyze` landmarks inside Immich's box for the tagged face. A second look at the whole aligned frame sees everyone in it, and with `num_faces=1` MediaPipe returns whichever face it ranks first, which is not the largest. This shipped: on a correctly tagged photograph, face-morph morphed a person in the background as the subject. It now asks for every face and keeps the one whose irises sit where `align` put the subject's: the eyes `analyze` found, through the transform stored in `frames`, not `[align]` from config. If no face is there, the frame dissolves. | `TestOnlyTheSubjectIsMorphed`, `TestTheSecondLookAsksForEveryFace` (`tests/test_morph.py`), `test_the_landmarker_is_told_where_the_subjects_eyes_are` (`tests/test_encode.py`) |
 | Reuse an in-between frame that is already on disk | face-morph writes thousands of them per render. The fork it came from named them by place (`morph-000123.jpg`) and kept any that existed, which is the frame-naming trap again: a render that failed part-way, or ran before the selection changed, leaves morphs between two other photographs, and they look plausible. They are named after their two photographs, the directory is emptied before every render, and deleted after it, failed or not. | `test_nothing_left_by_an_earlier_run_survives` (`tests/test_morph.py`), `test_they_are_thrown_away_when_the_render_fails_too` (`tests/test_encode.py`) |
 | Fall back to another transition when face-morph cannot run | The render is fingerprinted as face-morph, so a fallback video of hard cuts or dissolves is kept as the finished face-morph by every later run. A missing landmarker, or no face in any frame, stops the encode. One frame with no face found dissolves only its two pairs, deterministically, and is named by date. | `test_no_face_in_any_frame_stops_rather_than_storing_dissolves`, `test_without_its_in_betweens_it_refuses` (`tests/test_encode.py`) |
 | Round a face-morph slot to whole frames | The footer advances by exactly one hold per photograph. A slot rounded to whole playback frames drifts against it by a fraction of a frame per photograph, which is a frame every few photographs at `fps = 0.7` and a visibly wrong date by the end. The in-betweens are whole frames; the still part takes up the remainder. | `test_every_slot_lasts_exactly_one_hold` (`tests/test_encode.py`) |
@@ -135,7 +136,7 @@ pip install pillow                   # unlocks the footer-drawing tests
 # node that can require('playwright')  # unlocks the multi-screen browser test
 ```
 
-With none of them, 165 tests skip and the rest still assert everything that matters.
+With none of them, 168 tests skip and the rest still assert everything that matters.
 
 **You cannot verify anything on the owner's library.** There is no Immich instance and
 no credentials will be shared, so no change to landmarking, framing or filtering has
@@ -197,8 +198,10 @@ Hand these to the human running a real library:
     should change shape smoothly, with one set of eyes and one mouth throughout and the
     footer switching mid-morph. A face that tears or folds near the edge of the frame
     means landmarks fell outside it. Every pair dissolving instead of morphing means the
-    landmarker found no face in the aligned frames. It has run on two MediaPipe test
-    portraits, never on a child's photographs months apart.
+    landmarker found no face in the aligned frames. In a photo with someone else in it,
+    the morph must follow the subject while the other person only dissolves. It has run
+    on two MediaPipe test portraits, one of them with the other pasted in as a stranger,
+    never on a child's photographs months apart.
 
 ## Releasing
 

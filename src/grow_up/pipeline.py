@@ -752,7 +752,8 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
         with timing.stopwatch() as stage_elapsed:
             if _resolved_transition(settings) == "face-morph":
                 inbetweens, morph_dir = _face_morph_inbetweens(
-                    kept, settings, analyze_opts or analyze.AnalyzeOptions(), workers, log)
+                    conn, kept, settings, analyze_opts or analyze.AnalyzeOptions(),
+                    workers, log)
                 for _, _, extra, _ in renders:
                     extra["inbetweens"] = inbetweens
             results = _run_renders([r[:3] for r in renders], settings, workers, log)
@@ -776,16 +777,44 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     return [path for path, _ in results]
 
 
-def _face_morph_inbetweens(rows: list, settings: dict, opts: analyze.AnalyzeOptions,
-                           workers: int, log: Log) -> tuple[list[list[Path]], Path]:
+def _subject_eyes(conn: sqlite3.Connection,
+                  rows: list) -> list[tuple[np.ndarray, np.ndarray] | None]:
+    """Where the subject's irises are in each of these aligned frames.
+
+    The eyes `analyze` found -- inside Immich's box for the tagged face --
+    carried through the transform `align` stored for that frame. Read from the
+    manifest rather than worked out from `[align]`, which may have changed
+    since the frames were warped. None for a frame missing either half.
+    """
+    known = {}
+    for row in conn.execute(
+            "SELECT f.asset_id, f.tx, f.ty, f.angle, f.scale, m.left_eye_x,"
+            "       m.left_eye_y, m.right_eye_x, m.right_eye_y"
+            "  FROM frames f JOIN metrics m ON m.asset_id = f.asset_id"):
+        if any(row[k] is None for k in row.keys()):
+            continue
+        matrix = align.build_affine(align.TransformParams(
+            row["tx"], row["ty"], row["angle"], row["scale"]))
+        eyes = np.array([[row["left_eye_x"], row["left_eye_y"], 1.0],
+                         [row["right_eye_x"], row["right_eye_y"], 1.0]]) @ matrix.T
+        known[row["asset_id"]] = (eyes[0], eyes[1])
+    return [known.get(r["asset_id"]) for r in rows]
+
+
+def _face_morph_inbetweens(conn: sqlite3.Connection, rows: list, settings: dict,
+                           opts: analyze.AnalyzeOptions, workers: int,
+                           log: Log) -> tuple[list[list[Path]], Path]:
     """Every in-between frame face-morph needs, per pair, and where they were written.
 
-    A frame with no face found dissolves into its neighbours instead of
-    morphing, and the run names it by date so it can be found on the contact
-    sheet -- one odd photo should not cost the whole video its morph. No face in
-    any frame is something else: the landmarker is not seeing what `analyze`
-    saw, and a video of plain dissolves stored as face-morph would be kept by
-    every later run, so that stops the encode instead.
+    The subject's face is found in each frame by where its eyes are, not taken
+    as whatever face the model returns: a second person in the background was
+    morphed as the subject when it was. A frame where the subject is not found
+    dissolves into its neighbours instead of morphing, and the run names it by
+    date so it can be found on the contact sheet -- one odd photo should not
+    cost the whole video its morph. Not found in any frame is something else:
+    the landmarker is not seeing what `analyze` saw, and a video of plain
+    dissolves stored as face-morph would be kept by every later run, so that
+    stops the encode instead.
     """
     from . import morph
 
@@ -796,19 +825,20 @@ def _face_morph_inbetweens(rows: list, settings: dict, opts: analyze.AnalyzeOpti
     if count == 0 or len(frames) < 2:
         return [[] for _ in frames[1:]], morph_dir
 
-    log(f"  morph: finding the face in {len(frames)} aligned frames")
-    meshes = morph.landmarks_for(frames, opts)
+    log(f"  morph: finding the subject's face in {len(frames)} aligned frames")
+    meshes = morph.landmarks_for(frames, opts, _subject_eyes(conn, rows))
     faceless = [(r["local_datetime"] or Path(r["path"]).stem)[:10]
                 for r, mesh in zip(rows, meshes) if mesh is None]
     if len(faceless) == len(frames):
         raise RuntimeError(
-            'transition = "face-morph" found no face in any aligned frame, so there '
-            "is nothing to morph. Check that `grow-up fetch-model` has the model "
-            "`analyze` used, or choose crossfade.")
+            'transition = "face-morph" did not find the subject\'s face in any aligned '
+            "frame, so there is nothing to morph. Check that `grow-up fetch-model` has "
+            "the model `analyze` used, or choose crossfade.")
     if faceless:
         shown = ", ".join(faceless[:8]) + (" and more" if len(faceless) > 8 else "")
-        log(f"  ! morph: no face found in {len(faceless)} aligned frame(s), which "
-            f"dissolve into their neighbours instead: {shown}")
+        log(f"  ! morph: the subject's face was not found where `align` put it in "
+            f"{len(faceless)} aligned frame(s), which dissolve into their neighbours "
+            f"instead: {shown}")
     return morph.render(frames, meshes, morph_dir, count, workers, log), morph_dir
 
 

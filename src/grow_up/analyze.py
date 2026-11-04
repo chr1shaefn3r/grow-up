@@ -242,7 +242,10 @@ def init_worker(opts: AnalyzeOptions) -> None:
         _LANDMARKER = build_landmarker(opts)
 
 
-def build_landmarker(opts: AnalyzeOptions):
+def build_landmarker(opts: AnalyzeOptions, num_faces: int = 1):
+    """The landmarker. `analyze` asks for one face, inside Immich's box for the
+    tagged person; face-morph asks for several, because it looks at the whole
+    aligned frame and has to find the subject among whoever else is in it."""
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision
 
@@ -256,7 +259,7 @@ def build_landmarker(opts: AnalyzeOptions):
     options = vision.FaceLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.IMAGE,
-        num_faces=1,
+        num_faces=num_faces,
         min_face_detection_confidence=opts.min_face_detection_confidence,
         min_face_presence_confidence=opts.min_face_presence_confidence,
         output_face_blendshapes=True,
@@ -341,12 +344,24 @@ def attempt_ladder(opts: AnalyzeOptions) -> list[Attempt]:
 def detect_once(landmarker, opts: AnalyzeOptions, bgr: np.ndarray,
                 box: tuple[int, int, int, int], attempt: Attempt) -> Look | None:
     """One inference on one framing, or None if nothing was found."""
+    looks = detect_all(landmarker, opts, bgr, box, attempt)
+    return looks[0] if looks else None
+
+
+def detect_all(landmarker, opts: AnalyzeOptions, bgr: np.ndarray,
+               box: tuple[int, int, int, int], attempt: Attempt) -> list[Look]:
+    """One inference on one framing, and every face it found, in the model's order.
+
+    The model's order says nothing about who is who -- a stranger in the corner
+    can come first -- so a caller that wants a particular person has to choose
+    among these by where they are, as face-morph does by the subject's eyes.
+    """
     import mediapipe as mp
 
     height, width = bgr.shape[:2]
     cx1, cy1, cx2, cy2 = images.expand_box(box, attempt.margin, width, height)
     if cx2 - cx1 < 16 or cy2 - cy1 < 16:
-        return None
+        return []
 
     work = bgr[cy1:cy2, cx1:cx2]
     if attempt.equalize:
@@ -361,24 +376,26 @@ def detect_once(landmarker, opts: AnalyzeOptions, bgr: np.ndarray,
     work_h, work_w = work.shape[:2]
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=images.to_rgb(work))
     result = landmarker.detect(mp_image)
-    if not result.face_landmarks:
-        return None
+    looks: list[Look] = []
+    for index, face in enumerate(result.face_landmarks or []):
+        # Normalized landmarks may fall outside [0, 1] where the mesh
+        # extrapolates past the crop. Keeping those values is the whole basis of
+        # the out-of-frame check, so nothing is clamped on the way back.
+        pts = np.array([[lm.x * work_w, lm.y * work_h] for lm in face], dtype=np.float64)
+        if rotation_matrix is not None:
+            pts = images.unrotate_points(pts, rotation_matrix)
+        pts *= scale
+        pts += np.array([cx1, cy1], dtype=np.float64)
 
-    # Normalized landmarks may fall outside [0, 1] where the mesh extrapolates
-    # past the crop. Keeping those values is the whole basis of the
-    # out-of-frame check, so nothing is clamped on the way back.
-    pts = np.array([[lm.x * work_w, lm.y * work_h] for lm in result.face_landmarks[0]],
-                   dtype=np.float64)
-    if rotation_matrix is not None:
-        pts = images.unrotate_points(pts, rotation_matrix)
-    pts *= scale
-    pts += np.array([cx1, cy1], dtype=np.float64)
-
-    blendshapes = ({c.category_name: float(c.score) for c in result.face_blendshapes[0]}
-                   if result.face_blendshapes else {})
-    matrix = (np.asarray(result.facial_transformation_matrixes[0], dtype=np.float64)
-              if result.facial_transformation_matrixes else None)
-    return Look(points=pts, blendshapes=blendshapes, matrix=matrix, attempt=attempt)
+        shapes = result.face_blendshapes or []
+        blendshapes = ({c.category_name: float(c.score) for c in shapes[index]}
+                       if index < len(shapes) else {})
+        matrices = result.facial_transformation_matrixes or []
+        matrix = (np.asarray(matrices[index], dtype=np.float64)
+                  if index < len(matrices) else None)
+        looks.append(Look(points=pts, blendshapes=blendshapes, matrix=matrix,
+                          attempt=attempt))
+    return looks
 
 
 def gather_looks(landmarker, opts: AnalyzeOptions, bgr: np.ndarray,

@@ -159,6 +159,58 @@ class TestTheDissolve:
         assert out.dtype == np.uint8 and out.max() == 255
 
 
+def face_at(left: tuple[float, float], right: tuple[float, float]) -> np.ndarray:
+    """A 478-point mesh whose irises are at `left` and `right`."""
+    from grow_up import metrics
+
+    mesh = np.zeros((478, 2))
+    mesh[metrics.IRIS_CENTER_A] = left
+    mesh[metrics.IRIS_CENTER_B] = right
+    return mesh
+
+
+class TestOnlyTheSubjectIsMorphed:
+    """The second look sees the whole aligned frame and everyone in it. Asked
+    for one face, the model returned whichever it ranked first, and a second
+    person in the background was morphed as the subject. This shipped, on a
+    correctly tagged photograph. The subject's eyes are known exactly in every
+    aligned frame, so the face used is the one with its eyes there."""
+
+    LEFT, RIGHT = (432.0, 567.0), (648.0, 567.0)
+
+    def test_the_face_at_the_subjects_eyes_wins_even_when_it_comes_second(self):
+        stranger = face_at((130.0, 184.0), (205.0, 184.0))
+        subject = face_at((434.0, 569.0), (646.0, 566.0))
+        chosen = morph.pick_subject([stranger, subject], self.LEFT, self.RIGHT)
+        assert np.array_equal(chosen, subject)
+
+    def test_a_frame_with_only_someone_else_in_it_has_no_subject(self):
+        """Falling back to whoever was found is exactly the mistake."""
+        stranger = face_at((130.0, 184.0), (205.0, 184.0))
+        assert morph.pick_subject([stranger], self.LEFT, self.RIGHT) is None
+
+    def test_no_faces_is_no_subject(self):
+        assert morph.pick_subject([], self.LEFT, self.RIGHT) is None
+
+    def test_a_face_beside_the_subject_cheek_to_cheek_is_not_them(self):
+        """One eye can be close to the subject's while the other is a face away."""
+        neighbour = face_at((648.0, 570.0), (860.0, 570.0))
+        assert morph.pick_subject([neighbour], self.LEFT, self.RIGHT) is None
+
+    def test_the_tolerance_is_a_share_of_the_eye_distance(self):
+        """So it means the same at every output size."""
+        near = face_at((432.0 + 50.0, 567.0), (648.0 + 50.0, 567.0))     # 50 of 216px
+        far = face_at((432.0 + 60.0, 567.0), (648.0 + 60.0, 567.0))      # 60 of 216px
+        assert morph.pick_subject([near], self.LEFT, self.RIGHT) is not None
+        assert morph.pick_subject([far], self.LEFT, self.RIGHT) is None
+
+    def test_eyes_are_matched_left_to_right_in_the_picture(self):
+        """The mesh's own left and right are the subject's, mirrored in the
+        picture; `analyze` stores them ordered by x, and so must this."""
+        swapped = face_at((648.0, 567.0), (432.0, 567.0))
+        assert morph.pick_subject([swapped], self.LEFT, self.RIGHT) is not None
+
+
 # --------------------------------------------------------------------------- #
 # The pixel half
 # --------------------------------------------------------------------------- #
@@ -284,6 +336,53 @@ class TestMorphingAPair:
         a, b, pa, pb, triangles = self.pair()
         assert np.array_equal(morph.morph_pair(a, b, pa, pb, triangles, 0.0), a)
         assert np.array_equal(morph.morph_pair(a, b, pa, pb, triangles, 1.0), b)
+
+
+@requires_cv2
+class TestTheSecondLookAsksForEveryFace:
+    """Driven with a stand-in landmarker: the real one needs mediapipe."""
+
+    def run(self, tmp_path, monkeypatch, faces, eyes):
+        import cv2
+
+        from grow_up import analyze
+
+        asked = {}
+
+        class Landmarker:
+            def close(self):
+                pass
+
+        def build(opts, num_faces=1):
+            asked["num_faces"] = num_faces
+            return Landmarker()
+
+        def detect_all(landmarker, opts, image, box, attempt):
+            return [analyze.Look(points=f, blendshapes={}, matrix=None, attempt=attempt)
+                    for f in faces]
+
+        monkeypatch.setattr(analyze, "build_landmarker", build)
+        monkeypatch.setattr(analyze, "detect_all", detect_all)
+        frame = tmp_path / "a.jpg"
+        cv2.imwrite(str(frame), np.zeros((1350, 1080, 3), dtype=np.uint8))
+        found = morph.landmarks_for([frame], analyze.AnalyzeOptions(), [eyes])
+        return found[0], asked
+
+    def test_it_asks_for_more_than_one_face(self, tmp_path, monkeypatch):
+        _, asked = self.run(tmp_path, monkeypatch, [], ((432.0, 567.0), (648.0, 567.0)))
+        assert asked["num_faces"] > 1
+
+    def test_it_keeps_the_subject_when_a_stranger_comes_first(self, tmp_path, monkeypatch):
+        stranger = face_at((130.0, 184.0), (205.0, 184.0))
+        subject = face_at((433.0, 568.0), (647.0, 567.0))
+        found, _ = self.run(tmp_path, monkeypatch, [stranger, subject],
+                            ((432.0, 567.0), (648.0, 567.0)))
+        assert np.array_equal(found, subject)
+
+    def test_unknown_eyes_are_not_guessed_at(self, tmp_path, monkeypatch):
+        found, _ = self.run(tmp_path, monkeypatch, [face_at((432.0, 567.0), (648.0, 567.0))],
+                            None)
+        assert found is None
 
 
 @requires_cv2

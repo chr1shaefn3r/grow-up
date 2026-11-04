@@ -19,7 +19,13 @@ real photographs.
 The points come from landmarking the *aligned* frames again. The manifest keeps
 the metrics the filters need, not the mesh, and the aligned frames are already
 in output coordinates, so nothing has to be transformed -- and only photographs
-that reach the video are looked at.
+that reach the video are looked at. That second look has to find the *same
+person*: `analyze` landmarked inside Immich's box for the tagged face, while
+this sees the whole frame and everyone in it. Asked for one face, the model
+hands back whichever it ranks first, and a stranger in the background often
+wins. So every face is asked for, and the one used is the one whose eyes sit
+where `align` put the subject's -- known exactly, from the eyes `analyze` found
+and the transform `align` stored.
 
 The warp is one sampling map per frame: every output pixel lies in one triangle
 of the in-between mesh, and that triangle's affine says where in the photograph
@@ -49,6 +55,16 @@ BORDER_FRACTIONS = (
     (0.0, 0.5), (1.0, 0.5),
     (0.0, 1.0), (0.5, 1.0), (1.0, 1.0),
 )
+
+# How many faces the second look asks for. The subject plus a crowded
+# background; past this the subject would have to rank last to be missed.
+MAX_FACES = 6
+
+# How far, as a fraction of the distance between them, the eyes of the face
+# found may sit from where the subject's eyes are known to be. The same face
+# found again lands within a few pixels; anyone else's eyes are a whole face
+# away, so the margin can be generous without letting a stranger through.
+EYE_TOLERANCE = 0.25
 
 # What an in-between frame is saved at. The same as `align` writes the frames
 # themselves, so a still and the morph leaving it are not visibly different.
@@ -271,11 +287,43 @@ def triangulate(points: np.ndarray, width: int, height: int) -> np.ndarray:
     return index[real & distinct].astype(np.int32)
 
 
-def landmarks_for(paths: Sequence[Path], opts) -> list[np.ndarray | None]:
-    """The face mesh of each aligned frame, or None where no face is found.
+def pick_subject(candidates: Sequence[np.ndarray], left_eye: np.ndarray,
+                 right_eye: np.ndarray,
+                 tolerance: float = EYE_TOLERANCE) -> np.ndarray | None:
+    """The face among `candidates` whose eyes are the subject's, or None.
 
-    The whole frame is the crop: `align` has already centred the face and put
-    the eyes where they belong, so there is nothing left to search for.
+    `left_eye` and `right_eye` are where the subject's irises are in this
+    frame. The candidate whose irises are nearest wins, and only if both are
+    within `tolerance` of the distance between the eyes: a frame where the
+    subject was not found at all must not fall back to whoever was, which is
+    exactly the mistake this exists to prevent.
+    """
+    from .metrics import iris_centers
+
+    left_eye = np.asarray(left_eye, dtype=np.float64)
+    right_eye = np.asarray(right_eye, dtype=np.float64)
+    limit = tolerance * float(np.hypot(*(right_eye - left_eye)))
+    best, best_off = None, np.inf
+    for points in candidates:
+        found_left, found_right = iris_centers(np.asarray(points, dtype=np.float64))
+        off = max(float(np.hypot(*(found_left - left_eye))),
+                  float(np.hypot(*(found_right - right_eye))))
+        if off < best_off:
+            best, best_off = points, off
+    if best is None or best_off > limit:
+        return None
+    return np.asarray(best, dtype=np.float64)[:, :2].copy()
+
+
+def landmarks_for(paths: Sequence[Path], opts,
+                  eyes: Sequence[tuple[np.ndarray, np.ndarray] | None]
+                  ) -> list[np.ndarray | None]:
+    """The subject's face mesh in each aligned frame, or None where it is not found.
+
+    `eyes` gives, per frame, where the subject's irises are -- or None if that
+    is not known, which is treated as not found rather than guessed at. The
+    whole frame is looked at, since `align` has already centred the face, and
+    the face kept is the one at those eyes, whoever else is in the picture.
     """
     try:
         import cv2
@@ -283,7 +331,7 @@ def landmarks_for(paths: Sequence[Path], opts) -> list[np.ndarray | None]:
         from . import analyze
 
         with analyze.suppress_native_output(not opts.verbose):
-            landmarker = analyze.build_landmarker(opts)
+            landmarker = analyze.build_landmarker(opts, num_faces=MAX_FACES)
     except ImportError as exc:
         raise MorphUnavailable(
             f'transition = "face-morph" finds the face in every frame with the same '
@@ -292,16 +340,18 @@ def landmarks_for(paths: Sequence[Path], opts) -> list[np.ndarray | None]:
     found: list[np.ndarray | None] = []
     try:
         with analyze.suppress_native_output(not opts.verbose):
-            for path in paths:
+            for path, subject in zip(paths, eyes, strict=True):
+                if subject is None:
+                    found.append(None)
+                    continue
                 image = cv2.imread(str(path), cv2.IMREAD_COLOR)
                 if image is None:
                     raise MorphUnavailable(f"could not read the aligned frame {path}")
                 height, width = image.shape[:2]
-                look = analyze.detect_once(landmarker, opts, image,
+                looks = analyze.detect_all(landmarker, opts, image,
                                            (0, 0, width, height),
                                            analyze.Attempt(margin=0.0))
-                found.append(None if look is None
-                             else np.asarray(look.points, dtype=np.float64)[:, :2].copy())
+                found.append(pick_subject([look.points for look in looks], *subject))
     finally:
         # Closed here rather than left to the finalizer, which runs during
         # interpreter teardown and prints a traceback over a run that worked.

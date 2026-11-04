@@ -1555,31 +1555,46 @@ class TestFaceMorphInTheStage:
     CFG = {"fps": 0.5, "transition": "face-morph", "playback_fps": 30,
            "transition_seconds": 0.1}
 
+    # Where `align` puts the subject's eyes in a 1080x1350 frame, and where
+    # `analyze` found them in each photograph: three different photographs, so
+    # three different transforms that all land the eyes on the same two points.
+    TARGET = ((432.0, 567.0), (648.0, 567.0))
+    SOURCE_EYES = [((100.0, 200.0), (160.0, 205.0)), ((1500.0, 900.0), (1720.0, 880.0)),
+                   ((40.0, 60.0), (70.0, 61.0))]
+
     @pytest.fixture()
     def stage(self, tmp_path, monkeypatch):
         """Three warped frames, a stand-in landmarker and morph, and a spy ffmpeg."""
-        from grow_up import db, morph, pipeline
+        from grow_up import align, db, morph, pipeline
 
         conn = db.connect(tmp_path / "t.sqlite")
         stamp = "2026-01-01T00:00:00.000Z"
-        for i in range(1, 4):
+        for i, (left, right) in enumerate(self.SOURCE_EYES, start=1):
             frame = tmp_path / "frames" / f"a{i}.jpg"
             frame.parent.mkdir(exist_ok=True)
             frame.write_bytes(b"\xff\xd8\xff")
+            p = align.decompose_affine(align.similarity_transform(
+                np.array(left), np.array(right),
+                np.array(self.TARGET[0]), np.array(self.TARGET[1])))
             conn.execute("INSERT INTO assets (id, local_datetime, indexed_at)"
                          " VALUES (?, ?, ?)", (f"a{i}", f"2026-0{i}-01T10:00:00", stamp))
-            conn.execute("INSERT INTO frames (asset_id, path, seq, warped_at)"
-                         " VALUES (?, ?, ?, ?)", (f"a{i}", str(frame), i, stamp))
+            conn.execute("INSERT INTO metrics (asset_id, detected, left_eye_x, left_eye_y,"
+                         " right_eye_x, right_eye_y, analyzed_at) VALUES (?, 1, ?, ?, ?, ?, ?)",
+                         (f"a{i}", *left, *right, stamp))
+            conn.execute("INSERT INTO frames (asset_id, path, seq, tx, ty, angle, scale,"
+                         " warped_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                         (f"a{i}", str(frame), i, p.tx, p.ty, p.angle, p.scale, stamp))
             conn.execute("INSERT INTO selection (asset_id, bucket, rank, alternate,"
                          " selected_at) VALUES (?, ?, 0, 0, ?)",
                          (f"a{i}", f"2026-0{i}", stamp))
 
         state = {"meshes": [np.zeros((478, 2))] * 3, "landmarked": 0, "renders": [],
-                 "morph_seen": None, "opts": None}
+                 "morph_seen": None, "opts": None, "eyes": None}
 
-        def landmarks_for(paths, opts):
+        def landmarks_for(paths, opts, eyes):
             state["landmarked"] += 1
             state["opts"] = opts
+            state["eyes"] = list(eyes)
             return list(state["meshes"])
 
         def render(frames, meshes, out_dir, count, workers=0, log=None):
@@ -1654,10 +1669,37 @@ class TestFaceMorphInTheStage:
         self.encode(stage, analyze_opts=opts)
         assert stage["opts"] is opts
 
+    def test_the_landmarker_is_told_where_the_subjects_eyes_are(self, stage):
+        """Found by `analyze` inside Immich's box for the tagged face, carried
+        through the transform `align` stored. Every frame lands them on the same
+        two points, which is what aligning means."""
+        self.encode(stage)
+        for left, right in stage["eyes"]:
+            assert left == pytest.approx(self.TARGET[0], abs=1e-6)
+            assert right == pytest.approx(self.TARGET[1], abs=1e-6)
+
+    def test_the_eyes_come_from_the_manifest_not_from_align_config(self, stage):
+        """`[align]` may have changed since the frames were warped; the stored
+        transform is what the pixels were actually moved by."""
+        from grow_up import pipeline
+
+        stage["conn"].execute("UPDATE frames SET tx = tx + 50 WHERE asset_id = 'a2'")
+        rows = stage["conn"].execute("SELECT asset_id FROM frames ORDER BY seq").fetchall()
+        eyes = pipeline._subject_eyes(stage["conn"], rows)
+        assert eyes[1][0] == pytest.approx((self.TARGET[0][0] + 50, self.TARGET[0][1]))
+        assert eyes[0][0] == pytest.approx(self.TARGET[0])
+
+    def test_a_frame_whose_eyes_are_unknown_is_not_guessed_at(self, stage):
+        from grow_up import pipeline
+
+        stage["conn"].execute("DELETE FROM metrics WHERE asset_id = 'a3'")
+        rows = stage["conn"].execute("SELECT asset_id FROM frames ORDER BY seq").fetchall()
+        assert pipeline._subject_eyes(stage["conn"], rows)[2] is None
+
     def test_a_frame_with_no_face_is_named_by_date_and_morphs_nothing(self, stage):
         stage["meshes"] = [np.zeros((478, 2)), None, np.zeros((478, 2))]
         lines = self.encode(stage)
-        warning = [line for line in lines if "no face found" in line]
+        warning = [line for line in lines if "subject's face was not found" in line]
         assert warning and "2026-02-01" in warning[0]
         assert stage["morph_seen"][2][1] is None, "the render was told which one"
 
@@ -1665,7 +1707,7 @@ class TestFaceMorphInTheStage:
         """A video of plain dissolves recorded as face-morph would be kept by
         every later run."""
         stage["meshes"] = [None, None, None]
-        with pytest.raises(RuntimeError, match="no face in any aligned frame"):
+        with pytest.raises(RuntimeError, match="subject's face in any aligned frame"):
             self.encode(stage)
         assert stage["renders"] == []
 

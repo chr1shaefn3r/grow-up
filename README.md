@@ -762,9 +762,11 @@ then dissolves them: an eye becomes an eye, a smile a smile, and nothing appears
 the way it does halfway through a crossfade. Hair and background lie outside the face
 mesh, so they dissolve as in a crossfade. The in-between frames are made on every core
 and deleted once they are in the video. Before that, each aligned frame is landmarked
-once more, with the same model `analyze` uses. A frame where no face is found dissolves
-into its neighbours instead of morphing, and the run names it by date so you can find it
-on the contact sheet.
+once more, with the same model `analyze` uses, and the face used is the subject's. That
+means the face whose eyes sit exactly where `align` put the eyes `analyze` found inside
+Immich's box for the tagged person. Anyone else in the picture is ignored, however
+prominent. A frame where the subject's face is not found dissolves into its neighbours
+instead of morphing, and the run names it by date so you can find it on the contact sheet.
 
 `transition_seconds` governs all three. Lower it to hold the picture longer: at `fps = 0.5`,
 `0.5` gives a second and a half still and half a second moving. The two place it
