@@ -145,11 +145,13 @@ change as verified.
 Two real faces *are* within reach, for checks that need a face rather than a library.
 MediaPipe's public test images download from the sandbox (Wikimedia does not):
 `https://storage.googleapis.com/mediapipe-assets/portrait.jpg` and
-`.../face_stylizer_raw_face_demo.png`. mediapipe itself installs into a separate venv
-(`pip install mediapipe`) once `apt-get install -y libegl1 libgles2` has supplied the
-GL library it loads, and `grow-up fetch-model` downloads the model. face-morph was
-checked end to end this way: landmarked, aligned, morphed and encoded. Keep all of it out
-of the suite, which must still run with none of it installed.
+`.../face_stylizer_raw_face_demo.png`. mediapipe itself installs into a separate venv.
+Install the version `pyproject.toml` pins (`pip install "mediapipe>=0.10.14,<1.0"`), not
+the latest: 1.x crashes building the landmarker on macOS, which is why the pin exists. If
+it cannot load `libEGL.so.1`, run `apt-get install -y libegl1 libgles2`. Then
+`grow-up fetch-model` downloads the model. face-morph was checked end to end this way,
+on 0.10.35: landmarked, aligned, morphed and encoded. Keep all of it out of the suite,
+which must still run with none of it installed.
 
 **ffmpeg is not installed, and the tests are built so it never needs to be.** You can
 assert the exact command string and every number in it. For a manual check,
