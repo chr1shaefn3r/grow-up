@@ -14,7 +14,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from . import analyze, config, db, metrics, pipeline, review, select, timing
+from . import analyze, config, db, metrics, morph, pipeline, review, select, timing
 from .encode import FFmpegMissing
 from .immich import (
     ANY,
@@ -174,13 +174,19 @@ async def _resolve_person(cfg: config.Config, source: config.Source) -> str:
 
 def cmd_fetch_model(args: argparse.Namespace) -> None:
     target = Path(args.output or analyze.DEFAULT_MODEL_PATH)
-    if target.exists() and not args.force:
-        log(f"model: already present at {target}")
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    log(f"model: downloading {analyze.MODEL_URL}")
-    urllib.request.urlretrieve(analyze.MODEL_URL, target)  # noqa: S310
-    log(f"model: saved {target} ({target.stat().st_size / 1e6:.1f} MB)")
+    # The segmenter rides along, for face-morph's neutral_background, and is
+    # looked for beside the landmarker. Each file is judged on its own: anyone
+    # set up before the segmenter existed already has the landmarker, and
+    # stopping at "already present" would never give them the other one.
+    for url, path in ((analyze.MODEL_URL, target),
+                      (morph.SEGMENT_MODEL_URL, morph.segment_model_beside(target))):
+        if path.exists() and not args.force:
+            log(f"model: already present at {path}")
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        log(f"model: downloading {url}")
+        urllib.request.urlretrieve(url, path)  # noqa: S310
+        log(f"model: saved {path} ({path.stat().st_size / 1e6:.1f} MB)")
 
 
 def cmd_index(args: argparse.Namespace) -> None:
@@ -865,7 +871,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--source", default=None, metavar="NAME",
                        help="work on one configured [[immich.sources]] account only")
 
-    model = add("fetch-model", cmd_fetch_model, "download the MediaPipe face landmarker model")
+    model = add("fetch-model", cmd_fetch_model,
+                "download the MediaPipe models: the face landmarker, and the segmenter "
+                "neutral_background uses")
     model.add_argument("-o", "--output", default=None)
     model.add_argument("--force", action="store_true")
 

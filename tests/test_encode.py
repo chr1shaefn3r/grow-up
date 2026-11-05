@@ -1589,17 +1589,34 @@ class TestFaceMorphInTheStage:
                          (f"a{i}", f"2026-0{i}", stamp))
 
         state = {"meshes": [np.zeros((478, 2))] * 3, "landmarked": 0, "renders": [],
-                 "morph_seen": None, "opts": None, "eyes": None}
+                 "morph_seen": None, "opts": None, "eyes": None, "landmarked_paths": None,
+                 "morphed_from": None, "held": [], "cut": None, "lose": set(),
+                 "real_neutral_frames": morph.neutral_frames}
 
         def landmarks_for(paths, opts, eyes):
             state["landmarked"] += 1
             state["opts"] = opts
             state["eyes"] = list(eyes)
+            state["landmarked_paths"] = list(paths)
             return list(state["meshes"])
+
+        def neutral_frames(frames, eyes, model, out_dir, verbose=False, log=None):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            state["cut"] = {"model": model, "eyes": list(eyes), "verbose": verbose}
+            made = []
+            for frame in frames:
+                if frame.stem in state["lose"]:
+                    made.append(None)
+                    continue
+                target = out_dir / frame.name
+                target.write_bytes(b"cut out")
+                made.append(target)
+            return made
 
         def render(frames, meshes, out_dir, count, workers=0, log=None):
             out_dir.mkdir(parents=True, exist_ok=True)
             state["morph_seen"] = (len(frames), count, list(meshes))
+            state["morphed_from"] = list(frames)
             made = []
             for a, b in zip(frames, frames[1:]):
                 pair = [out_dir / f"{a.stem}--{b.stem}-{k:03d}.jpg" for k in range(1, count + 1)]
@@ -1612,16 +1629,20 @@ class TestFaceMorphInTheStage:
             state["renders"].append((out_path.name, kwargs.get("inbetweens"),
                                      all(p.exists() for pair in kwargs.get("inbetweens") or []
                                          for p in pair)))
+            state["held"].append((list(frames), all(p.exists() for p in frames)))
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(b"video")
             return out_path
 
         monkeypatch.setattr(morph, "landmarks_for", landmarks_for)
+        monkeypatch.setattr(morph, "neutral_frames", neutral_frames)
         monkeypatch.setattr(morph, "render", render)
         monkeypatch.setattr(pipeline, "encode", fake_encode)
         state["conn"] = conn
         state["out"] = tmp_path / "out"
+        state["frames"] = [tmp_path / "frames" / f"a{i}.jpg" for i in (1, 2, 3)]
         state["morph_dir"] = tmp_path / "frames" / "morph"
+        state["neutral_dir"] = tmp_path / "frames" / "neutral"
         return state
 
     def encode(self, stage, cfg=None, **kwargs):
@@ -1758,6 +1779,173 @@ class TestFaceMorphInTheStage:
         line = next(line for line in lines if "face-morph at 30 fps" in line)
         assert "15 in-between frames" in line
         assert "clamped" not in line, "rounding to whole frames is not a clamp"
+
+    def test_a_morph_that_fails_part_way_is_cleaned_up_too(self, stage, monkeypatch):
+        """Its directory is known before the first frame is written, so a
+        failure inside the morph leaves nothing behind either."""
+        from grow_up import morph
+
+        def half_a_render(frames, meshes, out_dir, count, workers=0, log=None):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "a1--a2-001.jpg").write_bytes(b"x")
+            raise morph.MorphUnavailable("a worker died")
+
+        monkeypatch.setattr(morph, "render", half_a_render)
+        with pytest.raises(RuntimeError, match="a worker died"):
+            self.encode(stage)
+        assert not stage["morph_dir"].exists()
+        assert not stage["neutral_dir"].exists()
+
+
+class TestTheNeutralBackground(TestFaceMorphInTheStage):
+    """`neutral_background`: the subject cut out of every frame and put on one
+    plain field. Only the new claims are asserted here; the face-morph ones
+    above run again with it on, through the inherited tests' own CFG."""
+
+    CFG = {**TestFaceMorphInTheStage.CFG, "neutral_background": True}
+    OFF = TestFaceMorphInTheStage.CFG
+
+    def test_the_held_frames_are_the_cut_outs(self, stage):
+        """Not only the morphs: a background that came back on every held
+        photograph would flicker."""
+        self.encode(stage)
+        [(held, existed)] = stage["held"]
+        assert held == [stage["neutral_dir"] / f.name for f in stage["frames"]]
+        assert existed, "they were deleted before ffmpeg read them"
+
+    def test_the_morphs_are_made_from_the_cut_outs(self, stage):
+        self.encode(stage)
+        assert stage["morphed_from"] == [stage["neutral_dir"] / f.name
+                                         for f in stage["frames"]]
+
+    def test_the_faces_are_still_found_in_the_aligned_frames(self, stage):
+        """The cut-out moves no pixel, so the meshes are the same either way."""
+        self.encode(stage)
+        assert stage["landmarked_paths"] == stage["frames"]
+
+    def test_both_videos_hold_the_cut_outs(self, stage, monkeypatch):
+        from grow_up import pipeline
+
+        monkeypatch.setattr(pipeline, "_annotated_frames",
+                            lambda conn, rows, footer, log, as_layers=False:
+                            [Path(r["path"]).with_suffix(".png") for r in rows])
+        self.encode(stage, {**self.CFG, "annotate": {"enabled": True}})
+        assert len(stage["held"]) == 2
+        for held, _ in stage["held"]:
+            assert all(p.parent == stage["neutral_dir"] for p in held)
+
+    def test_the_cut_outs_are_thrown_away_once_the_video_is_made(self, stage):
+        self.encode(stage)
+        assert not stage["neutral_dir"].exists()
+
+    def test_the_cut_outs_are_thrown_away_when_the_render_fails_too(self, stage,
+                                                                     monkeypatch):
+        from grow_up import pipeline
+
+        monkeypatch.setattr(pipeline, "encode",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ffmpeg died")))
+        with pytest.raises(RuntimeError, match="ffmpeg died"):
+            self.encode(stage)
+        assert not stage["neutral_dir"].exists()
+
+    def test_they_are_cut_out_even_with_no_room_to_morph(self, stage):
+        """The held frames are most of the film."""
+        self.encode(stage, {**self.CFG, "fps": 30})
+        [(held, _)] = stage["held"]
+        assert all(p.parent == stage["neutral_dir"] for p in held)
+        assert stage["landmarked"] == 0
+
+    def test_off_the_photographs_are_held_as_before(self, stage):
+        self.encode(stage, self.OFF)
+        [(held, _)] = stage["held"]
+        assert held == stage["frames"]
+        assert stage["cut"] is None, "nothing was segmented"
+
+    def test_turning_it_on_renders_again(self, stage):
+        self.encode(stage, self.OFF)
+        self.encode(stage)
+        assert len(stage["renders"]) == 2
+
+    def test_turning_it_off_renders_again(self, stage):
+        self.encode(stage)
+        self.encode(stage, self.OFF)
+        assert len(stage["renders"]) == 2
+
+    def test_unchanged_it_is_not_cut_out_again(self, stage):
+        self.encode(stage)
+        stage["cut"] = None
+        self.encode(stage)
+        assert len(stage["renders"]) == 1 and stage["cut"] is None
+
+    def test_off_the_face_morph_digest_is_what_it_always_was(self, stage):
+        """Or every face-morph video made before the setting existed would
+        re-render on upgrade."""
+        from grow_up import db, morph
+        from grow_up.encode import fingerprint
+
+        self.encode(stage, self.OFF)
+        rows = stage["conn"].execute(
+            "SELECT f.asset_id, f.path, f.warped_at FROM frames f ORDER BY f.seq").fetchall()
+        settings = dict(fps=0.5, codec="libx264", crf=18, interpolate=False,
+                        transition="face-morph", playback_fps=30.0, transition_seconds=0.1)
+        expected = fingerprint([tuple(r) for r in rows], settings,
+                               {"face_morph": morph.REVISION})
+        assert db.render_fingerprint(stage["conn"], stage["out"] / "timelapse.mp4") == expected
+
+    def test_another_transition_ignores_it_and_says_so(self, stage):
+        from grow_up import db
+
+        crossfade = {**self.OFF, "transition": "crossfade"}
+        self.encode(stage, crossfade)
+        plain = db.render_fingerprint(stage["conn"], stage["out"] / "timelapse.mp4")
+        lines = self.encode(stage, {**crossfade, "neutral_background": True})
+        assert any("applies to face-morph only" in line for line in lines)
+        assert stage["cut"] is None
+        assert len(stage["renders"]) == 1, "its digest must not move for a setting it ignores"
+        assert db.render_fingerprint(stage["conn"], stage["out"] / "timelapse.mp4") == plain
+
+    def test_the_segmenter_is_looked_for_beside_the_configured_landmarker(self, stage):
+        from grow_up import analyze, morph
+
+        opts = analyze.AnalyzeOptions(model_path="elsewhere/face_landmarker.task")
+        self.encode(stage, analyze_opts=opts)
+        assert stage["cut"]["model"] == Path("elsewhere") / morph.SEGMENT_MODEL_NAME
+
+    def test_the_cut_out_is_told_where_the_subjects_eyes_are(self, stage):
+        self.encode(stage)
+        for left, right in stage["cut"]["eyes"]:
+            assert left == pytest.approx(self.TARGET[0], abs=1e-6)
+            assert right == pytest.approx(self.TARGET[1], abs=1e-6)
+
+    def test_a_frame_the_cut_out_lost_keeps_its_photograph_and_is_named(self, stage):
+        stage["lose"] = {"a2"}
+        lines = self.encode(stage)
+        [(held, _)] = stage["held"]
+        assert held[1] == stage["frames"][1]
+        assert held[0].parent == stage["neutral_dir"]
+        warning = [line for line in lines if "cut-out lost the subject" in line]
+        assert warning and "2026-02-01" in warning[0]
+
+    def test_losing_the_subject_everywhere_stops_rather_than_storing_photographs(
+            self, stage):
+        """A video of the plain photographs recorded as the neutral one would
+        be kept by every later run."""
+        stage["lose"] = {"a1", "a2", "a3"}
+        with pytest.raises(RuntimeError, match="did not find the subject in any"):
+            self.encode(stage)
+        assert stage["renders"] == []
+
+    def test_a_missing_segmenter_stops_the_encode(self, stage, monkeypatch, tmp_path):
+        """Never the photographs instead, for the same reason."""
+        from grow_up import analyze, db, morph
+
+        monkeypatch.setattr(morph, "neutral_frames", stage["real_neutral_frames"])
+        opts = analyze.AnalyzeOptions(model_path=str(tmp_path / "models" / "face_landmarker.task"))
+        with pytest.raises(RuntimeError, match="grow-up fetch-model"):
+            self.encode(stage, analyze_opts=opts)
+        assert stage["renders"] == []
+        assert db.render_fingerprint(stage["conn"], stage["out"] / "timelapse.mp4") is None
+        assert not stage["neutral_dir"].exists()
 
 
 def test_the_cli_hands_the_landmarker_to_the_encode():

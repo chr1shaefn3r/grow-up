@@ -34,10 +34,20 @@ per-triangle compositing to leave seams, wedges or holes. The maths -- the
 interpolation, the affines and the map -- is plain numpy and tested with nothing
 installed, like `align.py`; opencv is imported lazily, for the Delaunay, the
 rasterising and the remap.
+
+`neutral_background` goes one step further, and also comes from the fork. The
+background is the one part of two photographs months apart with nothing in
+common -- another room, another light, another year -- so it is where a morph
+ghosts most and the part least worth keeping. MediaPipe's selfie segmenter cuts
+the person out and every frame is put on one plain field, the held ones as well
+as the in-betweens: a film that switched between a real background and a plain
+one on every photograph would flicker. The cut-out moves no pixel, so the meshes
+measured on the aligned frames stay valid for it.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 from functools import lru_cache
 from pathlib import Path
@@ -68,12 +78,37 @@ EYE_TOLERANCE = 0.25
 # picture. Without it, the run after a fix found the old video "already
 # rendered" and kept it -- which is how the fix for morphing a person in the
 # background never reached the video it was made for. Bump it whenever the
-# frames made from the same inputs change.
+# frames made from the same inputs change, the cut-out onto the neutral
+# background included.
 REVISION = 2
 
 # What an in-between frame is saved at. The same as `align` writes the frames
 # themselves, so a still and the morph leaving it are not visibly different.
 JPEG_QUALITY = 95
+
+# MediaPipe's multiclass selfie segmenter: background, hair, body skin, face
+# skin, clothes, and everything else on the person. mediapipe is already a
+# dependency, so the neutral background costs one model file and no library.
+SEGMENT_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+    "selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
+)
+SEGMENT_MODEL_NAME = "selfie_multiclass.tflite"
+
+# The one class that is not the person. Hair, skin, clothes and accessories are
+# all kept: a cut-out that dropped any of them would be the wrong shape.
+BACKGROUND_CLASS = 0
+
+# A soft, slightly cool grey, in opencv's BGR. Dark enough that fair hair and
+# skin stand out against it, light enough not to read as a void, and neutral
+# enough that years of different colour temperature sit on it without argument.
+NEUTRAL_BACKGROUND = (232, 230, 226)
+
+# How far the edge of the cut-out is softened, in pixels of the frame. The
+# segmenter sees 256x256, so its edge scaled up to a 1080-wide frame is a
+# staircase. A couple of pixels of blur reads as an ordinary depth-of-field
+# edge; the staircase reads as scissors.
+FEATHER = 2.5
 
 
 class MorphUnavailable(RuntimeError):
@@ -365,6 +400,184 @@ def landmarks_for(paths: Sequence[Path], opts,
         except Exception:                                  # pragma: no cover
             pass
     return found
+
+
+def segment_model_beside(landmarker: Path | str) -> Path:
+    """Where the segmenter is looked for: beside the face landmarker, which is
+    where `grow-up fetch-model` puts it."""
+    return Path(landmarker).parent / SEGMENT_MODEL_NAME
+
+
+def subject_alpha(mask: np.ndarray, feather: float = FEATHER) -> np.ndarray:
+    """How much of each pixel is the person, 0 to 1, softened at the silhouette."""
+    import cv2
+
+    alpha = (np.asarray(mask) != BACKGROUND_CLASS).astype(np.float32)
+    if feather <= 0:
+        return alpha
+    return cv2.GaussianBlur(alpha, (0, 0), sigmaX=float(feather))
+
+
+def on_neutral(image: np.ndarray, mask: np.ndarray,
+               colour: tuple[int, int, int] = NEUTRAL_BACKGROUND,
+               feather: float = FEATHER) -> np.ndarray:
+    """The person over the plain field, with their own background thrown away."""
+    image = np.asarray(image)
+    mask = np.asarray(mask)
+    if mask.shape != image.shape[:2]:
+        raise ValueError(f"a {mask.shape} mask does not cover a {image.shape[:2]} frame")
+    alpha = subject_alpha(mask, feather)[..., None]
+    field = np.asarray(colour, dtype=np.float32)
+    blended = alpha * image.astype(np.float32) + (1.0 - alpha) * field
+    return np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+
+
+def subject_at(mask: np.ndarray, eyes: tuple | None) -> bool:
+    """Did the cut-out keep the subject?
+
+    Asked at the bridge of the nose, half way between the eyes `align` put
+    there. A cut-out that does not reach it has lost the face, and a frame of
+    plain grey with nobody on it would be the worst frame in the film -- worse
+    than one photograph keeping its own background. Without known eyes,
+    anything on the person will do.
+    """
+    person = np.asarray(mask) != BACKGROUND_CLASS
+    if eyes is None:
+        return bool(person.any())
+    left, right = (np.asarray(e, dtype=np.float64)[:2] for e in eyes)
+    x, y = (int(v) for v in np.rint((left + right) / 2.0))
+    height, width = person.shape[:2]
+    return 0 <= x < width and 0 <= y < height and bool(person[y, x])
+
+
+def build_segmenter(model_path: Path):
+    """The selfie segmenter, asked for a class per pixel and nothing else."""
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision
+
+    return vision.ImageSegmenter.create_from_options(vision.ImageSegmenterOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.IMAGE,
+        output_category_mask=True,
+        output_confidence_masks=False))
+
+
+def segment(segmenter, image: np.ndarray) -> np.ndarray:
+    """A class label per pixel of `image`, at the image's own size."""
+    import cv2
+    import mediapipe as mp
+
+    frame = mp.Image(image_format=mp.ImageFormat.SRGB,
+                     data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    mask = segmenter.segment(frame).category_mask.numpy_view()
+    return np.ascontiguousarray(mask).reshape(mask.shape[:2])
+
+
+def _cut_out(job: tuple) -> list[bool]:
+    """Put every frame on the neutral field, and say which kept their subject.
+
+    The entry point of the segmenter's own process. One segmenter for the whole
+    render, built and closed here: the fork first built one per pair, which was
+    119 model loads across 12 processes and killed its pool.
+    """
+    from . import analyze
+
+    sources, targets, eyes, model, verbose = job
+    # Before mediapipe is imported, which is when the native log level is read.
+    if not verbose:
+        os.environ.update(analyze.QUIET_ENV)
+
+    import cv2
+
+    found = []
+    with analyze.suppress_native_output(not verbose):
+        segmenter = build_segmenter(Path(model))
+        try:
+            for source, target, subject in zip(sources, targets, eyes, strict=True):
+                image = cv2.imread(source, cv2.IMREAD_COLOR)
+                if image is None:
+                    raise MorphUnavailable(f"could not read the aligned frame {source}")
+                mask = segment(segmenter, image)
+                if not subject_at(mask, subject):
+                    found.append(False)
+                    continue
+                if not cv2.imwrite(target, on_neutral(image, mask),
+                                   [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]):
+                    raise MorphUnavailable(f"could not write {target}")
+                found.append(True)
+        finally:
+            try:
+                segmenter.close()
+            except Exception:                              # pragma: no cover
+                pass
+    return found
+
+
+def _in_a_child(work: Callable, job: tuple):
+    """`work(job)`, run in a fresh process of its own.
+
+    For the segmenter only. In the fork this comes from, a process that had
+    built one could no longer start a worker pool: the parent segfaulted as
+    the pool was created, at any worker count, spawned or forked, and closing
+    the segmenter first did not help. `render` starts its pool straight after.
+    It did not reproduce here (Linux, mediapipe 0.10.35, a landmarker and a
+    segmenter both live in the parent, then a 12-worker pool), but the crash
+    leaves nothing in the log except "terminated abruptly", and a second for a
+    fresh interpreter is a small price for never finding out.
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=context) as pool:
+        return pool.submit(work, job).result()
+
+
+def neutral_frames(frames: Sequence[Path], eyes: Sequence[tuple | None], model: Path,
+                   out_dir: Path, verbose: bool = False,
+                   log: Callable[[str], None] = lambda _m: None) -> list[Path | None]:
+    """Every frame cut out onto the neutral field, or None where the cut-out missed.
+
+    `eyes` is where the subject's irises are in each frame, as for
+    `landmarks_for`. A None in the result is a frame whose cut-out lost the
+    subject; the caller shows the photograph there instead, and names it.
+
+    Each is named after the frame it was cut from, never after its place in
+    the timeline, and `out_dir` is emptied first: a cut-out left behind by
+    another run is of another photograph or another selection, and would look
+    entirely plausible.
+    """
+    from concurrent.futures.process import BrokenProcessPool
+
+    model = Path(model)
+    if not model.exists():
+        raise MorphUnavailable(
+            f"neutral_background = true cuts the subject out with MediaPipe's selfie "
+            f"segmenter, and there is none at {model}. Run `grow-up fetch-model`, "
+            "which puts it beside the face landmarker.")
+
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    if not frames:
+        return []
+    targets = [out_dir / f"{Path(frame).stem}.jpg" for frame in frames]
+    job = ([str(f) for f in frames], [str(t) for t in targets],
+           [None if e is None else tuple(tuple(float(v) for v in point[:2]) for point in e)
+            for e in eyes],
+           str(model), bool(verbose))
+
+    log(f"  morph: cutting the subject out of {len(frames)} frames onto a neutral background")
+    try:
+        found = _in_a_child(_cut_out, job)
+    except ImportError as exc:
+        raise MorphUnavailable(
+            f"neutral_background = true cuts the subject out with MediaPipe's segmenter, "
+            f"and it cannot load here ({exc}).") from exc
+    except BrokenProcessPool as exc:
+        raise MorphUnavailable(
+            "the segmenter's process died before it finished, so nothing was cut out. "
+            "`grow-up -v encode` shows what MediaPipe printed.") from exc
+    return [target if kept else None for target, kept in zip(targets, found, strict=True)]
 
 
 def _render_pair(job: tuple) -> list[str]:

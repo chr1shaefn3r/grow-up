@@ -805,9 +805,20 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
         playback_fps=float(encode_cfg.get("playback_fps", 30)),
         transition_seconds=float(encode_cfg.get("transition_seconds", 1.0)),
     )
+    # Kept out of `settings`, which is fingerprinted whole and handed to ffmpeg:
+    # a new key there would change the digest of every video already made and
+    # re-render them all on upgrade. It reaches the digest through `made_by`
+    # below, and only when it is on.
+    neutral = bool(encode_cfg.get("neutral_background", False))
+    face_morph = _resolved_transition(settings) == "face-morph"
     filename = str(encode_cfg.get("filename", "timelapse.mp4"))
     log(f"  encode: {len(frames)} frames at {settings['fps']:g} fps")
     _log_transition(settings, len(frames), log)
+    if neutral and not face_morph:
+        # face-morph is the only transition that reads the pixels itself; the
+        # others are ffmpeg filters over the aligned frames as they are.
+        log("  ! encode: neutral_background applies to face-morph only, so this "
+            "video keeps each photograph's own background.")
 
     # One entry per photograph, and what `align` last did to it. This is what a
     # skip is judged against, so it is built from the same rows the render is.
@@ -828,8 +839,11 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
     # face-morph's frames are made by code here, not by ffmpeg, so which
     # version of it ran is an input too. Nothing for the other transitions,
     # whose digests -- and so whose skips -- stay exactly what they were.
-    made_by = ({"face_morph": morph.REVISION}
-               if _resolved_transition(settings) == "face-morph" else {})
+    made_by = {}
+    if face_morph:
+        made_by["face_morph"] = morph.REVISION
+        if neutral:
+            made_by["neutral_background"] = True
     plain_print = fingerprint(inputs, settings, made_by or None)
     if not force and _already_rendered(conn, plain_out, plain_print):
         skip(plain_out)
@@ -864,22 +878,28 @@ def stage_encode(conn: sqlite3.Connection, out_dir: Path, encode_cfg: dict,
 
     # Made only now, once a render is certain: an unchanged face-morph video is
     # skipped above without landmarking a single frame. Both videos share them.
-    morph_dir = None
+    # Where they go is known before any is made, so a morph that fails part-way
+    # is cleaned up as surely as an ffmpeg that does.
+    scratch = _morph_scratch(frames) if face_morph else ()
     try:
         with timing.stopwatch() as stage_elapsed:
-            if _resolved_transition(settings) == "face-morph":
-                inbetweens, morph_dir = _face_morph_inbetweens(
-                    conn, kept, settings, analyze_opts or analyze.AnalyzeOptions(),
-                    workers, log)
-                for _, _, extra, _ in renders:
-                    extra["inbetweens"] = inbetweens
+            if face_morph:
+                stills, inbetweens = _face_morph_frames(
+                    conn, kept, settings, neutral,
+                    analyze_opts or analyze.AnalyzeOptions(), workers, log)
+                # With the background cut away, the held frames are the
+                # cut-outs too, in both videos: a film that switched between a
+                # real background and a plain one on every photograph would
+                # flicker. Without it, `stills` is `frames`.
+                renders = [(stills, out, {**extra, "inbetweens": inbetweens}, digest)
+                           for _, out, extra, digest in renders]
             results = _run_renders([r[:3] for r in renders], settings, workers, log)
     finally:
-        if morph_dir is not None:
+        for directory in scratch:
             # Purely derived, and large -- hundreds of megabytes for a year of
             # weeks. The video holds everything they were for, and the next
             # render makes them afresh rather than trusting any left behind.
-            shutil.rmtree(morph_dir, ignore_errors=True)
+            shutil.rmtree(directory, ignore_errors=True)
 
     for (_, out_path, _, digest), (written, _) in zip(renders, results):
         db.record_render(conn, written or out_path, digest)
@@ -918,10 +938,22 @@ def _subject_eyes(conn: sqlite3.Connection,
     return [known.get(r["asset_id"]) for r in rows]
 
 
-def _face_morph_inbetweens(conn: sqlite3.Connection, rows: list, settings: dict,
-                           opts: analyze.AnalyzeOptions, workers: int,
-                           log: Log) -> tuple[list[list[Path]], Path]:
-    """Every in-between frame face-morph needs, per pair, and where they were written.
+def _morph_scratch(frames: list[Path]) -> tuple[Path, Path]:
+    """Where face-morph writes what it makes: the in-betweens, and the cut-outs."""
+    home = frames[0].parent
+    return home / "morph", home / "neutral"
+
+
+def _date_of(row) -> str:
+    """How the run names a frame for someone to find it on the contact sheet."""
+    return (row["local_datetime"] or Path(row["path"]).stem)[:10]
+
+
+def _face_morph_frames(conn: sqlite3.Connection, rows: list, settings: dict,
+                       neutral: bool, opts: analyze.AnalyzeOptions, workers: int,
+                       log: Log) -> tuple[list[Path], list[list[Path]]]:
+    """The pictures a face-morph video is made of: the frame each photograph is
+    held on, and the in-between frames for every pair.
 
     The subject's face is found in each frame by where its eyes are, not taken
     as whatever face the model returns: a second person in the background was
@@ -932,29 +964,65 @@ def _face_morph_inbetweens(conn: sqlite3.Connection, rows: list, settings: dict,
     the landmarker is not seeing what `analyze` saw, and a video of plain
     dissolves stored as face-morph would be kept by every later run, so that
     stops the encode instead.
+
+    With `neutral`, the held frames are the cut-outs and the morphs are made
+    from them. The faces are still found in the aligned frames: the cut-out
+    moves no pixel, so the meshes are the same either way.
     """
     frames = [Path(r["path"]) for r in rows]
+    morph_dir, neutral_dir = _morph_scratch(frames)
+    eyes = _subject_eyes(conn, rows)
     count = face_morph_steps(settings["fps"], settings["playback_fps"],
                              settings["transition_seconds"])
-    morph_dir = frames[0].parent / "morph"
-    if count == 0 or len(frames) < 2:
-        return [[] for _ in frames[1:]], morph_dir
 
-    log(f"  morph: finding the subject's face in {len(frames)} aligned frames")
-    meshes = morph.landmarks_for(frames, opts, _subject_eyes(conn, rows))
-    faceless = [(r["local_datetime"] or Path(r["path"]).stem)[:10]
-                for r, mesh in zip(rows, meshes) if mesh is None]
-    if len(faceless) == len(frames):
+    meshes = None
+    if count and len(frames) >= 2:
+        log(f"  morph: finding the subject's face in {len(frames)} aligned frames")
+        meshes = morph.landmarks_for(frames, opts, eyes)
+        faceless = [_date_of(r) for r, mesh in zip(rows, meshes) if mesh is None]
+        if len(faceless) == len(frames):
+            raise RuntimeError(
+                'transition = "face-morph" did not find the subject\'s face in any aligned '
+                "frame, so there is nothing to morph. Check that `grow-up fetch-model` has "
+                "the model `analyze` used, or choose crossfade.")
+        if faceless:
+            shown = ", ".join(faceless[:8]) + (" and more" if len(faceless) > 8 else "")
+            log(f"  ! morph: the subject's face was not found where `align` put it in "
+                f"{len(faceless)} aligned frame(s), which dissolve into their neighbours "
+                f"instead: {shown}")
+
+    # Cut out even when there is no room for an in-between: the held frames are
+    # most of the film.
+    stills = (_neutral_stills(rows, frames, eyes, opts, neutral_dir, log)
+              if neutral else frames)
+    if meshes is None:
+        return stills, [[] for _ in frames[1:]]
+    return stills, morph.render(stills, meshes, morph_dir, count, workers, log)
+
+
+def _neutral_stills(rows: list, frames: list[Path], eyes: list, opts: analyze.AnalyzeOptions,
+                    out_dir: Path, log: Log) -> list[Path]:
+    """Every frame on the neutral field, or the photograph where the cut-out lost the subject.
+
+    One photograph keeping its background is visible, and the run names it by
+    date. A cut-out that lost the subject in every frame means the segmenter is
+    not seeing a person at all, and a video of plain photographs stored as the
+    neutral one would be kept by every later run -- so that stops the encode,
+    as a landmarker that finds no face does.
+    """
+    model = morph.segment_model_beside(opts.model_path)
+    cut = morph.neutral_frames(frames, eyes, model, out_dir, opts.verbose, log)
+    missed = [_date_of(r) for r, path in zip(rows, cut) if path is None]
+    if len(missed) == len(frames):
         raise RuntimeError(
-            'transition = "face-morph" did not find the subject\'s face in any aligned '
-            "frame, so there is nothing to morph. Check that `grow-up fetch-model` has "
-            "the model `analyze` used, or choose crossfade.")
-    if faceless:
-        shown = ", ".join(faceless[:8]) + (" and more" if len(faceless) > 8 else "")
-        log(f"  ! morph: the subject's face was not found where `align` put it in "
-            f"{len(faceless)} aligned frame(s), which dissolve into their neighbours "
-            f"instead: {shown}")
-    return morph.render(frames, meshes, morph_dir, count, workers, log), morph_dir
+            "neutral_background = true, but the segmenter did not find the subject in "
+            f"any aligned frame, so there is nothing to cut out. Check {model}, or set "
+            "neutral_background = false.")
+    if missed:
+        shown = ", ".join(missed[:8]) + (" and more" if len(missed) > 8 else "")
+        log(f"  ! morph: the cut-out lost the subject in {len(missed)} frame(s), which "
+            f"keep their own background instead: {shown}")
+    return [path or frame for path, frame in zip(cut, frames)]
 
 
 def _already_rendered(conn: sqlite3.Connection, out_path: Path, digest: str) -> bool:

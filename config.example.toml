@@ -237,6 +237,13 @@ transition_seconds = 1.0
 # Superseded by transition = "morph", which does the same thing. Kept because it
 # shipped in 1.0.0; if both are set, transition wins.
 interpolate = false
+# face-morph only: cut the person out of every frame and put them all on one
+# plain light-grey field. The background is the part of two photos months apart
+# with nothing in common, so it is where a morph ghosts most. Applies to the held
+# frames too, or the background would flicker. Needs the segmenter, which
+# `grow-up fetch-model` downloads beside the landmarker. Other transitions ignore
+# it, and the run says so.
+neutral_background = false
 
 # Burn a footer into the video: capture date bottom left, age bottom right. The
 # age comes from the birth date on the person in Immich; without one, only the

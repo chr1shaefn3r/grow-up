@@ -454,3 +454,261 @@ class TestRenderingThePairs:
         many = morph.render(paths, meshes, tmp_path / "many", 2, workers=2)
         many_pixels = [cv2.imread(str(p)) for pair in many for p in pair]
         assert all(np.array_equal(x, y) for x, y in zip(one_pixels, many_pixels))
+
+
+def _pid(_job) -> int:
+    """Which process ran this. Top-level so a spawned child can import it."""
+    import os
+
+    return os.getpid()
+
+
+class TestTheCutOutKeepsTheSubject:
+    """A cut-out that lost the face would be a frame of plain grey with nobody
+    on it -- worse than one photograph keeping its own background."""
+
+    EYES = ((30.0, 40.0), (50.0, 40.0))
+
+    @staticmethod
+    def mask(person=True):
+        mask = np.zeros((80, 80), dtype=np.uint8)
+        if person:
+            mask[20:70, 20:60] = 3
+        return mask
+
+    def test_the_bridge_of_the_nose_on_the_person_is_kept(self):
+        assert morph.subject_at(self.mask(), self.EYES)
+
+    def test_a_person_somewhere_else_in_the_frame_is_not_the_subject(self):
+        mask = np.zeros((80, 80), dtype=np.uint8)
+        mask[60:80, 0:15] = 3
+        assert not morph.subject_at(mask, self.EYES)
+
+    def test_eyes_off_the_frame_are_not_kept(self):
+        assert not morph.subject_at(self.mask(), ((300.0, 40.0), (320.0, 40.0)))
+
+    def test_without_known_eyes_anyone_on_the_person_will_do(self):
+        assert morph.subject_at(self.mask(), None)
+        assert not morph.subject_at(self.mask(person=False), None)
+
+
+def test_the_segmenter_is_looked_for_beside_the_landmarker():
+    """Where `grow-up fetch-model` puts it, wherever the landmarker is configured."""
+    from pathlib import Path
+
+    assert (morph.segment_model_beside("elsewhere/face_landmarker.task")
+            == Path("elsewhere") / morph.SEGMENT_MODEL_NAME)
+
+
+@requires_cv2
+class TestTheNeutralField:
+
+    @staticmethod
+    def scene():
+        """A textured background with a person-shaped block on it."""
+        rng = np.random.default_rng(7)
+        image = rng.integers(0, 255, (90, 90, 3), dtype=np.uint8)
+        mask = np.zeros((90, 90), dtype=np.uint8)
+        mask[20:80, 25:65] = 3
+        return image, mask
+
+    def test_the_background_becomes_the_field(self):
+        image, mask = self.scene()
+        out = morph.on_neutral(image, mask)
+        assert np.array_equal(out[:8, :8], np.broadcast_to(morph.NEUTRAL_BACKGROUND, (8, 8, 3)))
+
+    def test_the_person_is_left_as_they_were(self):
+        image, mask = self.scene()
+        out = morph.on_neutral(image, mask)
+        assert np.array_equal(out[35:65, 35:55], image[35:65, 35:55])
+
+    def test_every_class_but_the_background_is_the_person(self):
+        """Hair, skin, clothes and accessories: a cut-out without any one of
+        them would be the wrong shape."""
+        mask = np.repeat(np.arange(6, dtype=np.uint8), 20)[None, :].repeat(20, axis=0)
+        alpha = morph.subject_alpha(mask, feather=0)
+        assert alpha[:, :20].max() == 0.0
+        assert alpha[:, 20:].min() == 1.0
+
+    def test_the_silhouette_is_softened_not_cut_with_scissors(self):
+        image, mask = self.scene()
+        row = morph.subject_alpha(mask)[50, 15:35]
+        assert ((row > 0.05) & (row < 0.95)).sum() >= 3
+
+    def test_a_mask_that_does_not_fit_the_frame_is_refused(self):
+        image, _ = self.scene()
+        with pytest.raises(ValueError):
+            morph.on_neutral(image, np.zeros((45, 45), dtype=np.uint8))
+
+
+class TestTheSegmenterIsRequired:
+
+    def test_without_it_the_cut_out_is_refused_and_says_how_to_get_it(self, tmp_path):
+        """Never the photographs instead: the render is fingerprinted as the
+        neutral one, and every later run would keep it."""
+        with pytest.raises(morph.MorphUnavailable, match="grow-up fetch-model"):
+            morph.neutral_frames([tmp_path / "a.jpg"], [None], tmp_path / "missing.tflite",
+                                 tmp_path / "neutral")
+
+    @pytest.mark.skipif(importlib.util.find_spec("mediapipe") is not None,
+                        reason="only says something where mediapipe is missing")
+    def test_without_mediapipe_it_stops_and_says_so(self, tmp_path):
+        """Through the real child process: what fails there arrives here."""
+        model = tmp_path / morph.SEGMENT_MODEL_NAME
+        model.write_bytes(b"not a model")
+        with pytest.raises(morph.MorphUnavailable, match="cannot load here"):
+            morph.neutral_frames([tmp_path / "a.jpg"], [None], model, tmp_path / "neutral")
+
+
+def test_the_segmenter_runs_in_a_process_of_its_own():
+    """In the fork, a process that had built a segmenter could no longer start
+    the worker pool `render` starts next."""
+    import os
+
+    assert morph._in_a_child(_pid, None) != os.getpid()
+
+
+@requires_cv2
+class TestCuttingOutTheFrames:
+    """Driven with a stand-in segmenter, in this process: the real one needs mediapipe."""
+
+    @pytest.fixture()
+    def segmenter(self, monkeypatch, tmp_path):
+        state = {"built": 0, "closed": 0, "runner": None, "lose": set()}
+
+        class Segmenter:
+            def close(self):
+                state["closed"] += 1
+
+        def build(model_path):
+            state["built"] += 1
+            return Segmenter()
+
+        def segment(segmenter, image):
+            mask = np.zeros(image.shape[:2], dtype=np.uint8)
+            if int(image[0, 0, 0]) not in state["lose"]:
+                mask[10:50, 15:45] = 3
+            return mask
+
+        def in_a_child(work, job):
+            state["runner"] = work
+            return work(job)
+
+        monkeypatch.setattr(morph, "build_segmenter", build)
+        monkeypatch.setattr(morph, "segment", segment)
+        monkeypatch.setattr(morph, "_in_a_child", in_a_child)
+        model = tmp_path / morph.SEGMENT_MODEL_NAME
+        model.write_bytes(b"model")
+        state["model"] = model
+        return state
+
+    @staticmethod
+    def frames(tmp_path, count=3):
+        import cv2
+
+        paths = []
+        for i in range(count):
+            image = np.full((60, 60, 3), 40 * (i + 1), dtype=np.uint8)
+            path = tmp_path / f"asset-{i}.jpg"
+            cv2.imwrite(str(path), image)
+            paths.append(path)
+        return paths
+
+    EYES = ((24.0, 30.0), (36.0, 30.0))
+
+    def cut(self, segmenter, paths, out):
+        return morph.neutral_frames(paths, [self.EYES] * len(paths), segmenter["model"], out)
+
+    def test_each_is_named_after_its_frame(self, segmenter, tmp_path):
+        """Never after a place in the timeline -- see the trap of that name."""
+        paths = self.frames(tmp_path)
+        made = self.cut(segmenter, paths, tmp_path / "neutral")
+        assert [p.name for p in made] == ["asset-0.jpg", "asset-1.jpg", "asset-2.jpg"]
+        assert all(p.parent == tmp_path / "neutral" and p.exists() for p in made)
+
+    def test_the_background_is_the_field_and_the_person_is_not(self, segmenter, tmp_path):
+        import cv2
+
+        [made] = self.cut(segmenter, self.frames(tmp_path, 1), tmp_path / "neutral")
+        image = cv2.imread(str(made)).astype(int)
+        # Within JPEG's error of the field in the corner, of the photograph inside.
+        assert np.abs(image[0, 0] - np.array(morph.NEUTRAL_BACKGROUND)).max() <= 3
+        assert np.abs(image[30, 30] - 40).max() <= 3
+
+    def test_nothing_left_by_an_earlier_run_survives(self, segmenter, tmp_path):
+        stale = tmp_path / "neutral" / "asset-9.jpg"
+        stale.parent.mkdir()
+        stale.write_bytes(b"from another selection")
+        self.cut(segmenter, self.frames(tmp_path), tmp_path / "neutral")
+        assert not stale.exists()
+
+    def test_one_segmenter_serves_the_whole_render_and_is_closed(self, segmenter, tmp_path):
+        """The fork built one per pair: 119 model loads across 12 processes."""
+        self.cut(segmenter, self.frames(tmp_path), tmp_path / "neutral")
+        assert segmenter["built"] == 1 and segmenter["closed"] == 1
+
+    def test_the_work_is_handed_to_a_process_of_its_own(self, segmenter, tmp_path):
+        self.cut(segmenter, self.frames(tmp_path), tmp_path / "neutral")
+        assert segmenter["runner"] is morph._cut_out
+
+    def test_a_frame_whose_cut_out_lost_the_subject_comes_back_empty(self, segmenter, tmp_path):
+        segmenter["lose"] = {80}                  # the second frame's grey level
+        made = self.cut(segmenter, self.frames(tmp_path), tmp_path / "neutral")
+        assert made[1] is None
+        assert made[0] is not None and made[2] is not None
+        assert not (tmp_path / "neutral" / "asset-1.jpg").exists()
+
+
+class TestFetchModelBringsTheSegmenter:
+    """`fetch-model` is the only setup step, and everyone who set up before the
+    segmenter existed already has the landmarker."""
+
+    @pytest.fixture()
+    def fetched(self, monkeypatch):
+        from grow_up import cli
+
+        urls = []
+
+        def retrieve(url, path):
+            urls.append(url)
+            path.write_bytes(b"model")
+
+        monkeypatch.setattr(cli.urllib.request, "urlretrieve", retrieve)
+        monkeypatch.setattr(cli, "log", lambda _m: None)
+        return urls
+
+    @staticmethod
+    def run(target, force=False):
+        import argparse
+
+        from grow_up import cli
+
+        cli.cmd_fetch_model(argparse.Namespace(output=str(target), force=force))
+
+    def test_an_existing_landmarker_does_not_stop_the_segmenter(self, tmp_path, fetched):
+        target = tmp_path / "models" / "face_landmarker.task"
+        target.parent.mkdir()
+        target.write_bytes(b"already here")
+        self.run(target)
+        assert fetched == [morph.SEGMENT_MODEL_URL]
+        assert target.read_bytes() == b"already here"
+
+    def test_it_lands_beside_the_landmarker(self, tmp_path, fetched):
+        target = tmp_path / "elsewhere" / "face_landmarker.task"
+        self.run(target)
+        assert target.exists()
+        assert morph.segment_model_beside(target).exists()
+
+    def test_with_both_present_nothing_is_downloaded(self, tmp_path, fetched):
+        target = tmp_path / "face_landmarker.task"
+        self.run(target)
+        fetched.clear()
+        self.run(target)
+        assert fetched == []
+
+    def test_force_fetches_both_again(self, tmp_path, fetched):
+        target = tmp_path / "face_landmarker.task"
+        self.run(target)
+        fetched.clear()
+        self.run(target, force=True)
+        assert len(fetched) == 2

@@ -28,7 +28,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 cp config.example.toml config.toml   # then edit person_name
-grow-up fetch-model                  # downloads face_landmarker.task (~3 MB)
+grow-up fetch-model                  # the face landmarker (~3 MB) and selfie segmenter (~16 MB)
 ```
 
 ffmpeg must be on `PATH` (`brew install ffmpeg` / `apt install ffmpeg`).
@@ -575,7 +575,7 @@ Everything heavy is native code, and the Python is glue:
 | Dependency | Does |
 |---|---|
 | [Immich](https://immich.app) | the library itself, and the person tagging every stage builds on |
-| `mediapipe` | face landmarks, head pose and blendshapes |
+| `mediapipe` | face landmarks, head pose and blendshapes; the cut-out for `neutral_background` |
 | `opencv-contrib-python` | affine warping, colour conversion, sharpness, face-morph's triangulation; the same OpenCV `mediapipe` brings, so there is only one |
 | `numpy` | the transform maths and every metric |
 | `pillow` + `pillow-heif` | decoding, HEIC included |
@@ -613,7 +613,7 @@ Outside that sequence:
 
 | Command | |
 |---|---|
-| `fetch-model` | Downloads the FaceLandmarker bundle. Run once, at setup. |
+| `fetch-model` | Downloads the FaceLandmarker bundle, and beside it the selfie segmenter `neutral_background` uses. Run once, at setup, and again after an upgrade: it fetches only what is missing. |
 | `trial` | Runs stages 2–8 over a sample and projects the full run. `--compare` measures the effort levels instead. |
 | `status` | Manifest counts, filter outcome, stored watermark, recent runs. |
 | `doctor` | Probes each Immich endpoint once and reports exactly what came back. |
@@ -797,13 +797,37 @@ estimated motion — half a second of warp between photographs a month apart is 
 violent than a full second of it. If more stillness makes the movement uglier, that is
 the mechanism, and `crossfade` is the way out: it invents nothing, so it cannot smear.
 
+**`neutral_background`** goes with `face-morph`. It cuts the subject out of their
+surroundings and puts every frame on one plain, light-grey field:
+
+```toml
+[encode]
+transition = "face-morph"
+neutral_background = true
+```
+
+The background is the one part of two photographs months apart with nothing in common —
+another room, another light, another season — so it is where a morph ghosts most and the
+part least worth keeping, and a series of portraits on one ground reads as deliberate. It
+applies to the frame each photograph is held on as well as to the in-betweens, or the
+background would flicker in and out with every photograph. Hair and shoulders lie outside
+the face mesh, so they still dissolve — over grey now, rather than over two rooms.
+
+The cut-out is MediaPipe's selfie segmenter, which `grow-up fetch-model` downloads beside
+the landmarker. Without it the encode stops and says so, rather than quietly keeping the
+backgrounds. It finds *a* person, not the tagged one: someone standing behind the subject
+stays in the picture with them. A frame whose cut-out loses the subject's face keeps its
+own background instead of becoming an empty grey frame, and the run names it by date.
+The other transitions ignore the setting, and the run says that too.
+
 **The date and age footer does not dissolve.** It is composited after the transition, on
 its own layer, and switches cleanly at the midpoint of each dissolve — where the picture
 stops being mostly one photograph and starts being mostly the next. Ghosting the text
 between two dates looks like a fault even when the pictures melting looks lovely.
 
 Pacing is cheap to try: `encode` re-runs from the frames already on disk, so changing
-`fps`, `transition` or `transition_seconds` costs one render and no re-warp. Changing
+`fps`, `transition`, `transition_seconds` or `neutral_background` costs one render and no
+re-warp. Changing
 `[select] cadence` does not — that needs `select`, `align` and `encode`.
 
 Worth doing the arithmetic before dropping to a monthly cadence. Over three years:
